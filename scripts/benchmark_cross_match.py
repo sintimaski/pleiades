@@ -5,15 +5,19 @@ Uses Int64 IDs for both catalogs so the Rust engine and Parquet encoding behave
 reliably at scale. For pre-generated files (e.g. to avoid OOM), use
 --catalog-a / --catalog-b or run scripts/generate_benchmark_fixtures.py first.
 
+With --verbose, sets ASTROJOIN_VERBOSE=1 so the Rust engine prints timing logs
+(index, load B, join, write per chunk; partition B and total) to stderr.
+
 Usage:
   uv run python scripts/benchmark_cross_match.py [--rows 100000] [--rust]
-  uv run python scripts/benchmark_cross_match.py --rows 1000000 --rust
+  uv run python scripts/benchmark_cross_match.py --rows 1000000 --rust --verbose
   uv run python scripts/benchmark_cross_match.py --catalog-a path/a.parquet --catalog-b path/b.parquet -o out.parquet
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -62,8 +66,17 @@ def main() -> int:
         help="Use pre-generated catalog B (skip in-memory generation)",
     )
     parser.add_argument("-o", "--output", type=Path, default=None, help="Output matches path (default: temp)")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Set ASTROJOIN_VERBOSE=1 for Rust engine timing logs (stderr)",
+    )
     args = parser.parse_args()
     n_b = args.rows_b if args.rows_b is not None else args.rows
+
+    if args.verbose:
+        os.environ["ASTROJOIN_VERBOSE"] = "1"
+        print("Rust timing logs (stderr):", flush=True)
 
     import astrojoin
 

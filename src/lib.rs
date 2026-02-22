@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 /// matches_count, chunks_processed, time_seconds).
 #[cfg(feature = "python")]
 #[pyfunction]
-#[pyo3(signature = (catalog_a, catalog_b, radius_arcsec, output_path, depth=8, batch_size_a=100_000, batch_size_b=100_000, ra_col="ra", dec_col="dec", id_col_a=None, id_col_b=None, ra_dec_units="deg", n_nearest=None, progress_callback=None))]
+#[pyo3(signature = (catalog_a, catalog_b, radius_arcsec, output_path, depth=8, batch_size_a=100_000, batch_size_b=100_000, n_shards=512, ra_col="ra", dec_col="dec", id_col_a=None, id_col_b=None, ra_dec_units="deg", n_nearest=None, progress_callback=None))]
 fn cross_match(
     py: Python<'_>,
     catalog_a: &str,
@@ -29,6 +29,7 @@ fn cross_match(
     depth: u8,
     batch_size_a: usize,
     batch_size_b: usize,
+    n_shards: usize,
     ra_col: &str,
     dec_col: &str,
     id_col_a: Option<&str>,
@@ -73,6 +74,7 @@ fn cross_match(
         depth,
         batch_size_a,
         batch_size_b,
+        n_shards,
         ra_col,
         dec_col,
         id_col_a,
