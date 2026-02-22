@@ -6,8 +6,12 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float32Array, Float64Array, Int64Array, StringArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    Array, ArrayAccessor, DictionaryArray, Float32Array, Float64Array, Int64Array, StringArray,
+    UInt64Array,
+};
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchReader};
 use cdshealpix::haversine_dist;
 use cdshealpix::nested::{self, get};
@@ -63,16 +67,19 @@ fn id_column(batch: &RecordBatch, ra_col: &str, dec_col: &str, id_col: Option<&s
     "index".to_string()
 }
 
-/// Infer Arrow DataType for ID column.
+/// Infer Arrow DataType for ID column (value type when Dictionary).
 fn id_type(batch: &RecordBatch, col_name: &str) -> DataType {
     let schema = batch.schema();
     let field = schema
         .field_with_name(col_name)
         .expect("id column missing");
-    field.data_type().clone()
+    match field.data_type() {
+        DataType::Dictionary(_, value_type) => (**value_type).clone(),
+        other => other.clone(),
+    }
 }
 
-/// Extract ID value from batch row.
+/// Extract ID value from batch row. Supports Dictionary-encoded columns (Parquet often uses these).
 fn get_id_value(batch: &RecordBatch, _col_name: &str, col_idx: usize, row: usize) -> IdVal {
     let col = batch.column(col_idx);
     match col.data_type() {
@@ -87,6 +94,23 @@ fn get_id_value(batch: &RecordBatch, _col_name: &str, col_idx: usize, row: usize
         DataType::Utf8 | DataType::LargeUtf8 => {
             let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
             IdVal::Str(arr.value(row).to_string())
+        }
+        DataType::Dictionary(_, value_type) => {
+            if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+                match value_type.as_ref() {
+                    DataType::Int64 => {
+                        let typed = dict.downcast_dict::<Int64Array>().unwrap();
+                        IdVal::I64(typed.value(row))
+                    }
+                    DataType::Utf8 | DataType::LargeUtf8 => {
+                        let typed = dict.downcast_dict::<StringArray>().unwrap();
+                        IdVal::Str(typed.value(row).to_string())
+                    }
+                    _ => IdVal::Str(format!("{:?}", value_type)),
+                }
+            } else {
+                IdVal::Str(format!("{:?}", col.as_any()))
+            }
         }
         _ => IdVal::Str(format!("{:?}", col.as_any())),
     }
@@ -287,6 +311,8 @@ pub fn cross_match_impl(
 
     let mut id_a_name: Option<String> = None;
     let mut id_b_name: Option<String> = None;
+    let mut first_dt_a: Option<DataType> = None;
+    let mut first_dt_b: Option<DataType> = None;
     let mut out_schema: Option<Arc<Schema>> = None;
     let mut writer: Option<ArrowWriter<File>> = None;
     let mut rows_a_read: u64 = 0;
@@ -320,6 +346,7 @@ pub fn cross_match_impl(
         let id_a_col = id_column(&batch_a, ra_col, dec_col, id_col_a);
         if id_a_name.is_none() {
             id_a_name = Some(id_a_col.clone());
+            first_dt_a = Some(id_type(&batch_a, &id_a_col));
         }
 
         let ra_idx = column_index(&batch_a, ra_col);
@@ -376,15 +403,9 @@ pub fn cross_match_impl(
                 }
             }
             if !matches_id_a.is_empty() && out_schema.is_none() {
-                let (paths, _) = list_shard_paths(shard_dir.as_ref().unwrap())?;
-                let f = File::open(&paths[0])?;
-                let reader = ParquetRecordBatchReaderBuilder::try_new(f)?;
-                let schema_b = reader.schema();
-                let dt_b = schema_b
-                    .field_with_name("id_b")
-                    .map(|f| f.data_type().clone())
-                    .unwrap_or(DataType::Utf8);
-                let dt_a = id_type(&batch_a, &id_a_col);
+                let (col_a, col_b) = build_id_columns(&matches_id_a, &matches_id_b);
+                let dt_a = col_a.data_type().clone();
+                let dt_b = col_b.data_type().clone();
                 let id_b_col_name = id_b_name.as_deref().unwrap_or("id_b");
                 out_schema = Some(Arc::new(Schema::new(vec![
                     Field::new(id_a_col.as_str(), dt_a, false),
@@ -413,7 +434,9 @@ pub fn cross_match_impl(
                 }
 
                 if id_b_name.is_none() {
-                    id_b_name = Some(id_column(&batch_b, ra_col, dec_col, id_col_b));
+                    let name = id_column(&batch_b, ra_col, dec_col, id_col_b);
+                    id_b_name = Some(name.clone());
+                    first_dt_b = Some(id_type(&batch_b, &name));
                 }
                 let id_b_col = id_b_name.as_ref().unwrap();
                 let ra_b_idx = column_index(&batch_b, ra_col);
@@ -467,9 +490,10 @@ pub fn cross_match_impl(
                 }
 
                 if !matches_id_a.is_empty() && out_schema.is_none() {
+                    let (col_a, col_b) = build_id_columns(&matches_id_a, &matches_id_b);
+                    let dt_a = col_a.data_type().clone();
+                    let dt_b = col_b.data_type().clone();
                     let id_b_col = id_b_name.as_ref().unwrap();
-                    let dt_a = id_type(&batch_a, &id_a_col);
-                    let dt_b = id_type(&batch_b, id_b_col);
                     out_schema = Some(Arc::new(Schema::new(vec![
                         Field::new(id_a_col.as_str(), dt_a, false),
                         Field::new(id_b_col, dt_b, false),
@@ -493,9 +517,11 @@ pub fn cross_match_impl(
 
         if let Some(ref mut w) = writer {
             let (col_a, col_b) = build_id_columns(&matches_id_a, &matches_id_b);
+            let schema = out_schema.as_ref().unwrap();
+            let col_a = coerce_id_column_to_type(col_a, schema.field(0).data_type())?;
+            let col_b = coerce_id_column_to_type(col_b, schema.field(1).data_type())?;
             let sep_arr = Arc::new(Float64Array::from(matches_sep));
             let id_b_col = id_b_name.as_deref().unwrap_or("id_b");
-            let schema = out_schema.as_ref().unwrap();
             let batch = RecordBatch::try_new(
                 Arc::new(Schema::new(vec![
                     Field::new(id_a_col.as_str(), schema.field(0).data_type().clone(), false),
@@ -527,9 +553,11 @@ pub fn cross_match_impl(
     } else {
         let id_a_col = id_a_name.as_deref().unwrap_or("id_a");
         let id_b_col = id_b_name.as_deref().unwrap_or("id_b");
+        let dt_a = first_dt_a.clone().unwrap_or(DataType::Int64);
+        let dt_b = first_dt_b.clone().unwrap_or(DataType::Utf8);
         let empty_schema = Arc::new(Schema::new(vec![
-            Field::new(id_a_col, DataType::Int64, false),
-            Field::new(id_b_col, DataType::Utf8, false),
+            Field::new(id_a_col, dt_a, false),
+            Field::new(id_b_col, dt_b, false),
             Field::new("separation_arcsec", DataType::Float64, false),
         ]));
         let empty_batch = RecordBatch::new_empty(empty_schema.clone());
@@ -630,6 +658,17 @@ fn apply_n_nearest(
     w.write(&out_batch)?;
     w.close()?;
     Ok(())
+}
+
+/// Coerce an ID column array to the target schema type so output batches match the writer schema.
+fn coerce_id_column_to_type(
+    col: Arc<dyn Array>,
+    target: &DataType,
+) -> Result<Arc<dyn Array>, Box<dyn std::error::Error + Send + Sync>> {
+    if col.data_type() == target {
+        return Ok(col);
+    }
+    cast(col.as_ref(), target).map_err(|e| e.into())
 }
 
 fn build_id_columns(
