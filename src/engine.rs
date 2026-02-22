@@ -6,7 +6,9 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 
 use arrow::array::{
     Array, ArrayAccessor, DictionaryArray, Float32Array, Float64Array, Int64Array, StringArray,
@@ -306,10 +308,42 @@ pub fn cross_match_impl(
         (0, None)
     };
 
-    let file_a = File::open(catalog_a)?;
-    let mut reader_a = ParquetRecordBatchReaderBuilder::try_new(file_a)?
-        .with_batch_size(batch_size_a)
-        .build()?;
+    // Prefetch thread: read catalog A batches one ahead so I/O overlaps with compute.
+    let (tx_a, rx_a) = mpsc::sync_channel::<Result<Option<RecordBatch>, Box<dyn std::error::Error + Send + Sync>>>(1);
+    let path_a = catalog_a.to_path_buf();
+    let batch_size_a_prefetch = batch_size_a;
+    let reader_handle = thread::spawn(move || {
+        let file_a = match File::open(&path_a) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx_a.send(Err(e.into()));
+                return;
+            }
+        };
+        let reader_a = match ParquetRecordBatchReaderBuilder::try_new(file_a)
+            .and_then(|b| b.with_batch_size(batch_size_a_prefetch).build())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx_a.send(Err(e.into()));
+                return;
+            }
+        };
+        for batch in reader_a {
+            match batch {
+                Ok(b) => {
+                    if tx_a.send(Ok(Some(b))).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx_a.send(Err(e.into()));
+                    return;
+                }
+            }
+        }
+        let _ = tx_a.send(Ok(None));
+    });
 
     let mut id_a_name: Option<String> = None;
     let mut id_b_name: Option<String> = None;
@@ -335,8 +369,12 @@ pub fn cross_match_impl(
             .sum();
     }
 
-    while let Some(batch_a) = reader_a.next() {
-        let batch_a = batch_a?;
+    while let Ok(msg) = rx_a.recv() {
+        let batch_a = match msg {
+            Ok(Some(b)) => b,
+            Ok(None) => break,
+            Err(e) => return Err(e),
+        };
         if batch_a.num_rows() == 0 {
             continue;
         }
@@ -534,6 +572,10 @@ pub fn cross_match_impl(
             )?;
             w.write(&batch)?;
         }
+    }
+
+    if let Err(e) = reader_handle.join() {
+        std::panic::resume_unwind(e);
     }
 
     if b_is_prepartitioned {
