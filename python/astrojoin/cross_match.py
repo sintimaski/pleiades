@@ -376,7 +376,7 @@ def cross_match(
     matrix_block_size: int = MATRIX_BLOCK_SIZE,
     partition_b: bool = True,
     n_shards: int = B_PARTITION_SHARDS,
-    use_rust: bool = False,
+    use_rust: bool = True,
     n_nearest: int | None = None,
     progress_callback: Callable[[int, int | None, int, int], None] | None = None,
     include_coords: bool = False,
@@ -395,8 +395,11 @@ def cross_match(
     If n_nearest is set (e.g. 1 for best match only), only the n_nearest smallest-
     separation matches per id_a are kept in the output.
 
-    If use_rust=True, uses the Rust engine (astrojoin_core) when available;
-    otherwise falls back to the Python implementation.
+    Matching is done by the Rust engine (use_rust=True, default). Python is used
+    for the API, validation, and helpers; the heavy work runs in the Rust extension.
+    If the extension is not installed, install with ``pip install astrojoin`` (wheels
+    include it) or from source: ``uv run maturin develop``. Set use_rust=False to
+    use the Python implementation (slow, for testing or environments without the wheel).
 
     If include_coords=True (Python path only, catalog_b must be a file), the
     output is augmented with ra_a, dec_a, ra_b, dec_b from the two catalogs.
@@ -497,8 +500,22 @@ def cross_match(
                         id_col_b=id_col_b,
                     )
             if result is not None and isinstance(result, dict):
+                out_path = result["output_path"]
+                if include_coords and catalog_b.is_file():
+                    from astrojoin.analysis import attach_match_coords
+
+                    attach_match_coords(
+                        out_path,
+                        catalog_a,
+                        catalog_b,
+                        out_path,
+                        id_col_a=id_col_a,
+                        id_col_b=id_col_b,
+                        ra_col=ra_col,
+                        dec_col=dec_col,
+                    )
                 return CrossMatchResult(
-                    output_path=result["output_path"],
+                    output_path=out_path,
                     rows_a_read=int(result["rows_a_read"]),
                     rows_b_read=int(result["rows_b_read"]),
                     matches_count=int(result["matches_count"]),
@@ -524,7 +541,13 @@ def cross_match(
                 time_seconds=elapsed,
             )
         except ImportError:
-            pass  # fall back to Python implementation
+            if use_rust:
+                raise ImportError(
+                    "AstroJoin requires the Rust engine for cross-match. "
+                    "Install it with: pip install astrojoin (wheels include it), "
+                    "or from source: uv run maturin develop"
+                ) from None
+            # use_rust=False: fall back to Python implementation
 
     out_schema: pa.Schema | None = None
     writer: pq.ParquetWriter | None = None

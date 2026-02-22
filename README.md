@@ -2,7 +2,7 @@
 
 **High-performance out-of-core spatial cross-matcher for astronomical catalogs.**
 
-Cross-match two Parquet catalogs by angular distance (e.g. Gaia × SDSS) using HEALPix indexing (cdshealpix) and chunked streaming. Python implementation is default; optional Rust engine for scale via `use_rust=True` (included in PyPI wheels).
+Cross-match two Parquet catalogs by angular distance (e.g. Gaia × SDSS) using HEALPix indexing and chunked streaming. **Python is the interface** (API, validation, CLI, analysis helpers); **the Rust engine does the matching** and is included in PyPI wheels. If the extension is not installed, you get a clear error; set `use_rust=False` to use the slow Python implementation (e.g. for testing).
 
 ## Installation
 
@@ -14,7 +14,7 @@ pip install astrojoin
 uv add astrojoin
 ```
 
-This installs the Python package and the Rust extension wheel for your platform (Python 3.10–3.12). You can use `use_rust=True` immediately.
+This installs the Python package and the Rust extension wheel for your platform (Python 3.10–3.12). You can use `use_rust=True` immediately. For preparing real catalogs (Gaia, LSST, SDSS, etc.), see [DATA_SOURCES.md](DATA_SOURCES.md).
 
 **From source** (developers):
 
@@ -44,13 +44,13 @@ result = astrojoin.cross_match(
 - ID columns are auto-detected (e.g. `source_id`, `object_id`) or set via `id_col_a` / `id_col_b`.
 - Output: Parquet with **id_a**, **id_b**, **separation_arcsec**. Optionally **ra_a**, **dec_a**, **ra_b**, **dec_b** with `include_coords=True` (Python path, catalog_b must be a file).
 
-**Options**: `partition_b=True` (default); `ra_dec_units="deg"` | `"rad"`; `n_nearest=1` for best match only; `progress_callback=(chunk_ix, total, rows_a, matches)`; `catalog_b` may be a **directory** of pre-partitioned shards (`shard_0000.parquet`, ...). Rust: `use_rust=True`; full parity including pre-partitioned B, `n_nearest`, and progress callback.
+**Options**: `partition_b=True` (default); `ra_dec_units="deg"` | `"rad"`; `n_nearest=1` for best match only; `progress_callback=(chunk_ix, total, rows_a, matches)`; `catalog_b` may be a **directory** of pre-partitioned shards (`shard_0000.parquet`, ...). The Rust engine is used by default (`use_rust=True`); set `use_rust=False` for the Python implementation (slow).
 
 ### Command-line interface (CLI)
 
 ```bash
-# Cross-match
-astrojoin cross-match catalog_a.parquet catalog_b.parquet -r 2.0 -o matches.parquet [--rust]
+# Cross-match (Rust engine by default; use --no-rust for Python path)
+astrojoin cross-match catalog_a.parquet catalog_b.parquet -r 2.0 -o matches.parquet
 
 # Summarize matches
 astrojoin summarize-matches matches.parquet
@@ -116,7 +116,7 @@ uv run python scripts/benchmark_cross_match.py --rows 50000 --rust   # compare P
 - **Rust extension**: Recommended: `uv run maturin develop` (uses the project’s Python 3.10–3.13). If you use `cargo build --features python` and your default Python is 3.14 or newer, PyO3 will error; either set `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` to build with the stable ABI, or point to a 3.10–3.13 interpreter, e.g. `PYO3_PYTHON=python3.12 cargo build --features python`.
 - **Lint/format**: `uv run ruff check . && uv run ruff format .`
 - **Type check**: `uv run mypy python/`
-- **Tests** (Python + Rust): `uv run python run_tests.py` — or Python only: `uv run pytest`
+- **Tests** (Python + Rust): `uv run python run_tests.py` — or Python only: `uv run pytest`. Add `--benchmark` to run a small cross-match benchmark after tests; use `--benchmark-only` to run only the benchmark (no tests); use `--rust` to include the Rust engine.
 - **Coverage**: `uv run pytest tests/ --cov=python/astrojoin --cov-report=term-missing`
 - **Pre-commit**: `uv run pre-commit install` then `pre-commit run --all-files`
 - **Publishing (plug-and-play wheels)**: From the project root, `uv run maturin build --release` builds wheels for the current platform; upload to PyPI with `uv run maturin publish`. For many platforms (Linux/macOS/Windows × Python 3.10–3.12), use CI (e.g. the provided GitHub Actions workflow) to build and publish on tag push.

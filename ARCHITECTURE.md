@@ -55,7 +55,7 @@ catalog_a.parquet          catalog_b.parquet
 | **Python inner loop** | Addressed when use_matrix=True (block matrix). | Addressed: block (A×B) matrix + np.where; partition path same. Remaining: Rust/rayon for more speed. |
 | **Index build per A chunk** | We build `pixel -> list of (id, ra, dec)` in Python with many small lists. | Build index in Rust/Arrow (e.g. array of structs grouped by pixel) or use a faster in-memory structure. |
 | **Single-threaded** | One process, one thread for the join. | Parallelize over A chunks (each chunk gets a B stream or B partitions) or over B chunks within an A chunk (rayon / multiprocessing). |
-| **No pre-partitioning** | If A and B are not spatially ordered, we still do full scans. | Optional pre-step: repartition one or both catalogs by HEALPix (e.g. write “A_by_pixel.parquet”), then join by reading only relevant pixel partitions. |
+| **No pre-partitioning** | If A and B are not spatially ordered, we still do full scans. | **Addressed for B**: use **partition_catalog**(catalog_b, output_dir) to write shards once; pass the directory as catalog_b. For A, same helper can pre-partition; join-by-pixel is a possible future extension. |
 
 **Matrix vs HEALPix path**: `use_matrix=True` (default) computes distances as (A_block × B_block) matrices in blocks (e.g. 4000×4000); fully vectorized, bounded memory. `use_matrix=False` builds a HEALPix index and only compares B rows to A candidates in the same/neighbor pixels (fewer distance ops, more Python overhead). The matrix path usually wins for typical chunk sizes.
 

@@ -51,7 +51,8 @@ def main() -> int:
         generate_catalog(path_a, args.rows, 42, "source_id")
         generate_catalog(path_b, n_b, 123, "object_id")
 
-        runs: list[tuple[str, bool]] = [("Python", False)]
+        # runs: list[tuple[str, bool]] = [("Python", False)]
+        runs: list[tuple[str, bool]] = []
         if args.rust:
             try:
                 import astrojoin_core  # noqa: F401

@@ -101,7 +101,18 @@ def main() -> int:
     p_cm.add_argument("--id-col-a", default=None, help="ID column in catalog A")
     p_cm.add_argument("--id-col-b", default=None, help="ID column in catalog B")
     p_cm.add_argument("--n-nearest", default=None, help="Keep only n best matches per id_a (e.g. 1)")
-    p_cm.add_argument("--rust", action="store_true", help="Use Rust engine if available")
+    p_cm.add_argument(
+        "--rust",
+        action="store_true",
+        default=True,
+        help="Use Rust engine (default)",
+    )
+    p_cm.add_argument(
+        "--no-rust",
+        action="store_false",
+        dest="rust",
+        help="Use Python implementation instead (slow)",
+    )
     p_cm.set_defaults(func=cmd_cross_match)
 
     # summarize-matches
