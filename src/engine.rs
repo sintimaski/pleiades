@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -33,6 +33,8 @@ use rayon::prelude::*;
 
 /// Larger write buffer for temp shard files (fewer syscalls).
 const SHARD_WRITE_BUFFER_BYTES: usize = 256 * 1024; // 256 KiB
+/// Read buffer for Parquet (fewer syscalls on partition and shard reads).
+const PARQUET_READ_BUFFER_BYTES: usize = 1024 * 1024; // 1 MiB
 
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
@@ -280,7 +282,11 @@ fn load_one_shard(
     pixels_wanted: &HashSet<u64>,
 ) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
+        PARQUET_READ_BUFFER_BYTES,
+        file,
+    ))?
+    .build()?;
     let mut out: Vec<(IdVal, f64, f64)> = Vec::new();
     for batch in reader {
         let batch = batch?;
@@ -399,7 +405,10 @@ fn partition_b_to_temp(
     let shard_dir = temp_dir.path().to_path_buf();
 
     let file_b = File::open(catalog_b)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
+        PARQUET_READ_BUFFER_BYTES,
+        file_b,
+    ))?;
     let arrow_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size_b).build()?;
 
@@ -481,7 +490,8 @@ fn partition_b_to_temp(
 
     let mut rows_written: u64 = 0;
     let mut buffers: Vec<Vec<(u64, IdVal, f64, f64)>> = (0..n_shards).map(|_| Vec::new()).collect();
-    const FLUSH_AT: usize = 65_536;
+    /// Larger flush reduces Parquet write() calls and RecordBatch builds during partition.
+    const FLUSH_AT: usize = 131_072;
 
     let mut process_batch = |batch: &RecordBatch| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ra_idx = column_index(batch, ra_col);
@@ -588,7 +598,10 @@ fn partition_b_to_memory(
 ) -> Result<(Vec<Vec<(u64, IdVal, f64, f64)>>, String, u64), Box<dyn std::error::Error + Send + Sync>> {
     let layer = get(depth);
     let file_b = File::open(catalog_b)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
+        PARQUET_READ_BUFFER_BYTES,
+        file_b,
+    ))?;
     let arrow_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size_b).build()?;
 
@@ -843,8 +856,14 @@ pub fn cross_match_impl(
         n_shards
     };
 
-    // Prefetch thread: read catalog A batches one ahead so I/O overlaps with compute.
-    let (tx_a, rx_a) = mpsc::sync_channel::<Result<Option<RecordBatch>, Box<dyn std::error::Error + Send + Sync>>>(1);
+    let use_b_prefetch = shard_dir.is_some() && b_in_memory.is_none();
+    let a_channel_cap = if use_b_prefetch { 2 } else { 1 };
+    if verbose && use_b_prefetch {
+        verbose_log("B prefetch: overlapping load B with join (two A batches ahead)");
+    }
+
+    // Prefetch thread: read catalog A batches one ahead (or two when B prefetch) so I/O overlaps with compute.
+    let (tx_a, rx_a) = mpsc::sync_channel::<Result<Option<RecordBatch>, Box<dyn std::error::Error + Send + Sync>>>(a_channel_cap);
     let path_a = catalog_a.to_path_buf();
     let batch_size_a_prefetch = batch_size_a;
     let reader_handle = thread::spawn(move || {
@@ -855,8 +874,11 @@ pub fn cross_match_impl(
                 return;
             }
         };
-        let reader_a = match ParquetRecordBatchReaderBuilder::try_new(file_a)
-            .and_then(|b| b.with_batch_size(batch_size_a_prefetch).build())
+        let reader_a = match ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
+            PARQUET_READ_BUFFER_BYTES,
+            file_a,
+        ))
+        .and_then(|b| b.with_batch_size(batch_size_a_prefetch).build())
         {
             Ok(r) => r,
             Err(e) => {
@@ -880,6 +902,40 @@ pub fn cross_match_impl(
         let _ = tx_a.send(Ok(None));
     });
 
+    type BLoadResult = Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>>;
+    let (tx_b_request, rx_b_request) = mpsc::sync_channel::<Option<HashSet<u64>>>(1);
+    let (tx_b_response, rx_b_response) = mpsc::sync_channel::<BLoadResult>(1);
+    let b_prefetch_handle = if use_b_prefetch {
+        let shard_dir_b = shard_dir.as_ref().unwrap().clone();
+        Some(thread::spawn(move || {
+            while let Ok(Some(pixels)) = rx_b_request.recv() {
+                match load_b_from_shards(&shard_dir_b, &pixels, n_shards, from_radians) {
+                    Ok(rows) => {
+                        let _ = tx_b_response.send(Ok(rows));
+                    }
+                    Err(e) => {
+                        let _ = tx_b_response.send(Err(e));
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    /// Receive one A batch, skipping empty; None = end of stream.
+    let recv_a = |rx: &mpsc::Receiver<Result<Option<RecordBatch>, Box<dyn std::error::Error + Send + Sync>>>| -> Result<Option<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
+        loop {
+            match rx.recv() {
+                Ok(Ok(Some(b))) if b.num_rows() > 0 => return Ok(Some(b)),
+                Ok(Ok(Some(_))) => continue,
+                Ok(Ok(None)) => return Ok(None),
+                Ok(Err(e)) => return Err(e),
+                Err(mpsc::RecvError) => return Ok(None),
+            }
+        }
+    };
+
     let mut id_a_name: Option<String> = None;
     let mut id_b_name: Option<String> = None;
     let mut first_dt_a: Option<DataType> = None;
@@ -892,16 +948,11 @@ pub fn cross_match_impl(
     let mut chunks_processed: usize = 0;
     let mut cancelled = false;
 
-    while let Ok(msg) = rx_a.recv() {
-        let batch_a = match msg {
-            Ok(Some(b)) => b,
-            Ok(None) => break,
-            Err(e) => return Err(e),
-        };
-        if batch_a.num_rows() == 0 {
-            continue;
-        }
+    let mut current_batch = recv_a(&rx_a)?;
+    let mut next_batch = if use_b_prefetch { recv_a(&rx_a)? } else { None };
+    let mut prefetched_b: Option<Vec<(IdVal, f64, f64)>> = None;
 
+    while let Some(batch_a) = current_batch.take() {
         chunks_processed += 1;
         let n_a = batch_a.num_rows();
         rows_a_read += n_a as u64;
@@ -957,7 +1008,28 @@ pub fn cross_match_impl(
         }
         let t_load = std::time::Instant::now();
         let pixels_wanted = pixels_in_chunk_with_neighbors(&ra_deg_a, &dec_deg_a, depth);
-        let b_rows = if let Some(ref buf) = b_in_memory {
+        if use_b_prefetch {
+            if let Some(ref next) = next_batch {
+                let ra_idx_n = column_index(next, ra_col);
+                let dec_idx_n = column_index(next, dec_col);
+                let (ra_n, dec_n) = ra_dec_degrees(next, ra_idx_n, dec_idx_n, from_radians)?;
+                let pixels_next = pixels_in_chunk_with_neighbors(&ra_n, &dec_n, depth);
+                let _ = tx_b_request.send(Some(pixels_next));
+            }
+        }
+        let b_rows = if use_b_prefetch {
+            prefetched_b
+                .take()
+                .unwrap_or_else(|| {
+                    load_b_from_shards(
+                        shard_dir.as_ref().unwrap(),
+                        &pixels_wanted,
+                        n_shards,
+                        from_radians,
+                    )
+                    .expect("load B for first chunk")
+                })
+        } else if let Some(ref buf) = b_in_memory {
             load_b_from_memory(buf, &pixels_wanted, n_shards)
         } else {
             load_b_from_shards(
@@ -1200,6 +1272,28 @@ pub fn cross_match_impl(
                 verbose_log_timed("  chunk total", t_chunk.elapsed().as_secs_f64(), "");
             }
         }
+
+        if use_b_prefetch {
+            if next_batch.is_none() {
+                break;
+            }
+            prefetched_b = Some(match rx_b_response.recv() {
+                Ok(Ok(rows)) => rows,
+                Ok(Err(e)) => return Err(e),
+                Err(e) => return Err(e.into()),
+            });
+            current_batch = next_batch.take();
+            next_batch = recv_a(&rx_a)?;
+        } else {
+            current_batch = recv_a(&rx_a)?;
+        }
+    }
+
+    if use_b_prefetch {
+        let _ = tx_b_request.send(None);
+        if let Some(h) = b_prefetch_handle {
+            let _ = h.join();
+        }
     }
 
     if let Err(e) = reader_handle.join() {
@@ -1217,7 +1311,12 @@ pub fn cross_match_impl(
         rows_b_read = 0u64;
         for path in paths.iter().take(n) {
             let f = File::open(path)?;
-            let meta = ParquetRecordBatchReaderBuilder::try_new(f)?.metadata().clone();
+            let meta = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
+                PARQUET_READ_BUFFER_BYTES,
+                f,
+            ))?
+            .metadata()
+            .clone();
             rows_b_read += meta
                 .row_groups()
                 .iter()
@@ -1258,7 +1357,12 @@ pub fn cross_match_impl(
     if let Some(n) = n_nearest {
         apply_n_nearest(output_path, &id_a_col, &id_b_col, n)?;
         let file_out = File::open(output_path)?;
-        let meta = ParquetRecordBatchReaderBuilder::try_new(file_out)?.metadata().clone();
+        let meta = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
+            PARQUET_READ_BUFFER_BYTES,
+            file_out,
+        ))?
+        .metadata()
+        .clone();
         matches_count = meta
             .row_groups()
             .iter()
@@ -1313,7 +1417,11 @@ fn apply_n_nearest(
     n_nearest: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(output_path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
+        PARQUET_READ_BUFFER_BYTES,
+        file,
+    ))?
+    .build()?;
     let schema = reader.schema().clone();
     let id_a_idx = schema.index_of(id_a_col)?;
     let id_b_idx = schema.index_of(id_b_col)?;

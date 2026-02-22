@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """Pre-generate Parquet catalogs for benchmarking. Avoids OOM and slow in-memory generation for large runs.
 
-Write fixtures to scripts/benchmark_fixtures/ (or --out-dir). Then run:
-  uv run python scripts/benchmark_cross_match.py --catalog-a scripts/benchmark_fixtures/catalog_a_1M.parquet --catalog-b scripts/benchmark_fixtures/catalog_b_1M.parquet -o matches.parquet --rust
+Write fixtures to data/benchmark_fixtures/ (or --out-dir). Default is to generate all standard sizes
+(100k, 1M, 50M). Then run benchmarks with those files:
+
+  uv run python scripts/generate_benchmark_fixtures.py
+  ./scripts/run_benchmarks.sh
+
+Or generate a single size and run manually:
+  uv run python scripts/generate_benchmark_fixtures.py --sizes 1000000
+  uv run python scripts/benchmark_cross_match.py --catalog-a data/benchmark_fixtures/catalog_a_1000000.parquet --catalog-b data/benchmark_fixtures/catalog_b_1000000.parquet --rust -o matches.parquet
 
 Usage:
-  uv run python scripts/generate_benchmark_fixtures.py [--rows 100000] [--rows-b 100000] [--out-dir DIR]
+  uv run python scripts/generate_benchmark_fixtures.py [--sizes 100000 1000000 50000000] [--out-dir DIR]
 """
 
 from __future__ import annotations
@@ -42,27 +49,36 @@ def generate_catalog(path: Path, n: int, seed: int, id_col: str = "source_id") -
         writer.close()
 
 
+# Default benchmark sizes (rows): 100k, 1M, 50M.
+DEFAULT_SIZES = [10_000_000]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Pre-generate benchmark catalog Parquet files")
-    parser.add_argument("--rows", type=int, default=100_000, help="Rows in catalog A")
-    parser.add_argument("--rows-b", type=int, default=None, help="Rows in catalog B (default: same as A)")
+    parser.add_argument(
+        "--sizes",
+        type=int,
+        nargs="*",
+        default=DEFAULT_SIZES,
+        help=f"Row counts to generate (default: {DEFAULT_SIZES}). Produces catalog_a_{{n}}.parquet and catalog_b_{{n}}.parquet for each n.",
+    )
     parser.add_argument(
         "--out-dir",
         type=Path,
-        default=Path(__file__).resolve().parent / "benchmark_fixtures",
+        default=Path(__file__).resolve().parent.parent / "data" / "benchmark_fixtures",
         help="Output directory for Parquet files",
     )
     args = parser.parse_args()
-    n_b = args.rows_b if args.rows_b is not None else args.rows
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    path_a = args.out_dir / f"catalog_a_{args.rows}.parquet"
-    path_b = args.out_dir / f"catalog_b_{n_b}.parquet"
-    print(f"Writing A: {path_a} ({args.rows} rows)")
-    generate_catalog(path_a, args.rows, 42, "source_id")
-    print(f"Writing B: {path_b} ({n_b} rows)")
-    generate_catalog(path_b, n_b, 123, "object_id")
-    print(f"Done. Run: uv run python scripts/benchmark_cross_match.py --catalog-a {path_a} --catalog-b {path_b} --rust -o matches.parquet")
+    for n in args.sizes:
+        path_a = args.out_dir / f"catalog_a_{n}.parquet"
+        path_b = args.out_dir / f"catalog_b_{n}.parquet"
+        print(f"Writing A: {path_a} ({n} rows)")
+        generate_catalog(path_a, n, 42, "source_id")
+        print(f"Writing B: {path_b} ({n} rows)")
+        generate_catalog(path_b, n, 123, "object_id")
+    print(f"Done. Fixtures in {args.out_dir}. Run: ./scripts/run_benchmarks.sh")
     return 0
 
 

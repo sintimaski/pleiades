@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Run benchmarks and write logs.
+# Run benchmarks using pregenerated fixtures (100k, 1M, 50M rows) and write logs.
+#
+# Generate fixtures first (one-time or when missing):
+#   uv run python scripts/generate_benchmark_fixtures.py
 #
 # Usage (from project root):
 #   ./scripts/run_benchmarks.sh
@@ -13,6 +16,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOGS_DIR="${PROJECT_ROOT}/logs"
+FIXTURES_DIR="${PROJECT_ROOT}/data/benchmark_fixtures"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_STDOUT="${LOGS_DIR}/benchmark_${TIMESTAMP}.log"
 LOG_STDERR="${LOGS_DIR}/benchmark_${TIMESTAMP}.stderr.log"
@@ -20,12 +24,26 @@ LOG_STDERR="${LOGS_DIR}/benchmark_${TIMESTAMP}.stderr.log"
 mkdir -p "$LOGS_DIR"
 
 cd "$PROJECT_ROOT"
-echo "Running benchmarks (args: ${*:-default})"
-echo "  stdout -> $LOG_STDOUT"
+echo "Running benchmarks (pregenerated fixture)"
+echo "  fixtures dir: $FIXTURES_DIR"
+echo "  log: $LOG_STDOUT"
+echo "  extra args: ${*:-none}"
 echo "---"
 
-PLEIADES_GPU=wgpu PLEIADES_GPU_MIN_PAIRS=0 uv run python scripts/benchmark_cross_match.py "$@" 2> "$LOG_STDOUT"
-# uv run python scripts/benchmark_cross_match.py --rows 1000000 --batch-size 500000 --verbose 2> "$LOG_STDOUT"
+ROWS=1000000
+BATCH=$((ROWS / 4))
+N_SHARDS=128
+CATALOG_A="${FIXTURES_DIR}/catalog_a_${ROWS}.parquet"
+CATALOG_B="${FIXTURES_DIR}/catalog_b_${ROWS}.parquet"
+# PLEIADES_GPU=wgpu PLEIADES_GPU_MIN_PAIRS=0 uv run python scripts/benchmark_cross_match.py "$@" 2> "$LOG_STDOUT"
+uv run python scripts/benchmark_cross_match.py \
+    --catalog-a "$CATALOG_A" \
+    --catalog-b "$CATALOG_B" \
+    --rows "$ROWS" \
+    --batch-size "$BATCH" \
+    --n_shards "$N_SHARDS" \
+    --verbose \
+    "$@" > "$LOG_STDOUT"
 
 echo "---"
-echo "Done. Logs: $LOG_STDOUT"
+echo "Done. Log: $LOG_STDOUT"

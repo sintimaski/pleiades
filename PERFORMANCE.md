@@ -44,7 +44,85 @@ Concepts or tools that can reduce I/O time and work across OSes (Windows, macOS,
 
 **Practical order to try:** (1) Larger batch sizes and buffer sizes (stay out-of-core); (2) temp dir on fast disk (SSD); (3) if still I/O-bound and B is small enough to fit in RAM, consider `keep_b_in_memory=True`; (4) mmap or overlapped B loading; (5) sequential access hints and compression choices for temp shards.
 
-**What the engine does for I/O:** Temp shard files (when not using `keep_b_in_memory`) are written with **no compression** and **256 KiB write buffers** to speed up partition and shard reads. For runs where B has ~1M rows and you have enough RAM, use **`--keep-b-in-memory`** (or `keep_b_in_memory=True` in the API): B is partitioned once into RAM and no shard I/O happens per chunk, so "load B" time goes away. Also set **`TMPDIR`** (or the platform temp dir) to an SSD so partition writes and shard reads are fast.
+## I/O as bottleneck (e.g. “load B” dominates)
+
+When verbose timing shows **partition B** and **load B** taking most of the time (e.g. partition ~33s, load B ~8s per chunk so ~80s over 10 chunks), I/O is the bottleneck. The join and index phases are already in Rust and fast.
+
+### Do you need an “assembly driver” to read files and push memory to Rust?
+
+**No.** The engine already does all I/O in Rust; there is no Python read path that copies data into Rust. A separate C/assembly “driver” that reads files and hands memory to Rust would not remove a boundary—Rust is already that boundary. The gains come from *how* Rust does I/O (buffer sizes, mmap, overlapped reads, or format choice), not from moving I/O into another layer.
+
+If you wanted a minimal “driver” in the sense of *fastest possible read path*, that would be: inside Rust, use memory-mapped files or a custom binary shard format and parse directly into the structures the join needs, avoiding Parquet decode per shard. That’s still Rust; no assembly required.
+
+### Suggested solutions (in rough order: quick wins → larger changes)
+
+| Solution | Effort | Impact | Notes |
+|----------|--------|--------|--------|
+| **1. `keep_b_in_memory=True`** | None (flag) | **Removes “load B” entirely** after partition | Use when B fits in RAM (e.g. ~10M rows × ~40 bytes ≈ hundreds of MB). Partition once into RAM; no shard I/O per chunk. |
+| **2. Larger read buffers** | Small (code) | 10–30% faster shard reads in many cases | Wrap `File` in `BufReader::with_capacity(1 << 20, file)` (1 MiB) for every Parquet open (partition read, each shard in `load_b_from_shards`, A prefetch). Fewer syscalls, better throughput. |
+| **3. Temp dir on fast storage** | None (env) | 2× or more if currently on HDD | Set `TMPDIR` to an SSD or RAM disk so partition write and shard reads are fast. |
+| **4. Prefetch B for next chunk** | Medium (code) | Overlap “load B” with “join (CPU)” | Like A prefetch: in a background thread, load the *next* chunk’s B shards while the main thread joins the *current* chunk. Requires predicting next chunk’s pixels or loading a superset. |
+| **5. Memory-mapped shard reads** | Medium (code + dep) | Can reduce copy and syscall overhead | Add `memmap2`; open each shard with `unsafe { Mmap::map(&file)? }` and build a Parquet reader from `Bytes::from(mmap.as_ref())` if the Parquet API accepts it. Or use mmap only for a custom binary shard format (see below). |
+| **6. Custom binary shard format** | Larger (code) | Highest throughput for B load | Instead of Parquet shards, write a simple binary layout (e.g. fixed record: `pixel_id: u64`, `id_b: i64`, `ra: f64`, `dec: f64`) and memory-map or stream with large buffers. Parse with `std::io::Read` or pointer casts (safe if layout is fixed). No Parquet decode; “load B” becomes mostly I/O bound. |
+| **7. Fewer, larger shards** | Tuning | Fewer file opens; more sequential I/O | Try e.g. `n_shards=128` instead of 512. Fewer shards = fewer small files and often better sequential read behavior; selectivity per chunk may drop slightly. |
+| **8. Sequential access hints** | Medium (code, platform) | Better OS read-ahead | On Unix, after opening a file for sequential read, call `posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)` (via `libc` or `nix`). Helps the kernel prefetch. |
+
+**What the engine does for I/O:** Temp shard files (when not using `keep_b_in_memory`) are written with **no compression** and **256 KiB write buffers** to speed up partition and shard reads. Partition uses a **131k-row flush** so fewer Parquet `write()` calls and RecordBatch builds. **B prefetch** is on when using shard files (not in-memory B): the engine keeps two A batches ahead and loads B for the *next* chunk in a background thread while joining the *current* chunk, so "load B" and "join (CPU)" overlap. With `PLEIADES_VERBOSE=1` you’ll see "B prefetch: overlapping load B with join" when it’s active. For runs where B fits in RAM, use **`--keep-b-in-memory`** (or `keep_b_in_memory=True` in the API): B is partitioned once into RAM and no shard I/O happens per chunk. Also set **`TMPDIR`** to an SSD so partition writes and shard reads are fast.
+
+### Can I/O be async?
+
+**Yes.** The Parquet crate (52.x) has an **async API** when the `async` feature is enabled: `ParquetRecordBatchStreamBuilder`, `ParquetRecordBatchStream`, and async file readers (e.g. `tokio::fs::File`). You can move the engine’s I/O to async and run it on a Tokio runtime.
+
+**What it would take:**
+
+| Piece | Change |
+|--------|--------|
+| **Cargo** | Add `parquet = { ..., features = ["arrow", "snap", "async"] }`, add `tokio` with `rt-multi-thread` and `fs`. |
+| **Engine** | Refactor to `async fn`: open files with `tokio::fs::File::open(...).await`, use `ParquetRecordBatchStreamBuilder::new(file).await` and streams instead of `ParquetRecordBatchReaderBuilder` + sync reader. Run CPU-heavy work (partition hash loop, join) in `tokio::task::spawn_blocking` so the async runtime isn’t blocked. |
+| **Python boundary** | Keep the public API sync: from the PyO3 entry point run `tokio::runtime::Runtime::new()?.block_on(cross_match_impl_async(...))` (or use `Handle::current().block_on` if you already have a runtime). Python still sees a blocking call; inside Rust, I/O is async. |
+
+**When it helps:**
+
+- **Today:** The engine already overlaps I/O with compute using **threads** (A prefetch, B prefetch). So you already get “async-like” overlap without an async runtime.
+- **With async:** You can have many I/O operations in flight (e.g. start several shard reads, await them, then run the join) without one OS thread per operation. That can reduce context switching and scale better if you add more concurrent reads (e.g. more overlapping shard loads). It also fits if you later integrate with other async code (e.g. object storage, async Python).
+
+**Practical takeaway:** Async I/O is possible and the crates support it, but it’s a non-trivial refactor. Try the existing thread-based prefetch and `keep_b_in_memory` first; consider an async path if you need many concurrent I/O ops or an async-native design.
+
+### Async migration: analysis and recommendation
+
+**Current design (no async):**
+
+| Component | Concurrency | Role |
+|-----------|-------------|------|
+| **A reads** | 1 dedicated thread | Prefetches next batch(es) of catalog A; main thread never blocks on A I/O. |
+| **B shard reads** | **Rayon** (N threads) | `load_b_from_shards` uses `par_iter` over shard indices; many shards are read in parallel. |
+| **B prefetch** | 1 dedicated thread | Loads B for the *next* chunk while the main thread joins the *current* chunk. |
+| **Main thread** | 1 | Index A, receive prefetched B (or sync load first chunk), Rayon-based join, write. |
+
+So I/O is already overlapped with compute (A and B prefetch), and B load is already **parallel across shards** (not one-thread-per-chunk). The only single-threaded I/O is the sequential partition read/write and the A stream.
+
+**What async would change:**
+
+- Replace dedicated threads with async tasks and a Tokio runtime.
+- Use `ParquetRecordBatchStreamBuilder` + `tokio::fs::File` for A and for each shard (or keep sync in `spawn_blocking`).
+- Run CPU-heavy work (partition hash loop, join) in `spawn_blocking` so the runtime isn’t starved.
+- At the PyO3 boundary: `block_on(cross_match_impl_async(...))` so Python still sees a blocking call.
+
+**Why async is not needed today:**
+
+1. **Overlap already achieved:** Threads already overlap “load B” with “join” and A read with the rest of the pipeline. Benchmarks show chunk time ≈ max(load B, join) + index, not load B + join.
+2. **B is already parallel:** Shard reads run in parallel via Rayon. Async would not increase B concurrency; it would only change how those reads are scheduled (cooperatively vs. OS threads).
+3. **Single sync entry point:** The engine is called only from Python via PyO3, in a blocking way. There is no async caller or async ecosystem to plug into.
+4. **Cost is high:** Full engine refactor to `async fn`, `spawn_blocking` for all CPU work, and a runtime at the boundary. Ongoing maintenance of two mental models (sync vs async) if only part of the code is migrated.
+5. **Benefit is low:** Gains appear when you have many small, independent I/O operations and want to multiplex them on few threads. Here, B load is already N-way parallel (Rayon), and A is a single stream; the bottleneck is usually disk throughput or CPU (join), not lack of concurrency.
+
+**Recommendation:** **Do not migrate to async** unless you have a concrete need, for example:
+
+- Reading catalogs from **object storage** (S3, GCS, Azure) via async object-store APIs.
+- Calling the engine from **async Rust** or **async Python** without blocking a thread.
+- A future design with **many more concurrent I/O streams** (e.g. dozens of independent partition reads) where you want to cap OS thread count.
+
+Until then, keep the current thread- and Rayon-based design and tune with the existing knobs (e.g. `keep_b_in_memory`, `TMPDIR`, batch sizes, B prefetch).
 
 ## Further CPU improvements
 
