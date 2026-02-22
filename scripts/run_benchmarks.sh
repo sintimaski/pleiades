@@ -42,12 +42,14 @@ echo "---"
 
 # 1M-row fixtures; tool defaults (batch 250k, n_shards 16) match this scale
 ROWS=1000000
+BATCH=$((ROWS / 4))
 CATALOG_A="${FIXTURES_DIR}/catalog_a_${ROWS}.parquet"
 CATALOG_B="${FIXTURES_DIR}/catalog_b_${ROWS}.parquet"
 uv run python scripts/benchmark_cross_match.py \
     --catalog-a "$CATALOG_A" \
     --catalog-b "$CATALOG_B" \
     --verbose \
+    --batch-size $BATCH \
     "$@" > "$LOG_STDOUT"
 
 prune_logs

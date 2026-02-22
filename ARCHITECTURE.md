@@ -1,6 +1,8 @@
 # How Pleiades works
 
-High-level flow and where the heavy work runs.
+High-level flow and where the work runs.
+
+---
 
 ## Flow
 
@@ -14,30 +16,39 @@ catalog_a.parquet     catalog_b.parquet (or shard dir)
         |
         v
   For each A chunk:
-  - Assign pixels (ra, dec → HEALPix)
-  - For each B row in same/neighbor pixels: haversine, emit (id_a, id_b, sep)
-  - Write matches to Parquet
+  · Assign pixels (ra, dec → HEALPix)
+  · For each B row in same/neighbor pixels: haversine → (id_a, id_b, sep)
+  · Write matches to Parquet
         |
         v
   matches.parquet (id_a, id_b, separation_arcsec)
 ```
 
-**Rust does the join.** Python does: CLI, validation, schema checks, and helpers (summarize, cone search, partition). B is either partitioned once into shards or read from a pre-partitioned directory; each A chunk only touches B rows in the same or neighboring HEALPix pixels, so we never load full catalogs.
+- **Rust** does the join
+- **Python** does: CLI, validation, schema checks, helpers (summarize, cone, partition)
+- B is partitioned once or read from a shard directory; each A chunk only touches B rows in same/neighbor pixels
+
+---
 
 ## Main pieces
 
 | Piece | Role |
 |-------|------|
-| **Rust engine** (`src/`, built with `maturin develop`) | Streams A, indexes by pixel, loads only relevant B from shards, haversine + rayon, writes matches. Supports `n_nearest`, `progress_callback`, `keep_b_in_memory`, pre-partitioned B (directory of `shard_*.parquet`). |
-| **Python API** (`python/pleiades/`) | `cross_match()` calls the Rust extension; `cross_match_iter()` is a Python-only streaming path. Analysis, cone search, `partition_catalog`, CLI. Validates inputs; `include_coords` is applied in Python after the Rust run. |
-| **pleiades_core** | PyO3 bindings to the Rust extension; built by maturin and shipped in wheels. |
+| **Rust engine** (`src/`) | Streams A, indexes by pixel, loads only relevant B from shards, haversine + rayon, writes matches. Supports `n_nearest`, `progress_callback`, `keep_b_in_memory`, pre-partitioned B (`shard_*.parquet` dir). |
+| **Python API** (`python/pleiades/`) | `cross_match()` → Rust; `cross_match_iter()` → Python-only streaming. Analysis, cone search, `partition_catalog`, CLI. `include_coords` applied in Python after Rust. |
+| **pleiades_core** | PyO3 bindings; built by maturin, shipped in wheels. |
 
-Cross-match is **Rust-only**; there is no Python fallback. If the extension isn’t installed you get a clear error and install instructions.
+- Cross-match is **Rust-only** (no Python fallback)
+- Missing extension → clear error + install instructions
+
+---
 
 ## Bottlenecks and knobs
 
-- **B reads**: One partition pass (or skip it by passing a shard directory). Per A chunk we only read B rows for the pixels we need.
-- **Memory**: Governed by `batch_size_a`, `batch_size_b`, and `n_shards`. Smaller batches = less RAM, more I/O.
-- **Throughput**: Rayon parallelizes the inner B-loop in Rust. For big runs, pre-partition B and pass the directory; use `progress_callback` (e.g. with tqdm) to watch progress.
+| Knob | Effect |
+|------|--------|
+| **B reads** | One partition pass, or pass a shard directory to skip. Per A chunk: only B rows for needed pixels. |
+| **Memory** | `batch_size_a`, `batch_size_b`, `n_shards`. Smaller = less RAM, more I/O. |
+| **Throughput** | Rayon in Rust. Pre-partition B + pass directory; use `progress_callback` (e.g. tqdm). |
 
-Tuning and GPU notes: [PERFORMANCE.md](PERFORMANCE.md).
+- Tuning and GPU: [PERFORMANCE.md](PERFORMANCE.md)
