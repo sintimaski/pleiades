@@ -32,7 +32,7 @@ echo "---"
 
 ROWS=1000000
 BATCH=$((ROWS / 4))
-N_SHARDS=128
+N_SHARDS=16
 CATALOG_A="${FIXTURES_DIR}/catalog_a_${ROWS}.parquet"
 CATALOG_B="${FIXTURES_DIR}/catalog_b_${ROWS}.parquet"
 # PLEIADES_GPU=wgpu PLEIADES_GPU_MIN_PAIRS=0 uv run python scripts/benchmark_cross_match.py "$@" 2> "$LOG_STDOUT"
@@ -41,7 +41,7 @@ uv run python scripts/benchmark_cross_match.py \
     --catalog-b "$CATALOG_B" \
     --rows "$ROWS" \
     --batch-size "$BATCH" \
-    --n_shards "$N_SHARDS" \
+    --n-shards "$N_SHARDS" \
     --verbose \
     "$@" > "$LOG_STDOUT"
 

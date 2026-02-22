@@ -114,6 +114,12 @@ def main() -> int:
         action="store_true",
         help="Partition B into RAM (no shard I/O). Use only when B is small; default is out-of-core (disk).",
     )
+    parser.add_argument(
+        "--n-shards",
+        type=int,
+        default=None,
+        help="Number of HEALPix shards for B (default: API default). More shards = finer granularity; fewer = less I/O overhead.",
+    )
     args = parser.parse_args()
     n_b = args.rows_b if args.rows_b is not None else args.rows
 
@@ -140,9 +146,12 @@ def main() -> int:
     runs: list[tuple[str, bool]] = [("Rust", True)]
     batch_kw: dict = {}
     if args.batch_size is not None:
-        batch_kw = {"batch_size_a": args.batch_size, "batch_size_b": args.batch_size}
+        batch_kw["batch_size_a"] = args.batch_size
+        batch_kw["batch_size_b"] = args.batch_size
     if args.keep_b_in_memory:
         batch_kw["keep_b_in_memory"] = True
+    if args.n_shards is not None:
+        batch_kw["n_shards"] = args.n_shards
 
     # Ctrl+C: set flag so progress_callback returns False next chunk (stops within ~1 chunk delay)
     cancel_requested: list[bool] = [False]
