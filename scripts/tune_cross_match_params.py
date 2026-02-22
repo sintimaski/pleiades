@@ -32,11 +32,13 @@ def _get_max_rss_bytes() -> tuple[float | None, bool]:
     if sys.platform == "win32":
         try:
             import psutil
+
             return (float(psutil.Process().memory_info().rss), False)
         except ImportError:
             return (None, False)
     try:
         import resource
+
         ru = resource.getrusage(resource.RUSAGE_SELF)
         if sys.platform == "darwin":
             return (float(ru.ru_maxrss), True)
@@ -46,7 +48,7 @@ def _get_max_rss_bytes() -> tuple[float | None, bool]:
 
 
 def _format_memory_bytes(b: float) -> str:
-    if b >= 1024 ** 3:
+    if b >= 1024**3:
         return f"{b / 1024**3:.2f} GiB"
     return f"{b / 1024**2:.2f} MiB"
 
@@ -62,11 +64,13 @@ def generate_catalog(
     ra = rng.uniform(0, 360, size=n)
     dec = np.degrees(np.arcsin(rng.uniform(-1, 1, size=n)))
     ids = np.arange(n, dtype=np.int64)
-    table = pa.table({
-        id_col: ids,
-        "ra": ra.astype(np.float64),
-        "dec": dec.astype(np.float64),
-    })
+    table = pa.table(
+        {
+            id_col: ids,
+            "ra": ra.astype(np.float64),
+            "dec": dec.astype(np.float64),
+        }
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path, use_dictionary=False)
 
@@ -83,6 +87,7 @@ def run_one(
 ) -> tuple[float, float | None, int] | None:
     """Run cross_match once; return (time_sec, max_rss_bytes or None, matches_count) or None if cancelled."""
     import pleiades
+
     t0 = time.perf_counter()
     kwargs: dict = {
         "catalog_a": path_a,
@@ -196,10 +201,7 @@ def main() -> int:
 
     results: list[dict] = []
     total_runs = (
-        len(args.batch_sizes)
-        * len(n_shards_list)
-        * len(memory_list)
-        * args.runs
+        len(args.batch_sizes) * len(n_shards_list) * len(memory_list) * args.runs
     )
     run_idx = 0
 
@@ -208,7 +210,7 @@ def main() -> int:
             for keep_b_in_memory in memory_list:
                 times: list[float] = []
                 rss_list: list[float] = []
-                for r in range(args.runs):
+                for _ in range(args.runs):
                     run_idx += 1
                     out_path = tmp / f"matches_{run_idx}.parquet"
                     if not args.quiet:
@@ -238,32 +240,38 @@ def main() -> int:
                         if max_rss is not None:
                             rss_list.append(max_rss)
                         if not args.quiet:
-                            rss_str = _format_memory_bytes(max_rss) if max_rss else "N/A"
+                            rss_str = (
+                                _format_memory_bytes(max_rss) if max_rss else "N/A"
+                            )
                             print(f"{elapsed:.2f}s  {rss_str}")
                     except Exception as e:
                         if not args.quiet:
                             print(f"FAILED: {e}")
-                        results.append({
-                            "batch_size": batch_size,
-                            "n_shards": n_shards,
-                            "keep_b_in_memory": keep_b_in_memory,
-                            "time_sec": float("inf"),
-                            "max_rss_mib": None,
-                            "matches": -1,
-                        })
+                        results.append(
+                            {
+                                "batch_size": batch_size,
+                                "n_shards": n_shards,
+                                "keep_b_in_memory": keep_b_in_memory,
+                                "time_sec": float("inf"),
+                                "max_rss_mib": None,
+                                "matches": -1,
+                            }
+                        )
                         continue
                 if not times:
                     continue
                 avg_time = sum(times) / len(times)
                 avg_rss = sum(rss_list) / len(rss_list) if rss_list else None
-                results.append({
-                    "batch_size": batch_size,
-                    "n_shards": n_shards,
-                    "keep_b_in_memory": keep_b_in_memory,
-                    "time_sec": avg_time,
-                    "max_rss_mib": avg_rss / (1024 * 1024) if avg_rss else None,
-                    "matches": matches if args.runs == 1 else 0,
-                })
+                results.append(
+                    {
+                        "batch_size": batch_size,
+                        "n_shards": n_shards,
+                        "keep_b_in_memory": keep_b_in_memory,
+                        "time_sec": avg_time,
+                        "max_rss_mib": avg_rss / (1024 * 1024) if avg_rss else None,
+                        "matches": matches if args.runs == 1 else 0,
+                    }
+                )
 
     if env_verbose is not None:
         os.environ["PLEIADES_VERBOSE"] = env_verbose
@@ -275,7 +283,9 @@ def main() -> int:
 
     out_of_core = [r for r in valid if r["keep_b_in_memory"] is False]
     in_memory = [r for r in valid if r["keep_b_in_memory"] is True]
-    best_out_of_core = min(out_of_core, key=lambda r: r["time_sec"]) if out_of_core else None
+    best_out_of_core = (
+        min(out_of_core, key=lambda r: r["time_sec"]) if out_of_core else None
+    )
     best_in_memory = min(in_memory, key=lambda r: r["time_sec"]) if in_memory else None
 
     # Table
@@ -288,7 +298,9 @@ def main() -> int:
     for r in sorted(valid, key=lambda x: (x["time_sec"], x["batch_size"])):
         mem_flag = "yes" if r["keep_b_in_memory"] else "no"
         rss_str = f"{r['max_rss_mib']:.1f} MiB" if r["max_rss_mib"] else "N/A"
-        print(f"{r['batch_size']:>12} {r['n_shards']:>10} {mem_flag:>10} {r['time_sec']:>10.2f} {rss_str:>10}")
+        print(
+            f"{r['batch_size']:>12} {r['n_shards']:>10} {mem_flag:>10} {r['time_sec']:>10.2f} {rss_str:>10}"
+        )
     print("-" * 72)
     print()
 

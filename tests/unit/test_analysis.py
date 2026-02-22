@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pleiades
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
-import pleiades
-from pleiades.models import MatchSummary
 
 
 @pytest.mark.unit
@@ -105,9 +103,7 @@ class TestMatchStats:
             ),
             path,
         )
-        stats = pleiades.match_stats(
-            path, separation_percentiles=[25.0, 50.0, 75.0]
-        )
+        stats = pleiades.match_stats(path, separation_percentiles=[25.0, 50.0, 75.0])
         assert "separation_percentiles" in stats
         pct = stats["separation_percentiles"]
         assert "25.0" in pct
@@ -197,8 +193,12 @@ class TestAttachMatchCoords:
             cat_b,
         )
         pleiades.attach_match_coords(
-            matches, cat_a, cat_b, out,
-            id_col_a="source_id", id_col_b="object_id",
+            matches,
+            cat_a,
+            cat_b,
+            out,
+            id_col_a="source_id",
+            id_col_b="object_id",
         )
         t = pq.read_table(out)
         assert "ra_a" in t.column_names
@@ -377,7 +377,13 @@ class TestMultiRadiusCrossMatch:
             assert Path(path).is_file()
             t = pq.read_table(path)
             if t.num_rows > 0:
-                assert max(t.column("separation_arcsec")[i].as_py() for i in range(t.num_rows)) <= r
+                assert (
+                    max(
+                        t.column("separation_arcsec")[i].as_py()
+                        for i in range(t.num_rows)
+                    )
+                    <= r
+                )
         combined = tmp_path / "matches_max_radius.parquet"
         assert combined.is_file()
         n_max = pq.read_table(combined).num_rows

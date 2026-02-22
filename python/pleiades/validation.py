@@ -94,7 +94,7 @@ def validate_catalog_schema(
             if suggestion:
                 msg += f" Did you mean '{suggestion}'?"
             raise CatalogValidationError(msg)
-        return names_lower[key]
+        return str(names_lower[key])
 
     for col_name, _key in [(ra_col, "ra"), (dec_col, "dec")]:
         resolved = resolve(col_name)

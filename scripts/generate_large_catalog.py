@@ -31,11 +31,13 @@ def generate_large_catalog(
     seed: int = 999,
 ) -> None:
     """Write a large Parquet file in row-groups (chunked on disk)."""
-    schema = pa.schema([
-        ("source_id", pa.int64()),
-        ("ra", pa.float64()),
-        ("dec", pa.float64()),
-    ])
+    schema = pa.schema(
+        [
+            ("source_id", pa.int64()),
+            ("ra", pa.float64()),
+            ("dec", pa.float64()),
+        ]
+    )
     rng = _simple_rng(seed)
     written = 0
     with pq.ParquetWriter(output_path, schema) as writer:
@@ -51,7 +53,9 @@ def generate_large_catalog(
             )
             writer.write_table(table, row_group_size=chunk)
             written += chunk
-    print(f"Wrote {output_path} ({written} rows, {written // rows_per_row_group} row-groups)")
+    print(
+        f"Wrote {output_path} ({written} rows, {written // rows_per_row_group} row-groups)"
+    )
 
 
 def main() -> int:

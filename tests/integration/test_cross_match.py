@@ -305,12 +305,14 @@ def test_rust_with_prepartitioned_b_matches_reference(tmp_path: Path) -> None:
     n_shards = 32
     shard_dir = tmp_path / "shards"
     shard_dir.mkdir()
-    schema = pa.schema([
-        ("pixel_id", pa.uint64()),
-        ("id_b", pa.string()),
-        ("ra", pa.float64()),
-        ("dec", pa.float64()),
-    ])
+    schema = pa.schema(
+        [
+            ("pixel_id", pa.uint64()),
+            ("id_b", pa.string()),
+            ("ra", pa.float64()),
+            ("dec", pa.float64()),
+        ]
+    )
     writers = [
         pq.ParquetWriter(shard_dir / f"shard_{s:04d}.parquet", schema)
         for s in range(n_shards)
@@ -367,8 +369,12 @@ def test_rust_n_nearest_reduces_output(tmp_path: Path) -> None:
     """With use_rust=True and n_nearest=1, at most one match per id_a."""
     pytest.importorskip("pleiades_core")
     table_a, table_b, _ = make_catalogs_exact_n_pairs(
-        n_pairs=5, radius_arcsec=2.0, separation_arcsec=1.0,
-        n_a_extra=5, n_b_extra=15, seed=42
+        n_pairs=5,
+        radius_arcsec=2.0,
+        separation_arcsec=1.0,
+        n_a_extra=5,
+        n_b_extra=15,
+        seed=42,
     )
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out = tmp_path / "matches_n1.parquet"
@@ -395,7 +401,9 @@ def test_rust_n_nearest_reduces_output(tmp_path: Path) -> None:
 def test_rust_progress_callback_called(tmp_path: Path) -> None:
     """With use_rust=True and progress_callback, callback is invoked."""
     pytest.importorskip("pleiades_core")
-    table_a, table_b = make_catalogs_no_pairs(n_a=20, n_b=20, radius_arcsec=2.0, seed=88)
+    table_a, table_b = make_catalogs_no_pairs(
+        n_a=20, n_b=20, radius_arcsec=2.0, seed=88
+    )
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out = tmp_path / "matches.parquet"
     progress_calls: list = []
@@ -473,12 +481,14 @@ def test_prepartitioned_b_directory_matches_file_path(tmp_path: Path) -> None:
     n_shards = 32
     shard_dir = tmp_path / "shards"
     shard_dir.mkdir()
-    schema = pa.schema([
-        ("pixel_id", pa.uint64()),
-        ("id_b", pa.string()),
-        ("ra", pa.float64()),
-        ("dec", pa.float64()),
-    ])
+    schema = pa.schema(
+        [
+            ("pixel_id", pa.uint64()),
+            ("id_b", pa.string()),
+            ("ra", pa.float64()),
+            ("dec", pa.float64()),
+        ]
+    )
     writers = [
         pq.ParquetWriter(shard_dir / f"shard_{s:04d}.parquet", schema)
         for s in range(n_shards)
@@ -549,8 +559,12 @@ def test_partition_catalog_produces_shards(tmp_path: Path) -> None:
 def test_cross_match_include_coords_adds_ra_dec_columns(tmp_path: Path) -> None:
     """cross_match with include_coords=True writes ra_a, dec_a, ra_b, dec_b."""
     table_a, table_b, expected = make_catalogs_exact_n_pairs(
-        n_pairs=3, radius_arcsec=2.0, separation_arcsec=1.0,
-        n_a_extra=5, n_b_extra=5, seed=22
+        n_pairs=3,
+        radius_arcsec=2.0,
+        separation_arcsec=1.0,
+        n_a_extra=5,
+        n_b_extra=5,
+        seed=22,
     )
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out = tmp_path / "matches_with_coords.parquet"

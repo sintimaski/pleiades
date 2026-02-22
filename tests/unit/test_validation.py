@@ -7,7 +7,6 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
 from pleiades.validation import (
     CatalogValidationError,
     validate_catalog_schema,
@@ -166,12 +165,14 @@ class TestValidatePrepartitionedDir:
 
     def test_valid_shard_dir_returns_n_shards_and_schema(self, tmp_path: Path) -> None:
         """Valid shard directory returns count and schema."""
-        schema = pa.schema([
-            ("pixel_id", pa.uint64()),
-            ("id_b", pa.int64()),
-            ("ra", pa.float64()),
-            ("dec", pa.float64()),
-        ])
+        schema = pa.schema(
+            [
+                ("pixel_id", pa.uint64()),
+                ("id_b", pa.int64()),
+                ("ra", pa.float64()),
+                ("dec", pa.float64()),
+            ]
+        )
         for i in range(3):
             pq.write_table(
                 pa.table(

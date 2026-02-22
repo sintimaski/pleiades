@@ -28,11 +28,13 @@ def make_catalog_a(n: int = 500, seed: int = 42) -> pa.Table:
     source_id = list(range(1, n + 1))
     return pa.table(
         {"source_id": source_id, "ra": ra, "dec": dec},
-        schema=pa.schema([
-            ("source_id", pa.int64()),
-            ("ra", pa.float64()),
-            ("dec", pa.float64()),
-        ]),
+        schema=pa.schema(
+            [
+                ("source_id", pa.int64()),
+                ("ra", pa.float64()),
+                ("dec", pa.float64()),
+            ]
+        ),
     )
 
 
@@ -45,11 +47,13 @@ def make_catalog_b(n: int = 300, seed: int = 123) -> pa.Table:
     object_id = [f"B{i}" for i in range(1, n + 1)]
     return pa.table(
         {"object_id": object_id, "ra": ra, "dec": dec},
-        schema=pa.schema([
-            ("object_id", pa.string()),
-            ("ra", pa.float64()),
-            ("dec", pa.float64()),
-        ]),
+        schema=pa.schema(
+            [
+                ("object_id", pa.string()),
+                ("ra", pa.float64()),
+                ("dec", pa.float64()),
+            ]
+        ),
     )
 
 
@@ -97,19 +101,23 @@ def make_catalog_with_pairs(
 
     table_a = pa.table(
         {"source_id": a_ids, "ra": a_ra, "dec": a_dec},
-        schema=pa.schema([
-            ("source_id", pa.int64()),
-            ("ra", pa.float64()),
-            ("dec", pa.float64()),
-        ]),
+        schema=pa.schema(
+            [
+                ("source_id", pa.int64()),
+                ("ra", pa.float64()),
+                ("dec", pa.float64()),
+            ]
+        ),
     )
     table_b = pa.table(
         {"object_id": b_ids, "ra": b_ra, "dec": b_dec},
-        schema=pa.schema([
-            ("object_id", pa.string()),
-            ("ra", pa.float64()),
-            ("dec", pa.float64()),
-        ]),
+        schema=pa.schema(
+            [
+                ("object_id", pa.string()),
+                ("ra", pa.float64()),
+                ("dec", pa.float64()),
+            ]
+        ),
     )
     return table_a, table_b
 

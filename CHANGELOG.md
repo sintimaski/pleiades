@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- No changes yet.
+### Changed
+
+- **Documentation**: README benchmark section documents `generate_benchmark_fixtures.py` and `run_benchmarks.sh`; project layout updated (pleiades_core, scripts list).
+- **Code quality**: Ruff and test cleanups (import order, unused imports, loop variable, assertion on specific exception). Mypy overrides for untyped third-party libs (pyarrow, astropy, cdshealpix); assertions for optional ParquetWriter and partition writers.
+- **Rust engine**: Parquet 52 compatibility — use `File` directly for `ParquetRecordBatchReaderBuilder::try_new()` (parquet 52’s `ChunkReader` is implemented for `File`, not `BufReader`). Removed unused `BufReader` import and `PARQUET_READ_BUFFER_BYTES`.
 
 ## [0.1.0] - 2025-02-21
 

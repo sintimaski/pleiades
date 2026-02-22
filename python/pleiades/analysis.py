@@ -52,8 +52,7 @@ def match_stats(
     }
     if separation_percentiles and len(sep_np) > 0:
         out["separation_percentiles"] = {
-            str(p): float(np.percentile(sep_np, p))
-            for p in separation_percentiles
+            str(p): float(np.percentile(sep_np, p)) for p in separation_percentiles
         }
     return out
 
@@ -323,7 +322,10 @@ def attach_match_coords(
             (n for n in catalog_b.column_names if n.lower() not in ("ra", "dec")),
             "id",
         )
-    def build_id_to_ra_dec(tbl: pa.Table, id_name: str) -> dict[Any, tuple[float, float]]:
+
+    def build_id_to_ra_dec(
+        tbl: pa.Table, id_name: str
+    ) -> dict[Any, tuple[float, float]]:
         out: dict[Any, tuple[float, float]] = {}
         id_col = tbl.column(id_name)
         ra_col_arr = tbl.column(ra_col)
@@ -332,6 +334,7 @@ def attach_match_coords(
             k = id_col[i].as_py() if hasattr(id_col[i], "as_py") else id_col[i]
             out[k] = (float(ra_col_arr[i].as_py()), float(dec_col_arr[i].as_py()))
         return out
+
     a_map = build_id_to_ra_dec(catalog_a, id_col_a)
     b_map = build_id_to_ra_dec(catalog_b, id_col_b)
     id_a_arr = matches.column(id_a_name)
@@ -359,12 +362,14 @@ def attach_match_coords(
             dec_b_list.append(None)
     new_columns = list(matches.columns)
     new_names = list(matches.column_names)
-    new_columns.extend([
-        pa.array(ra_a_list),
-        pa.array(dec_a_list),
-        pa.array(ra_b_list),
-        pa.array(dec_b_list),
-    ])
+    new_columns.extend(
+        [
+            pa.array(ra_a_list),
+            pa.array(dec_a_list),
+            pa.array(ra_b_list),
+            pa.array(dec_b_list),
+        ]
+    )
     new_names.extend(["ra_a", "dec_a", "ra_b", "dec_b"])
     out_table = pa.table(dict(zip(new_names, new_columns, strict=True)))
     path_out.parent.mkdir(parents=True, exist_ok=True)

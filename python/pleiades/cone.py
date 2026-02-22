@@ -87,6 +87,7 @@ def cone_search(
         if out_schema is None:
             out_schema = extended.schema
             writer = pq.ParquetWriter(path_out, out_schema)
+        assert writer is not None
         writer.write_table(extended)
         total_written += extended.num_rows
 
@@ -174,6 +175,7 @@ def batch_cone_search(
         if out_schema is None:
             out_schema = extended.schema
             writer = pq.ParquetWriter(path_out, out_schema)
+        assert writer is not None
         writer.write_table(extended)
         total_written += extended.num_rows
     if writer is not None:

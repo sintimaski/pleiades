@@ -90,7 +90,9 @@ def run_benchmark(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run Rust tests, Python tests, and optional benchmark.")
+    parser = argparse.ArgumentParser(
+        description="Run Rust tests, Python tests, and optional benchmark."
+    )
     parser.add_argument(
         "--benchmark",
         action="store_true",

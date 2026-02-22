@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pleiades
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
-import pleiades
 from pleiades.validation import CatalogValidationError
 
 
@@ -89,6 +88,7 @@ class TestConeSearch:
     def test_cone_search_radians_units(self, tmp_path: Path) -> None:
         """cone_search with ra_dec_units='rad' converts catalog coords and finds match."""
         import math
+
         rad = math.radians(180.0)  # 180 deg in rad
         cat = tmp_path / "rad_cat.parquet"
         pq.write_table(
@@ -157,9 +157,7 @@ class TestBatchConeSearch:
             catalog,
         )
         out = tmp_path / "empty.parquet"
-        n = pleiades.batch_cone_search(
-            catalog, [(100.0, 100.0, 1.0)], out
-        )
+        n = pleiades.batch_cone_search(catalog, [(100.0, 100.0, 1.0)], out)
         assert n == 0
         t = pq.read_table(out)
         assert t.num_rows == 0

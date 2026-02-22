@@ -37,11 +37,13 @@ def generate_catalog(path: Path, n: int, seed: int, id_col: str = "source_id") -
         ra = rng.uniform(0, 360, size=size)
         dec = np.degrees(np.arcsin(rng.uniform(-1, 1, size=size)))
         ids = np.arange(start, end, dtype=np.int64)
-        table = pa.table({
-            id_col: ids,
-            "ra": ra.astype(np.float64),
-            "dec": dec.astype(np.float64),
-        })
+        table = pa.table(
+            {
+                id_col: ids,
+                "ra": ra.astype(np.float64),
+                "dec": dec.astype(np.float64),
+            }
+        )
         if writer is None:
             writer = pq.ParquetWriter(path, table.schema, use_dictionary=False)
         writer.write_table(table)
@@ -54,7 +56,9 @@ DEFAULT_SIZES = [10_000_000]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Pre-generate benchmark catalog Parquet files")
+    parser = argparse.ArgumentParser(
+        description="Pre-generate benchmark catalog Parquet files"
+    )
     parser.add_argument(
         "--sizes",
         type=int,

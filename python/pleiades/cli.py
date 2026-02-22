@@ -14,7 +14,20 @@ def _path(s: str) -> Path:
 
 def cmd_cross_match(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Run cross-match from CLI."""
+    import os
+
     import pleiades
+
+    if getattr(args, "verbose", False):
+        os.environ["PLEIADES_VERBOSE"] = "1"
+    batch_kw: dict = {}
+    if getattr(args, "batch_size", None) is not None:
+        batch_kw["batch_size_a"] = args.batch_size
+        batch_kw["batch_size_b"] = args.batch_size
+    if getattr(args, "n_shards", None) is not None:
+        batch_kw["n_shards"] = args.n_shards
+    if getattr(args, "keep_b_in_memory", False):
+        batch_kw["keep_b_in_memory"] = True
 
     result = pleiades.cross_match(
         catalog_a=args.catalog_a,
@@ -27,6 +40,7 @@ def cmd_cross_match(parser: argparse.ArgumentParser, args: argparse.Namespace) -
         id_col_b=args.id_col_b,
         n_nearest=int(args.n_nearest) if args.n_nearest else None,
         use_rust=args.rust,
+        **batch_kw,
     )
     print(
         f"Wrote {result.matches_count} matches to {result.output_path} "
@@ -94,14 +108,20 @@ def main() -> int:
     # cross-match
     p_cm = subparsers.add_parser("cross-match", help="Cross-match two Parquet catalogs")
     p_cm.add_argument("catalog_a", type=_path, help="Path to catalog A (Parquet)")
-    p_cm.add_argument("catalog_b", type=_path, help="Path to catalog B or shard directory")
+    p_cm.add_argument(
+        "catalog_b", type=_path, help="Path to catalog B or shard directory"
+    )
     p_cm.add_argument("-r", "--radius", required=True, help="Match radius (arcsec)")
-    p_cm.add_argument("-o", "--output", required=True, type=_path, help="Output matches Parquet")
+    p_cm.add_argument(
+        "-o", "--output", required=True, type=_path, help="Output matches Parquet"
+    )
     p_cm.add_argument("--ra-col", default=None, help="RA column name (default: ra)")
     p_cm.add_argument("--dec-col", default=None, help="Dec column name (default: dec)")
     p_cm.add_argument("--id-col-a", default=None, help="ID column in catalog A")
     p_cm.add_argument("--id-col-b", default=None, help="ID column in catalog B")
-    p_cm.add_argument("--n-nearest", default=None, help="Keep only n best matches per id_a (e.g. 1)")
+    p_cm.add_argument(
+        "--n-nearest", default=None, help="Keep only n best matches per id_a (e.g. 1)"
+    )
     p_cm.add_argument(
         "--rust",
         action="store_true",
@@ -114,20 +134,50 @@ def main() -> int:
         dest="rust",
         help="Use Python implementation instead (slow)",
     )
+    p_cm.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Rows per chunk for A and B (default: 250000, benchmark-style)",
+    )
+    p_cm.add_argument(
+        "--n-shards",
+        type=int,
+        default=None,
+        metavar="N",
+        help="HEALPix shards for B (default: 16). Fewer = less I/O overhead.",
+    )
+    p_cm.add_argument(
+        "--keep-b-in-memory",
+        action="store_true",
+        help="Partition B into RAM (no shard I/O). Use only when B is small.",
+    )
+    p_cm.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Set PLEIADES_VERBOSE=1 for Rust engine timing logs (stderr)",
+    )
     p_cm.set_defaults(func=cmd_cross_match)
 
     # summarize-matches
-    p_sm = subparsers.add_parser("summarize-matches", help="Summarize a matches Parquet file")
+    p_sm = subparsers.add_parser(
+        "summarize-matches", help="Summarize a matches Parquet file"
+    )
     p_sm.add_argument("matches", type=_path, help="Path to matches Parquet")
     p_sm.set_defaults(func=cmd_summarize)
 
     # cone-search
-    p_cs = subparsers.add_parser("cone-search", help="Cone search: rows within radius of a point")
+    p_cs = subparsers.add_parser(
+        "cone-search", help="Cone search: rows within radius of a point"
+    )
     p_cs.add_argument("catalog", type=_path, help="Path to catalog Parquet")
     p_cs.add_argument("ra", help="Center RA (degrees)")
     p_cs.add_argument("dec", help="Center Dec (degrees)")
     p_cs.add_argument("-r", "--radius", required=True, help="Radius (arcsec)")
-    p_cs.add_argument("-o", "--output", required=True, type=_path, help="Output Parquet path")
+    p_cs.add_argument(
+        "-o", "--output", required=True, type=_path, help="Output Parquet path"
+    )
     p_cs.set_defaults(func=cmd_cone_search)
 
     # partition-catalog
@@ -138,14 +188,17 @@ def main() -> int:
     p_pc.add_argument("catalog", type=_path, help="Path to catalog Parquet")
     p_pc.add_argument("output_dir", type=_path, help="Output directory for shards")
     p_pc.add_argument("--depth", type=int, default=8, help="HEALPix depth (default: 8)")
-    p_pc.add_argument("--n-shards", type=int, default=512, help="Number of shards (default: 512)")
+    p_pc.add_argument(
+        "--n-shards", type=int, default=16, help="Number of shards (default: 16, benchmark-style)"
+    )
     p_pc.add_argument("--ra-col", default=None, help="RA column name")
     p_pc.add_argument("--dec-col", default=None, help="Dec column name")
     p_pc.add_argument("--id-col", default=None, help="ID column name")
     p_pc.set_defaults(func=cmd_partition)
 
     args = parser.parse_args()
-    return args.func(parser, args)
+    exit_code = args.func(parser, args)
+    return int(exit_code)
 
 
 if __name__ == "__main__":

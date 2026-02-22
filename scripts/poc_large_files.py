@@ -20,7 +20,9 @@ GRID_RA_DEG = 1.0
 GRID_DEC_DEG = 1.0
 
 
-def add_pixel_column(batch: pa.RecordBatch, ra_name: str = "ra", dec_name: str = "dec") -> pa.Table:
+def add_pixel_column(
+    batch: pa.RecordBatch, ra_name: str = "ra", dec_name: str = "dec"
+) -> pa.Table:
     """Add a 'pixel_id' int64 column from ra/dec; vectorized for large chunks."""
     table = pa.Table.from_batches([batch])
     ra = table.column(ra_name)
@@ -68,10 +70,14 @@ def stream_process(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="POC: stream process large Parquet (add pixel_id).")
+    parser = argparse.ArgumentParser(
+        description="POC: stream process large Parquet (add pixel_id)."
+    )
     parser.add_argument("input", type=Path, nargs="?", help="Input Parquet path")
     parser.add_argument("-o", "--output", type=Path, help="Output Parquet path")
-    parser.add_argument("-b", "--batch-size", type=int, default=100_000, help="Rows per chunk")
+    parser.add_argument(
+        "-b", "--batch-size", type=int, default=100_000, help="Rows per chunk"
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     data_dir = root / "data"
@@ -79,14 +85,21 @@ def main() -> int:
     output_path = args.output or data_dir / "catalog_large_indexed.parquet"
     if not input_path.is_file():
         print(f"Input not found: {input_path}", file=sys.stderr)
-        print("Generate it first: uv run python scripts/generate_large_catalog.py [n_rows]", file=sys.stderr)
+        print(
+            "Generate it first: uv run python scripts/generate_large_catalog.py [n_rows]",
+            file=sys.stderr,
+        )
         return 1
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Input:  {input_path}")
     print(f"Output: {output_path}")
     print(f"Batch size: {args.batch_size}")
-    total, batches, elapsed = stream_process(input_path, output_path, batch_size=args.batch_size)
-    print(f"Done: {total} rows, {batches} chunks, {elapsed:.2f}s ({total / elapsed:.0f} rows/s)")
+    total, batches, elapsed = stream_process(
+        input_path, output_path, batch_size=args.batch_size
+    )
+    print(
+        f"Done: {total} rows, {batches} chunks, {elapsed:.2f}s ({total / elapsed:.0f} rows/s)"
+    )
     return 0
 
 

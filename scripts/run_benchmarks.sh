@@ -30,18 +30,13 @@ echo "  log: $LOG_STDOUT"
 echo "  extra args: ${*:-none}"
 echo "---"
 
+# 1M-row fixtures; tool defaults (batch 250k, n_shards 16) match this scale
 ROWS=1000000
-BATCH=$((ROWS / 4))
-N_SHARDS=16
 CATALOG_A="${FIXTURES_DIR}/catalog_a_${ROWS}.parquet"
 CATALOG_B="${FIXTURES_DIR}/catalog_b_${ROWS}.parquet"
-# PLEIADES_GPU=wgpu PLEIADES_GPU_MIN_PAIRS=0 uv run python scripts/benchmark_cross_match.py "$@" 2> "$LOG_STDOUT"
 uv run python scripts/benchmark_cross_match.py \
     --catalog-a "$CATALOG_A" \
     --catalog-b "$CATALOG_B" \
-    --rows "$ROWS" \
-    --batch-size "$BATCH" \
-    --n-shards "$N_SHARDS" \
     --verbose \
     "$@" > "$LOG_STDOUT"
 

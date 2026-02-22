@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -34,7 +34,6 @@ use rayon::prelude::*;
 /// Larger write buffer for temp shard files (fewer syscalls).
 const SHARD_WRITE_BUFFER_BYTES: usize = 256 * 1024; // 256 KiB
 /// Read buffer for Parquet (fewer syscalls on partition and shard reads).
-const PARQUET_READ_BUFFER_BYTES: usize = 1024 * 1024; // 1 MiB
 
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
@@ -282,10 +281,7 @@ fn load_one_shard(
     pixels_wanted: &HashSet<u64>,
 ) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
-        PARQUET_READ_BUFFER_BYTES,
-        file,
-    ))?
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
     .build()?;
     let mut out: Vec<(IdVal, f64, f64)> = Vec::new();
     for batch in reader {
@@ -405,10 +401,7 @@ fn partition_b_to_temp(
     let shard_dir = temp_dir.path().to_path_buf();
 
     let file_b = File::open(catalog_b)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
-        PARQUET_READ_BUFFER_BYTES,
-        file_b,
-    ))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
     let arrow_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size_b).build()?;
 
@@ -598,10 +591,7 @@ fn partition_b_to_memory(
 ) -> Result<(Vec<Vec<(u64, IdVal, f64, f64)>>, String, u64), Box<dyn std::error::Error + Send + Sync>> {
     let layer = get(depth);
     let file_b = File::open(catalog_b)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
-        PARQUET_READ_BUFFER_BYTES,
-        file_b,
-    ))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
     let arrow_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size_b).build()?;
 
@@ -874,11 +864,8 @@ pub fn cross_match_impl(
                 return;
             }
         };
-        let reader_a = match ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
-            PARQUET_READ_BUFFER_BYTES,
-            file_a,
-        ))
-        .and_then(|b| b.with_batch_size(batch_size_a_prefetch).build())
+        let reader_a = match ParquetRecordBatchReaderBuilder::try_new(file_a)
+            .and_then(|b| b.with_batch_size(batch_size_a_prefetch).build())
         {
             Ok(r) => r,
             Err(e) => {
@@ -923,7 +910,7 @@ pub fn cross_match_impl(
         None
     };
 
-    /// Receive one A batch, skipping empty; None = end of stream.
+    // Receive one A batch, skipping empty; None = end of stream.
     let recv_a = |rx: &mpsc::Receiver<Result<Option<RecordBatch>, Box<dyn std::error::Error + Send + Sync>>>| -> Result<Option<RecordBatch>, Box<dyn std::error::Error + Send + Sync>> {
         loop {
             match rx.recv() {
@@ -1311,11 +1298,8 @@ pub fn cross_match_impl(
         rows_b_read = 0u64;
         for path in paths.iter().take(n) {
             let f = File::open(path)?;
-            let meta = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
-                PARQUET_READ_BUFFER_BYTES,
-                f,
-            ))?
-            .metadata()
+            let meta = ParquetRecordBatchReaderBuilder::try_new(f)?
+                .metadata()
             .clone();
             rows_b_read += meta
                 .row_groups()
@@ -1357,11 +1341,8 @@ pub fn cross_match_impl(
     if let Some(n) = n_nearest {
         apply_n_nearest(output_path, &id_a_col, &id_b_col, n)?;
         let file_out = File::open(output_path)?;
-        let meta = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
-            PARQUET_READ_BUFFER_BYTES,
-            file_out,
-        ))?
-        .metadata()
+        let meta = ParquetRecordBatchReaderBuilder::try_new(file_out)?
+            .metadata()
         .clone();
         matches_count = meta
             .row_groups()
@@ -1417,10 +1398,7 @@ fn apply_n_nearest(
     n_nearest: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(output_path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(BufReader::with_capacity(
-        PARQUET_READ_BUFFER_BYTES,
-        file,
-    ))?
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
     .build()?;
     let schema = reader.schema().clone();
     let id_a_idx = schema.index_of(id_a_col)?;

@@ -39,11 +39,13 @@ def _get_max_rss_bytes() -> tuple[float | None, bool]:
     if sys.platform == "win32":
         try:
             import psutil
+
             return (float(psutil.Process().memory_info().rss), False)  # current
         except ImportError:
             return (None, False)
     try:
         import resource
+
         ru = resource.getrusage(resource.RUSAGE_SELF)
         # macOS: ru_maxrss in bytes; Linux: in kilobytes
         if sys.platform == "darwin":
@@ -54,7 +56,7 @@ def _get_max_rss_bytes() -> tuple[float | None, bool]:
 
 
 def _format_memory_bytes(b: float) -> str:
-    if b >= 1024 ** 3:
+    if b >= 1024**3:
         return f"{b / 1024**3:.2f} GiB"
     return f"{b / 1024**2:.2f} MiB"
 
@@ -70,21 +72,37 @@ def generate_catalog(
     ra = rng.uniform(0, 360, size=n)
     dec = np.degrees(np.arcsin(rng.uniform(-1, 1, size=n)))
     ids = np.arange(n, dtype=np.int64)
-    table = pa.table({
-        id_col: ids,
-        "ra": ra.astype(np.float64),
-        "dec": dec.astype(np.float64),
-    })
+    table = pa.table(
+        {
+            id_col: ids,
+            "ra": ra.astype(np.float64),
+            "dec": dec.astype(np.float64),
+        }
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path, use_dictionary=False)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark pleiades.cross_match")
-    parser.add_argument("--rows", type=int, default=100_000, help="Rows in catalog A (ignored if --catalog-a)")
-    parser.add_argument("--rows-b", type=int, default=None, help="Rows in catalog B (default: same as A)")
-    parser.add_argument("--radius", type=float, default=2.0, help="Match radius (arcsec)")
-    parser.add_argument("--rust", action="store_true", help="Use Rust engine (default: True)")
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=100_000,
+        help="Rows in catalog A (ignored if --catalog-a)",
+    )
+    parser.add_argument(
+        "--rows-b",
+        type=int,
+        default=None,
+        help="Rows in catalog B (default: same as A)",
+    )
+    parser.add_argument(
+        "--radius", type=float, default=2.0, help="Match radius (arcsec)"
+    )
+    parser.add_argument(
+        "--rust", action="store_true", help="Use Rust engine (default: True)"
+    )
     parser.add_argument(
         "--catalog-a",
         type=Path,
@@ -97,7 +115,13 @@ def main() -> int:
         default=None,
         help="Use pre-generated catalog B (skip in-memory generation)",
     )
-    parser.add_argument("-o", "--output", type=Path, default=None, help="Output matches path (default: temp)")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output matches path (default: temp)",
+    )
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -107,7 +131,7 @@ def main() -> int:
         "--batch-size",
         type=int,
         default=None,
-        help="Override batch_size_a and batch_size_b (default 100000); larger = fewer chunks, more RAM",
+        help="Override batch_size_a/b (default 250000, tool default). Larger = fewer chunks, more RAM.",
     )
     parser.add_argument(
         "--keep-b-in-memory",
@@ -118,7 +142,7 @@ def main() -> int:
         "--n-shards",
         type=int,
         default=None,
-        help="Number of HEALPix shards for B (default: API default). More shards = finer granularity; fewer = less I/O overhead.",
+        help="HEALPix shards for B (default: 16, tool default). Fewer = less I/O overhead.",
     )
     args = parser.parse_args()
     n_b = args.rows_b if args.rows_b is not None else args.rows
@@ -132,9 +156,14 @@ def main() -> int:
     if args.catalog_a is not None and args.catalog_b is not None:
         path_a = args.catalog_a
         path_b = args.catalog_b
-        out = args.output or Path(tempfile.gettempdir()) / "pleiades_bench_matches.parquet"
+        out = (
+            args.output
+            or Path(tempfile.gettempdir()) / "pleiades_bench_matches.parquet"
+        )
         if not path_a.is_file() or not path_b.is_file():
-            raise FileNotFoundError(f"Pre-generated catalogs must exist: {path_a}, {path_b}")
+            raise FileNotFoundError(
+                f"Pre-generated catalogs must exist: {path_a}, {path_b}"
+            )
     else:
         tmp = Path(tempfile.mkdtemp(prefix="pleiades_bench_"))
         path_a = tmp / "catalog_a.parquet"
@@ -162,10 +191,14 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _on_sigint)
 
-    def _progress(chunk_ix: int, total: int | None, rows_a: int, matches_count: int) -> bool:
+    def _progress(
+        chunk_ix: int, total: int | None, rows_a: int, matches_count: int
+    ) -> bool:
         if args.verbose:
             rss_bytes, is_peak = _get_max_rss_bytes()
-            rss_str = _format_memory_bytes(rss_bytes) if rss_bytes is not None else "N/A"
+            rss_str = (
+                _format_memory_bytes(rss_bytes) if rss_bytes is not None else "N/A"
+            )
             kind = "peak RSS" if is_peak else "current RSS"
             print(
                 f"[chunk {chunk_ix}] rows_a={rows_a} matches={matches_count} memory={rss_str} ({kind})",

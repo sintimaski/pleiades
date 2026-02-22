@@ -44,13 +44,14 @@ result = pleiades.cross_match(
 - ID columns are auto-detected (e.g. `source_id`, `object_id`) or set via `id_col_a` / `id_col_b`.
 - Output: Parquet with **id_a**, **id_b**, **separation_arcsec**. Optionally **ra_a**, **dec_a**, **ra_b**, **dec_b** with `include_coords=True` (Python path, catalog_b must be a file).
 
-**Options**: `partition_b=True` (default); `ra_dec_units="deg"` | `"rad"`; `n_nearest=1` for best match only; `progress_callback=(chunk_ix, total, rows_a, matches)`; `catalog_b` may be a **directory** of pre-partitioned shards (`shard_0000.parquet`, ...). The Rust engine is used by default (`use_rust=True`); set `use_rust=False` for the Python implementation (slow).
+**Options**: `partition_b=True` (default); `batch_size_a` / `batch_size_b` default **250k** (benchmark-style); `n_shards` default **16**; `ra_dec_units="deg"` | `"rad"`; `n_nearest=1` for best match only; `progress_callback=(chunk_ix, total, rows_a, matches)`; `catalog_b` may be a **directory** of pre-partitioned shards. Rust engine by default (`use_rust=True`); set `use_rust=False` for the Python implementation (slow).
 
 ### Command-line interface (CLI)
 
 ```bash
-# Cross-match (Rust engine by default; use --no-rust for Python path)
+# Cross-match (defaults: batch 250k, n_shards 16; use --no-rust for Python path)
 pleiades cross-match catalog_a.parquet catalog_b.parquet -r 2.0 -o matches.parquet
+pleiades cross-match a.parquet b.parquet -r 2 -o out.parquet --verbose --batch-size 500000
 
 # Summarize matches
 pleiades summarize-matches matches.parquet
@@ -59,7 +60,7 @@ pleiades summarize-matches matches.parquet
 pleiades cone-search catalog.parquet 180.0 0.0 -r 3600 -o cone.parquet
 
 # Partition a catalog into HEALPix shards (for use as pre-partitioned B)
-pleiades partition-catalog catalog.parquet ./shards --depth 8 --n-shards 512
+pleiades partition-catalog catalog.parquet ./shards --depth 8 --n-shards 16
 ```
 
 ### Analysis and helpers
@@ -104,14 +105,23 @@ uv run python scripts/benchmark_cross_match.py --rows 100000
 uv run python scripts/benchmark_cross_match.py --rows 50000 --rust   # compare Python vs Rust
 ```
 
+For **pregenerated fixtures** (e.g. 100k, 1M, 50M rows) and logged runs:
+
+```bash
+uv run python scripts/generate_benchmark_fixtures.py   # one-time or when missing
+./scripts/run_benchmarks.sh                            # runs 1M-row benchmark, logs to logs/
+./scripts/run_benchmarks.sh --rows 500000 --rust --verbose
+```
+
 For tuning (batch sizes, n_shards, depth) and notes on CPU SIMD vs GPU (CUDA, wgpu, OpenCL), see [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Project layout
 
 - `python/pleiades/` – Python API, cross-match, analysis, cone search, CLI (HEALPix + stream I/O).
-- `src/` – Rust engine (arrow, cdshealpix, HEALPix join, pre-partitioned B, rayon); optional, built with `maturin develop`.
+- `python/pleiades_core/` – Python bindings for the Rust extension (built by maturin).
+- `src/` – Rust engine (arrow, cdshealpix, HEALPix join, pre-partitioned B, rayon); built with `maturin develop`.
 - `tests/` – Unit and integration tests; `tests/fixtures/` – small Parquet catalogs.
-- `scripts/` – `benchmark_cross_match.py`, `generate_large_catalog.py`, etc.
+- `scripts/` – `benchmark_cross_match.py`, `generate_benchmark_fixtures.py`, `run_benchmarks.sh`, `generate_large_catalog.py`, etc.
 
 ## Development
 

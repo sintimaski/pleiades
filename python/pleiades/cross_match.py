@@ -29,12 +29,13 @@ DEC_COL = "dec"
 RA_DEC_UNITS_DEFAULT = "deg"  # "deg" or "rad" for input catalog columns
 # cdshealpix nested: nside = 2^depth, so depth 8 -> nside 256
 DEPTH_DEFAULT = 8
-BATCH_SIZE_A = 100_000
-BATCH_SIZE_B = 100_000
+# Benchmark-style defaults (1M rows: batch = rows/4, n_shards = 16)
+BATCH_SIZE_A = 250_000
+BATCH_SIZE_B = 250_000
 # Block size for matrix path: block_n * block_m * 8 bytes (e.g. 4000*4000 = 128 MB)
 MATRIX_BLOCK_SIZE = 4000
-# Shards for partitioned B: only read B rows in pixels that appear in current A chunk
-B_PARTITION_SHARDS = 512
+# Shards for partitioned B (fewer = less I/O overhead, benchmark uses 16)
+B_PARTITION_SHARDS = 16
 
 
 def _lonlat_deg_to_healpix(
@@ -186,7 +187,9 @@ def _partition_b_to_shards(
                 },
                 schema=shard_schema,
             )
-            writers[shard].write_table(row)
+            w = writers[shard]
+            assert w is not None
+            w.write_table(row)
     for w in writers:
         if w is not None:
             w.close()
@@ -409,7 +412,7 @@ def cross_match(
     ra_dec_units: "deg" (default) or "rad" — units of ra/dec columns in the
     catalogs. Used when use_rust=True; Python fallback assumes degrees.
 
-    batch_size_a, batch_size_b: rows per Parquet read chunk (default 100k each).
+    batch_size_a, batch_size_b: rows per Parquet read chunk (default 250k each, benchmark-style).
     Smaller values use less RAM and are better on memory-constrained machines
     (e.g. laptops); larger values reduce I/O overhead.
 
@@ -461,9 +464,10 @@ def cross_match(
             import pleiades_core  # type: ignore[import-untyped]
 
             gpu_env = os.environ.get("PLEIADES_GPU")
-            if gpu_env == "wgpu" and not getattr(
-                pleiades_core, "has_wgpu_feature", lambda: False
-            )():
+            if (
+                gpu_env == "wgpu"
+                and not getattr(pleiades_core, "has_wgpu_feature", lambda: False)()
+            ):
                 import sys
 
                 print(
@@ -496,6 +500,7 @@ def cross_match(
                 if "keep_b_in_memory" in err_str and keep_b_in_memory:
                     # Older extension doesn't support keep_b_in_memory; retry without it
                     import warnings
+
                     warnings.warn(
                         "Rust extension does not support keep_b_in_memory; rebuild with "
                         "uv run maturin develop to enable in-memory B (faster when B fits in RAM).",
@@ -586,9 +591,16 @@ def cross_match(
             n_match = pf_out.metadata.num_rows if pf_out.metadata else 0
             pf_a = pq.ParquetFile(catalog_a)
             rows_b = (
-                sum(pq.read_table(p).num_rows for p in sorted(catalog_b.glob("shard_*.parquet")))
+                sum(
+                    pq.read_table(p).num_rows
+                    for p in sorted(catalog_b.glob("shard_*.parquet"))
+                )
                 if catalog_b.is_dir()
-                else (pq.ParquetFile(catalog_b).metadata.num_rows if pq.ParquetFile(catalog_b).metadata else 0)
+                else (
+                    pq.ParquetFile(catalog_b).metadata.num_rows
+                    if pq.ParquetFile(catalog_b).metadata
+                    else 0
+                )
             )
             return CrossMatchResult(
                 output_path=str(output_path),
@@ -700,6 +712,7 @@ def cross_match(
                             },
                             schema=out_schema,
                         )
+                        assert writer is not None
                         writer.write_table(tbl)
 
         if b_is_prepartitioned:
@@ -759,6 +772,7 @@ def cross_match(
                         },
                         schema=out_schema,
                     )
+                    assert writer is not None
                     writer.write_table(tbl)
         else:
             # Recompute rows_b_read from catalog B (partitioning already done in temp dir)
@@ -847,6 +861,7 @@ def cross_match(
                         },
                         schema=out_schema,
                     )
+                    assert writer is not None
                     writer.write_table(tbl)
         rows_b_read = pf_b.metadata.num_rows if pf_b.metadata else 0
 

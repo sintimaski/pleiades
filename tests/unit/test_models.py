@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import pytest
-
 from pleiades.models import CrossMatchResult, MatchSummary
+from pydantic import ValidationError
 
 
 @pytest.mark.unit
@@ -36,8 +36,8 @@ class TestCrossMatchResult:
             chunks_processed=0,
             time_seconds=0.0,
         )
-        with pytest.raises(Exception):  # ValidationError from pydantic
-            setattr(r, "matches_count", 1)
+        with pytest.raises(ValidationError):
+            r.matches_count = 1
 
 
 @pytest.mark.unit
