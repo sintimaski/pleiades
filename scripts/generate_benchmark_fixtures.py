@@ -9,7 +9,7 @@ Write fixtures to data/benchmark_fixtures/ (or --out-dir). Default is to generat
 
 Or generate a single size and run manually:
   uv run python scripts/generate_benchmark_fixtures.py --sizes 1000000
-  uv run python scripts/benchmark_cross_match.py --catalog-a data/benchmark_fixtures/catalog_a_1000000.parquet --catalog-b data/benchmark_fixtures/catalog_b_1000000.parquet --rust -o matches.parquet
+  uv run python scripts/benchmark_cross_match.py --catalog-a data/benchmark_fixtures/catalog_a_1000000.parquet --catalog-b data/benchmark_fixtures/catalog_b_1000000.parquet -o matches.parquet
 
 Usage:
   uv run python scripts/generate_benchmark_fixtures.py [--sizes 100000 1000000 50000000] [--out-dir DIR]

@@ -10,7 +10,7 @@
 #   bash scripts/run_benchmarks.sh
 #
 # Optional: pass benchmark args (they are forwarded to benchmark_cross_match.py).
-#   ./scripts/run_benchmarks.sh --rows 500000 --rust --verbose
+#   ./scripts/run_benchmarks.sh --rows 500000 --verbose
 
 set -euo pipefail
 

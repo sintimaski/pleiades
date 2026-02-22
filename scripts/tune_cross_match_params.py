@@ -310,7 +310,7 @@ def main() -> int:
             f"n_shards = {r['n_shards']}, keep_b_in_memory = {r['keep_b_in_memory']}"
         )
         cmd = (
-            f"  uv run python scripts/benchmark_cross_match.py --rows {args.rows} --rust "
+            f"  uv run python scripts/benchmark_cross_match.py --rows {args.rows} "
             f"--batch-size {r['batch_size']}"
         )
         if r["keep_b_in_memory"]:
