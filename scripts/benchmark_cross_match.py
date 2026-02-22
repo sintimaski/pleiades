@@ -81,6 +81,8 @@ def main() -> int:
         generate_catalog(path_a, args.rows, 42, "source_id")
         generate_catalog(path_b, n_b, 123, "object_id")
 
+    print(f"Generated {args.rows} for catalogs a and b")
+
     runs: list[tuple[str, bool]] = [("Rust", True)]
     for label, use_rust in runs:
         t0 = time.perf_counter()
