@@ -1,0 +1,25 @@
+[package]
+name = "astrojoin-core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust engine for out-of-core spatial cross-matching (HEALPix + Arrow)"
+
+[lib]
+name = "astrojoin_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["python"]
+# Enable PyO3 bindings for maturin/Python extension build.
+python = ["pyo3"]
+
+[dependencies]
+arrow = "52"
+parquet = { version = "52", default-features = false, features = ["arrow", "snap"] }
+chrono = "=0.4.39"  # pin: 0.4.40+ adds Datelike::quarter() conflicting with arrow-arith
+cdshealpix = "0.9"
+rayon = "1.10"
+pyo3 = { version = "0.23", optional = true, features = ["extension-module"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,1 @@
+"""AstroJoin test suite."""

@@ -1,0 +1,128 @@
+# Cursor Rules for AstroJoin Project
+
+## Project Context
+AstroJoin is a high-performance out-of-core spatial cross-matcher for astronomical catalogs. It provides a Python API backed by a native Rust engine (PyO3/Maturin). The engine uses HEALPix indexing (cdshealpix), Apache Arrow, and chunked streaming to join billion-row datasets without exceeding RAM.
+
+## Python Coding Standards
+
+### Style and Formatting
+- **PEP 8 Compliance**: Follow PEP 8 style guide strictly
+- **Type Hints**: Use type hints for all function parameters and return values
+- **Docstrings**: Include docstrings for all modules, classes, and functions (Google or NumPy style)
+- **Line Length**: Maximum 88 characters per line (Black/Ruff formatter standard)
+- **Imports**: Use absolute imports, organize imports (stdlib, third-party, local)
+- **Naming Conventions**:
+  - Functions and variables: `snake_case`
+  - Classes: `PascalCase`
+  - Constants: `UPPER_SNAKE_CASE`
+  - Private attributes/methods: leading underscore `_private_method`
+
+### Code Quality
+- Use `ruff` for both code formatting and linting
+- Use `mypy` for type checking
+- Prefer `pathlib` over `os.path` for file operations
+- Use f-strings for string formatting (Python 3.6+)
+- Handle exceptions explicitly with specific exception types
+- Use context managers (`with` statements) for resource management
+- Avoid mutable default arguments
+
+### Python Best Practices
+- Use `uv` for dependency management and virtual environments
+- Dependencies are managed in `pyproject.toml`
+- Use `pydantic` for data structures (preferred over dataclasses for validation)
+- Prefer composition over inheritance
+- Use `typing` module for complex type annotations
+- Implement `__repr__` and `__str__` for custom classes
+
+## Rust Coding Standards (Core Engine)
+
+### Style and Conventions
+- Follow standard `rustfmt` and `clippy` defaults
+- Use `#![forbid(unsafe_code)]` unless explicitly required for FFI/performance
+- Prefer `Result` and `?` for error propagation; avoid unwrap in library code
+- Document public API with `///` doc comments and examples where helpful
+
+### Dependencies
+- Use `arrow` (arrow-rs) for in-memory columnar data; avoid copying across Rust/Python boundary
+- Use `cdshealpix` for HEALPix pixel IDs and neighbor (halo) computation
+- Use `rayon` for CPU parallelism of distance computations
+- Use `pyo3` and `maturin` for Python bindings; keep PyO3 surface small and pythonic
+
+### Memory and Performance
+- Process data in chunks (RecordBatches); never assume full catalog fits in RAM
+- Explicitly drop or scope large buffers after use to avoid memory spikes
+- Consider pre-partitioning large Parquet files by HEALPix for efficient streaming
+
+## Unit Testing Requirements
+
+### Testing Framework
+- **Primary Framework**: Use `pytest` for all Python unit tests
+- **Test Structure**: Mirror source code structure in `tests/` directory (`tests/unit/`, `tests/integration/`)
+- **Test Naming**: Test files should be named `test_*.py` or `*_test.py`
+- **Test Functions**: Test functions should be named `test_*`
+
+### Test Coverage
+- **Minimum Coverage**: Maintain at least 80% code coverage for Python code
+- **Coverage Tool**: Use `pytest-cov` for coverage reporting
+- **Critical Paths**: Aim for 100% coverage on public API and join logic
+
+### Testing Best Practices
+- Write tests before or alongside code (TDD encouraged)
+- Use fixtures for test setup and teardown (`conftest.py` for shared fixtures)
+- Mock file I/O and external data in unit tests; use small fixtures for integration
+- Use `pytest.mark.parametrize` for testing multiple scenarios
+- Test both success and failure cases (invalid paths, empty catalogs, edge cases)
+- Use descriptive test names that explain what is being tested
+- Use `pytest.raises()` for exception testing
+- Rust: use `cargo test` for Rust unit tests; keep tests in `src/` or `tests/`
+
+### Test Organization
+- Group related tests in classes when appropriate
+- Use `conftest.py` for shared fixtures
+- Separate unit tests from integration tests; use markers `@pytest.mark.unit`, `@pytest.mark.integration`
+
+## Project Structure
+
+```
+project_root/
+├── src/                    # Rust crate source (engine)
+│   └── lib.rs
+├── python/                 # Python package (public API)
+│   └── astrojoin/
+│       ├── __init__.py
+│       └── ...
+├── tests/                  # Python test files
+│   ├── conftest.py
+│   ├── unit/
+│   └── integration/
+├── Cargo.toml              # Rust dependencies
+├── pyproject.toml          # Python + uv + maturin config
+├── .pre-commit-config.yaml
+└── README.md
+```
+
+## Documentation Standards
+
+### README.md
+- Project overview and one-liner (out-of-core spatial join for astronomy)
+- Installation: `uv sync` and `pip install astrojoin` (or editable install)
+- Usage example: `astrojoin.cross_match(catalog_a=..., catalog_b=..., radius_arcsec=..., output_path=...)`
+- Architecture summary (Python API → Rust engine → HEALPix + Arrow + chunked I/O)
+- Contributing and license
+
+### Docstrings
+- Use docstrings for all public functions, classes, and modules (Google or NumPy style)
+- Include description, parameters, return values, and exceptions where relevant
+
+## Dependencies
+- Use `uv` for Python dependency management; lock file via `uv lock`
+- Rust dependencies in `Cargo.toml`; pin versions for reproducibility
+- Build: `maturin` for building the Rust extension and packaging the Python wheel
+
+## Code Review Checklist
+- [ ] Code follows PEP 8 / rustfmt and project style guidelines
+- [ ] Type hints (Python) and doc comments (Rust) are present where needed
+- [ ] Unit tests are written and passing (`pytest` and `cargo test`)
+- [ ] Test coverage meets minimum threshold for Python
+- [ ] No hardcoded credentials or paths to large datasets
+- [ ] README.md updated for user-facing changes
