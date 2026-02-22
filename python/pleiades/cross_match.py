@@ -380,7 +380,6 @@ def cross_match(
     matrix_block_size: int = MATRIX_BLOCK_SIZE,
     partition_b: bool = True,
     n_shards: int = B_PARTITION_SHARDS,
-    use_rust: bool = True,
     n_nearest: int | None = None,
     keep_b_in_memory: bool = False,
     progress_callback: Callable[[int, int | None, int, int], None | bool] | None = None,
@@ -400,17 +399,15 @@ def cross_match(
     If n_nearest is set (e.g. 1 for best match only), only the n_nearest smallest-
     separation matches per id_a are kept in the output.
 
-    Matching is done by the Rust engine (use_rust=True, default). Python is used
-    for the API, validation, and helpers; the heavy work runs in the Rust extension.
-    If the extension is not installed, install with ``pip install pleiades`` (wheels
-    include it) or from source: ``uv run maturin develop``. Set use_rust=False to
-    use the Python implementation (slow, for testing or environments without the wheel).
+    Matching is done by the Rust engine. Python provides the API, validation, and
+    helpers; the heavy work runs in the Rust extension (required). Install with
+    ``pip install pleiades`` (wheels include it) or from source:
+    ``uv run maturin develop``.
 
-    If include_coords=True (Python path only, catalog_b must be a file), the
-    output is augmented with ra_a, dec_a, ra_b, dec_b from the two catalogs.
+    If include_coords=True (catalog_b must be a file), the output is augmented
+    with ra_a, dec_a, ra_b, dec_b from the two catalogs.
 
-    ra_dec_units: "deg" (default) or "rad" — units of ra/dec columns in the
-    catalogs. Used when use_rust=True; Python fallback assumes degrees.
+    ra_dec_units: "deg" (default) or "rad" — units of ra/dec columns in the catalogs.
 
     batch_size_a, batch_size_b: rows per Parquet read chunk (default 250k each, benchmark-style).
     Smaller values use less RAM and are better on memory-constrained machines
@@ -459,24 +456,52 @@ def cross_match(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
 
-    if use_rust:
+    try:
+        import pleiades_core  # type: ignore[import-untyped]
+
+        gpu_env = os.environ.get("PLEIADES_GPU")
+        if (
+            gpu_env == "wgpu"
+            and not getattr(pleiades_core, "has_wgpu_feature", lambda: False)()
+        ):
+            import sys
+
+            print(
+                "pleiades: PLEIADES_GPU=wgpu is set but the extension was not built "
+                "with GPU support. Rebuild with: uv run maturin develop --features wgpu",
+                file=sys.stderr,
+            )
+
         try:
-            import pleiades_core  # type: ignore[import-untyped]
+            result = pleiades_core.cross_match(
+                str(catalog_a),
+                str(catalog_b),
+                radius_arcsec,
+                str(output_path),
+                depth=depth,
+                batch_size_a=batch_size_a,
+                batch_size_b=batch_size_b,
+                n_shards=n_shards,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                id_col_a=id_col_a,
+                id_col_b=id_col_b,
+                ra_dec_units=ra_dec_units,
+                n_nearest=n_nearest,
+                keep_b_in_memory=keep_b_in_memory,
+                progress_callback=progress_callback,
+            )
+        except TypeError as e:
+            err_str = str(e)
+            if "keep_b_in_memory" in err_str and keep_b_in_memory:
+                import warnings
 
-            gpu_env = os.environ.get("PLEIADES_GPU")
-            if (
-                gpu_env == "wgpu"
-                and not getattr(pleiades_core, "has_wgpu_feature", lambda: False)()
-            ):
-                import sys
-
-                print(
-                    "pleiades: PLEIADES_GPU=wgpu is set but the extension was not built "
-                    "with GPU support. Rebuild with: uv run maturin develop --features wgpu",
-                    file=sys.stderr,
+                warnings.warn(
+                    "Rust extension does not support keep_b_in_memory; rebuild with "
+                    "uv run maturin develop to enable in-memory B (faster when B fits in RAM).",
+                    UserWarning,
+                    stacklevel=2,
                 )
-
-            try:
                 result = pleiades_core.cross_match(
                     str(catalog_a),
                     str(catalog_b),
@@ -492,429 +517,100 @@ def cross_match(
                     id_col_b=id_col_b,
                     ra_dec_units=ra_dec_units,
                     n_nearest=n_nearest,
-                    keep_b_in_memory=keep_b_in_memory,
                     progress_callback=progress_callback,
                 )
-            except TypeError as e:
-                err_str = str(e)
-                if "keep_b_in_memory" in err_str and keep_b_in_memory:
-                    # Older extension doesn't support keep_b_in_memory; retry without it
-                    import warnings
-
-                    warnings.warn(
-                        "Rust extension does not support keep_b_in_memory; rebuild with "
-                        "uv run maturin develop to enable in-memory B (faster when B fits in RAM).",
-                        UserWarning,
-                        stacklevel=2,
-                    )
-                    result = pleiades_core.cross_match(
-                        str(catalog_a),
-                        str(catalog_b),
-                        radius_arcsec,
-                        str(output_path),
-                        depth=depth,
-                        batch_size_a=batch_size_a,
-                        batch_size_b=batch_size_b,
-                        n_shards=n_shards,
-                        ra_col=ra_col,
-                        dec_col=dec_col,
-                        id_col_a=id_col_a,
-                        id_col_b=id_col_b,
-                        ra_dec_units=ra_dec_units,
-                        n_nearest=n_nearest,
-                        progress_callback=progress_callback,
-                    )
-                elif "progress_callback" in err_str or "n_nearest" in err_str:
-                    result = pleiades_core.cross_match(
-                        str(catalog_a),
-                        str(catalog_b),
-                        radius_arcsec,
-                        str(output_path),
-                        depth=depth,
-                        batch_size_a=batch_size_a,
-                        batch_size_b=batch_size_b,
-                        n_shards=n_shards,
-                        ra_col=ra_col,
-                        dec_col=dec_col,
-                        id_col_a=id_col_a,
-                        id_col_b=id_col_b,
-                        ra_dec_units=ra_dec_units,
-                    )
-                elif "ra_dec_units" not in err_str:
-                    raise
-                elif ra_dec_units.lower() != "deg":
-                    raise ValueError(
-                        "ra_dec_units='rad' requires rebuilding the Rust extension "
-                        "(uv run maturin develop)"
-                    ) from e
-                else:
-                    result = pleiades_core.cross_match(
-                        str(catalog_a),
-                        str(catalog_b),
-                        radius_arcsec,
-                        str(output_path),
-                        depth=depth,
-                        batch_size_a=batch_size_a,
-                        batch_size_b=batch_size_b,
-                        n_shards=n_shards,
-                        ra_col=ra_col,
-                        dec_col=dec_col,
-                        id_col_a=id_col_a,
-                        id_col_b=id_col_b,
-                    )
-            if result is not None and isinstance(result, dict):
-                out_path = result["output_path"]
-                if include_coords and catalog_b.is_file():
-                    from pleiades.analysis import attach_match_coords
-
-                    attach_match_coords(
-                        out_path,
-                        catalog_a,
-                        catalog_b,
-                        out_path,
-                        id_col_a=id_col_a,
-                        id_col_b=id_col_b,
-                        ra_col=ra_col,
-                        dec_col=dec_col,
-                    )
-                return CrossMatchResult(
-                    output_path=out_path,
-                    rows_a_read=int(result["rows_a_read"]),
-                    rows_b_read=int(result["rows_b_read"]),
-                    matches_count=int(result["matches_count"]),
-                    chunks_processed=int(result["chunks_processed"]),
-                    time_seconds=float(result["time_seconds"]),
-                )
-            # Older Rust extension returns None
-            elapsed = time.perf_counter() - t0
-            pf_out = pq.ParquetFile(output_path)
-            n_match = pf_out.metadata.num_rows if pf_out.metadata else 0
-            pf_a = pq.ParquetFile(catalog_a)
-            rows_b = (
-                sum(
-                    pq.read_table(p).num_rows
-                    for p in sorted(catalog_b.glob("shard_*.parquet"))
-                )
-                if catalog_b.is_dir()
-                else (
-                    pq.ParquetFile(catalog_b).metadata.num_rows
-                    if pq.ParquetFile(catalog_b).metadata
-                    else 0
-                )
-            )
-            return CrossMatchResult(
-                output_path=str(output_path),
-                rows_a_read=pf_a.metadata.num_rows if pf_a.metadata else 0,
-                rows_b_read=rows_b,
-                matches_count=n_match,
-                chunks_processed=0,
-                time_seconds=elapsed,
-            )
-        except ImportError:
-            if use_rust:
-                raise ImportError(
-                    "Pleiades requires the Rust engine for cross-match. "
-                    "Install it with: pip install pleiades (wheels include it), "
-                    "or from source: uv run maturin develop"
-                ) from None
-            # use_rust=False: fall back to Python implementation
-
-    out_schema: pa.Schema | None = None
-    writer: pq.ParquetWriter | None = None
-    id_a_name: str | None = None
-    id_b_name: str | None = None
-    type_a: pa.DataType = pa.int64()
-    type_b: pa.DataType = pa.string()
-    rows_a_read = 0
-    rows_b_read = 0
-    matches_count = 0
-    chunks_processed = 0
-
-    if partition_b:
-        if b_is_prepartitioned:
-            shard_path = catalog_b
-            id_b_name = "id_b"
-            first_shard = next(shard_path.glob("shard_*.parquet"))
-            t0_shard = pq.read_table(first_shard)
-            type_b = _infer_id_type(t0_shard.column("id_b"))
-            for p in sorted(shard_path.glob("shard_*.parquet")):
-                rows_b_read += pq.read_table(p).num_rows
-        else:
-            with tempfile.TemporaryDirectory(prefix="pleiades_b_") as shard_dir:
-                shard_path = Path(shard_dir)
-                id_b_name, type_b = _partition_b_to_shards(
-                    catalog_b,
-                    shard_path,
-                    depth,
-                    n_shards,
-                    ra_col,
-                    dec_col,
-                    id_col_b,
-                    batch_size_b,
-                )
-                for s in range(n_shards):
-                    p = shard_path / f"shard_{s:04d}.parquet"
-                    if p.exists():
-                        rows_b_read += pq.read_table(p).num_rows
-                pf_a = pq.ParquetFile(catalog_a)
-                for batch_a in pf_a.iter_batches(batch_size=batch_size_a):
-                    table_a = pa.Table.from_batches([batch_a])
-                    if id_a_name is None:
-                        id_a_name = _id_column(table_a, id_col_a)
-                        type_a = _infer_id_type(table_a.column(id_a_name))
-                    rows_a_read += table_a.num_rows
-                    chunks_processed += 1
-                    ra_a = table_a.column(ra_col).to_numpy()
-                    dec_a = table_a.column(dec_col).to_numpy()
-                    id_a_arr = table_a.column(id_a_name)
-                    pix_a = _lonlat_deg_to_healpix(ra_a, dec_a, depth)
-                    pixels_wanted = _pixels_in_chunk_with_neighbors(pix_a, depth)
-                    ra_b, dec_b, id_b_list = _load_b_subset_for_pixels(
-                        shard_path, pixels_wanted, n_shards, id_b_name, ra_col, dec_col
-                    )
-                    if len(id_b_list) == 0:
-                        if progress_callback is not None:
-                            progress_callback(
-                                chunks_processed, None, rows_a_read, matches_count
-                            )
-                        continue
-                    id_a_list = [id_a_arr[i].as_py() for i in range(len(table_a))]
-                    buf_a, buf_b, buf_sep = _cross_match_chunk_matrix(
-                        ra_a,
-                        dec_a,
-                        id_a_list,
-                        ra_b,
-                        dec_b,
-                        id_b_list,
-                        radius_arcsec,
-                        matrix_block_size,
-                    )
-                    matches_count += len(buf_a)
-                    if progress_callback is not None:
-                        progress_callback(
-                            chunks_processed, None, rows_a_read, matches_count
-                        )
-                    if buf_a and id_a_name and id_b_name:
-                        if out_schema is None:
-                            out_schema = pa.schema(
-                                [
-                                    (id_a_name, type_a),
-                                    (id_b_name, type_b),
-                                    ("separation_arcsec", pa.float64()),
-                                ]
-                            )
-                            writer = pq.ParquetWriter(output_path, out_schema)
-                        tbl = pa.table(
-                            {
-                                id_a_name: buf_a,
-                                id_b_name: buf_b,
-                                "separation_arcsec": buf_sep,
-                            },
-                            schema=out_schema,
-                        )
-                        assert writer is not None
-                        writer.write_table(tbl)
-
-        if b_is_prepartitioned:
-            pf_a = pq.ParquetFile(catalog_a)
-            for batch_a in pf_a.iter_batches(batch_size=batch_size_a):
-                table_a = pa.Table.from_batches([batch_a])
-                if id_a_name is None:
-                    id_a_name = _id_column(table_a, id_col_a)
-                    type_a = _infer_id_type(table_a.column(id_a_name))
-                rows_a_read += table_a.num_rows
-                chunks_processed += 1
-                ra_a = table_a.column(ra_col).to_numpy()
-                dec_a = table_a.column(dec_col).to_numpy()
-                id_a_arr = table_a.column(id_a_name)
-                pix_a = _lonlat_deg_to_healpix(ra_a, dec_a, depth)
-                pixels_wanted = _pixels_in_chunk_with_neighbors(pix_a, depth)
-                ra_b, dec_b, id_b_list = _load_b_subset_for_pixels(
-                    shard_path, pixels_wanted, n_shards, id_b_name, ra_col, dec_col
-                )
-                if len(id_b_list) == 0:
-                    if progress_callback is not None:
-                        progress_callback(
-                            chunks_processed, None, rows_a_read, matches_count
-                        )
-                    continue
-                id_a_list = [id_a_arr[i].as_py() for i in range(len(table_a))]
-                buf_a, buf_b, buf_sep = _cross_match_chunk_matrix(
-                    ra_a,
-                    dec_a,
-                    id_a_list,
-                    ra_b,
-                    dec_b,
-                    id_b_list,
+            elif "progress_callback" in err_str or "n_nearest" in err_str:
+                result = pleiades_core.cross_match(
+                    str(catalog_a),
+                    str(catalog_b),
                     radius_arcsec,
-                    matrix_block_size,
+                    str(output_path),
+                    depth=depth,
+                    batch_size_a=batch_size_a,
+                    batch_size_b=batch_size_b,
+                    n_shards=n_shards,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                    id_col_a=id_col_a,
+                    id_col_b=id_col_b,
+                    ra_dec_units=ra_dec_units,
                 )
-                matches_count += len(buf_a)
-                if progress_callback is not None:
-                    progress_callback(
-                        chunks_processed, None, rows_a_read, matches_count
-                    )
-                if buf_a and id_a_name and id_b_name:
-                    if out_schema is None:
-                        out_schema = pa.schema(
-                            [
-                                (id_a_name, type_a),
-                                (id_b_name, type_b),
-                                ("separation_arcsec", pa.float64()),
-                            ]
-                        )
-                        writer = pq.ParquetWriter(output_path, out_schema)
-                    tbl = pa.table(
-                        {
-                            id_a_name: buf_a,
-                            id_b_name: buf_b,
-                            "separation_arcsec": buf_sep,
-                        },
-                        schema=out_schema,
-                    )
-                    assert writer is not None
-                    writer.write_table(tbl)
-        else:
-            # Recompute rows_b_read from catalog B (partitioning already done in temp dir)
-            pf_b = pq.ParquetFile(catalog_b)
-            rows_b_read = pf_b.metadata.num_rows if pf_b.metadata else 0
-    else:
+            elif "ra_dec_units" not in err_str:
+                raise
+            elif ra_dec_units.lower() != "deg":
+                raise ValueError(
+                    "ra_dec_units='rad' requires rebuilding the Rust extension "
+                    "(uv run maturin develop)"
+                ) from e
+            else:
+                result = pleiades_core.cross_match(
+                    str(catalog_a),
+                    str(catalog_b),
+                    radius_arcsec,
+                    str(output_path),
+                    depth=depth,
+                    batch_size_a=batch_size_a,
+                    batch_size_b=batch_size_b,
+                    n_shards=n_shards,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                    id_col_a=id_col_a,
+                    id_col_b=id_col_b,
+                )
+        if result is not None and isinstance(result, dict):
+            out_path = result["output_path"]
+            if include_coords and catalog_b.is_file():
+                from pleiades.analysis import attach_match_coords
+
+                attach_match_coords(
+                    out_path,
+                    catalog_a,
+                    catalog_b,
+                    out_path,
+                    id_col_a=id_col_a,
+                    id_col_b=id_col_b,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                )
+            return CrossMatchResult(
+                output_path=out_path,
+                rows_a_read=int(result["rows_a_read"]),
+                rows_b_read=int(result["rows_b_read"]),
+                matches_count=int(result["matches_count"]),
+                chunks_processed=int(result["chunks_processed"]),
+                time_seconds=float(result["time_seconds"]),
+            )
+        # Older Rust extension returns None
+        elapsed = time.perf_counter() - t0
+        pf_out = pq.ParquetFile(output_path)
+        n_match = pf_out.metadata.num_rows if pf_out.metadata else 0
         pf_a = pq.ParquetFile(catalog_a)
-        pf_b = pq.ParquetFile(catalog_b)
-        for batch_a in pf_a.iter_batches(batch_size=batch_size_a):
-            table_a = pa.Table.from_batches([batch_a])
-            if id_a_name is None:
-                id_a_name = _id_column(table_a, id_col_a)
-                type_a = _infer_id_type(table_a.column(id_a_name))
-            rows_a_read += table_a.num_rows
-            chunks_processed += 1
-            ra_a = table_a.column(ra_col).to_numpy()
-            dec_a = table_a.column(dec_col).to_numpy()
-            id_a_arr = table_a.column(id_a_name)
-            index: dict[int, list[tuple[Any, float, float]]] = {}
-            if not use_matrix:
-                pix_a = _lonlat_deg_to_healpix(ra_a, dec_a, depth)
-                for i in range(len(table_a)):
-                    pix = int(pix_a[i])
-                    ra = float(ra_a[i])
-                    dec = float(dec_a[i])
-                    id_val = (
-                        id_a_arr[i].as_py()
-                        if hasattr(id_a_arr[i], "as_py")
-                        else id_a_arr[i]
-                    )
-                    index.setdefault(pix, []).append((id_val, ra, dec))
-
-            for batch_b in pf_b.iter_batches(batch_size=batch_size_b):
-                table_b = pa.Table.from_batches([batch_b])
-                if id_b_name is None:
-                    id_b_name = _id_column(table_b, id_col_b)
-                    type_b = _infer_id_type(table_b.column(id_b_name))
-                ra_b = table_b.column(ra_col).to_numpy()
-                dec_b = table_b.column(dec_col).to_numpy()
-                id_b_col = table_b.column(id_b_name)
-                id_b_list = [id_b_col[j].as_py() for j in range(len(table_b))]
-                if use_matrix:
-                    id_a_list = [id_a_arr[i].as_py() for i in range(len(table_a))]
-                    buf_a, buf_b, buf_sep = _cross_match_chunk_matrix(
-                        ra_a,
-                        dec_a,
-                        id_a_list,
-                        ra_b,
-                        dec_b,
-                        id_b_list,
-                        radius_arcsec,
-                        matrix_block_size,
-                    )
-                else:
-                    buf_a, buf_b, buf_sep = [], [], []
-                    for j in range(len(table_b)):
-                        ra_b_j = float(ra_b[j])
-                        dec_b_j = float(dec_b[j])
-                        id_b_val = id_b_list[j]
-                        for id_a, id_b, sep in _cross_match_chunk(
-                            index, ra_b_j, dec_b_j, id_b_val, radius_arcsec, depth
-                        ):
-                            buf_a.append(id_a)
-                            buf_b.append(id_b)
-                            buf_sep.append(sep)
-                matches_count += len(buf_a)
-                if progress_callback is not None:
-                    progress_callback(
-                        chunks_processed, None, rows_a_read, matches_count
-                    )
-                if buf_a and id_a_name and id_b_name:
-                    if out_schema is None:
-                        out_schema = pa.schema(
-                            [
-                                (id_a_name, type_a),
-                                (id_b_name, type_b),
-                                ("separation_arcsec", pa.float64()),
-                            ]
-                        )
-                        writer = pq.ParquetWriter(output_path, out_schema)
-                    tbl = pa.table(
-                        {
-                            id_a_name: buf_a,
-                            id_b_name: buf_b,
-                            "separation_arcsec": buf_sep,
-                        },
-                        schema=out_schema,
-                    )
-                    assert writer is not None
-                    writer.write_table(tbl)
-        rows_b_read = pf_b.metadata.num_rows if pf_b.metadata else 0
-
-    if writer is not None:
-        writer.close()
-    elif out_schema is None:
-        out_schema = pa.schema(
-            [
-                ("source_id", pa.int64()),
-                ("object_id", pa.string()),
-                ("separation_arcsec", pa.float64()),
-            ]
+        rows_b = (
+            sum(
+                pq.read_table(p).num_rows
+                for p in sorted(catalog_b.glob("shard_*.parquet"))
+            )
+            if catalog_b.is_dir()
+            else (
+                pq.ParquetFile(catalog_b).metadata.num_rows
+                if pq.ParquetFile(catalog_b).metadata
+                else 0
+            )
         )
-        pq.write_table(
-            pa.table(
-                {"source_id": [], "object_id": [], "separation_arcsec": []},
-                schema=out_schema,
-            ),
-            output_path,
+        return CrossMatchResult(
+            output_path=str(output_path),
+            rows_a_read=pf_a.metadata.num_rows if pf_a.metadata else 0,
+            rows_b_read=rows_b,
+            matches_count=n_match,
+            chunks_processed=0,
+            time_seconds=elapsed,
         )
-
-    if (
-        n_nearest is not None
-        and out_schema is not None
-        and id_a_name is not None
-        and id_b_name is not None
-    ):
-        _apply_n_nearest(output_path, id_a_name, id_b_name, n_nearest, out_schema)
-        matches_count = pq.read_table(output_path).num_rows
-
-    if include_coords and not b_is_prepartitioned:
-        from pleiades.analysis import attach_match_coords
-
-        attach_match_coords(
-            output_path,
-            catalog_a,
-            catalog_b,
-            output_path,
-            id_col_a=id_col_a,
-            id_col_b=id_col_b,
-            ra_col=ra_col,
-            dec_col=dec_col,
-        )
-
-    elapsed = time.perf_counter() - t0
-    return CrossMatchResult(
-        output_path=str(output_path),
-        rows_a_read=rows_a_read,
-        rows_b_read=rows_b_read,
-        matches_count=matches_count,
-        chunks_processed=chunks_processed,
-        time_seconds=elapsed,
-    )
+    except ImportError:
+        raise ImportError(
+            "Pleiades requires the Rust engine for cross-match. "
+            "Install it with: pip install pleiades (wheels include it), "
+            "or from source: uv run maturin develop"
+        ) from None
 
 
 def cross_match_iter(

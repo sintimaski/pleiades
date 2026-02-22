@@ -13,8 +13,8 @@ For best throughput, build the Rust extension in release mode:
   uv run maturin develop --release
 
 Usage:
-  uv run python scripts/benchmark_cross_match.py [--rows 100000] [--rust]
-  uv run python scripts/benchmark_cross_match.py --rows 1000000 --rust --verbose
+  uv run python scripts/benchmark_cross_match.py [--rows 100000]
+  uv run python scripts/benchmark_cross_match.py --rows 1000000 --verbose
   uv run python scripts/benchmark_cross_match.py --rows 500000 --batch-size 250000
   uv run python scripts/benchmark_cross_match.py --catalog-a path/a.parquet --catalog-b path/b.parquet -o out.parquet
 """
@@ -101,9 +101,6 @@ def main() -> int:
         "--radius", type=float, default=2.0, help="Match radius (arcsec)"
     )
     parser.add_argument(
-        "--rust", action="store_true", help="Use Rust engine (default: True)"
-    )
-    parser.add_argument(
         "--catalog-a",
         type=Path,
         default=None,
@@ -172,7 +169,7 @@ def main() -> int:
         generate_catalog(path_a, args.rows, 42, "source_id")
         generate_catalog(path_b, n_b, 123, "object_id")
 
-    runs: list[tuple[str, bool]] = [("Rust", True)]
+    run_label = "cross_match"
     batch_kw: dict = {}
     if args.batch_size is not None:
         batch_kw["batch_size_a"] = args.batch_size
@@ -208,38 +205,36 @@ def main() -> int:
 
     batch_kw["progress_callback"] = _progress
 
-    for label, use_rust in runs:
-        t0 = time.perf_counter()
-        try:
-            result = pleiades.cross_match(
-                catalog_a=path_a,
-                catalog_b=path_b,
-                radius_arcsec=args.radius,
-                output_path=out,
-                use_rust=use_rust,
-                **batch_kw,
-            )
-        except OSError as e:
-            if "cancelled" in str(e).lower():
-                print("Cancelled.", flush=True)
-                return 130
-            raise
-        elapsed = time.perf_counter() - t0
-        max_rss, is_peak = _get_max_rss_bytes()
-        pairs = result.rows_a_read * result.rows_b_read
-        pairs_per_sec = pairs / elapsed if elapsed > 0 else 0
-        rows_per_sec = result.rows_a_read / elapsed if elapsed > 0 else 0
-        print(
-            f"{label}: {result.rows_a_read} x {result.rows_b_read} -> "
-            f"{result.matches_count} matches in {elapsed:.2f}s "
-            f"({pairs / 1e9:.4f} G pairs) "
-            f"| {pairs_per_sec / 1e6:.2f} M pairs/s, {rows_per_sec / 1e6:.2f} M rows(A)/s"
+    t0 = time.perf_counter()
+    try:
+        result = pleiades.cross_match(
+            catalog_a=path_a,
+            catalog_b=path_b,
+            radius_arcsec=args.radius,
+            output_path=out,
+            **batch_kw,
         )
-        if max_rss is not None:
-            kind = "peak RSS" if is_peak else "current RSS"
-            print(f"Max memory: {_format_memory_bytes(max_rss)} ({kind})")
-        else:
-            print("Max memory: N/A (install psutil on Windows for current RSS)")
+    except OSError as e:
+        if "cancelled" in str(e).lower():
+            print("Cancelled.", flush=True)
+            return 130
+        raise
+    elapsed = time.perf_counter() - t0
+    max_rss, is_peak = _get_max_rss_bytes()
+    pairs = result.rows_a_read * result.rows_b_read
+    pairs_per_sec = pairs / elapsed if elapsed > 0 else 0
+    rows_per_sec = result.rows_a_read / elapsed if elapsed > 0 else 0
+    print(
+        f"{run_label}: {result.rows_a_read} x {result.rows_b_read} -> "
+        f"{result.matches_count} matches in {elapsed:.2f}s "
+        f"({pairs / 1e9:.4f} G pairs) "
+        f"| {pairs_per_sec / 1e6:.2f} M pairs/s, {rows_per_sec / 1e6:.2f} M rows(A)/s"
+    )
+    if max_rss is not None:
+        kind = "peak RSS" if is_peak else "current RSS"
+        print(f"Max memory: {_format_memory_bytes(max_rss)} ({kind})")
+    else:
+        print("Max memory: N/A (install psutil on Windows for current RSS)")
     return 0
 
 

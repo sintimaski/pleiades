@@ -94,7 +94,6 @@ def run_one(
         "catalog_b": path_b,
         "radius_arcsec": radius_arcsec,
         "output_path": out_path,
-        "use_rust": True,
         "batch_size_a": batch_size,
         "batch_size_b": batch_size,
         "n_shards": n_shards,

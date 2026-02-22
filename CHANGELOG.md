@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Rust engine required**: `cross_match()` always uses the Rust engine. The `use_rust` parameter and the pure-Python fallback have been removed. Install with `pip install pleiades` or build from source with `uv run maturin develop`. CLI flags `--rust` / `--no-rust` removed.
 - **Documentation**: README benchmark section documents `generate_benchmark_fixtures.py` and `run_benchmarks.sh`; project layout updated (pleiades_core, scripts list).
 - **Code quality**: Ruff and test cleanups (import order, unused imports, loop variable, assertion on specific exception). Mypy overrides for untyped third-party libs (pyarrow, astropy, cdshealpix); assertions for optional ParquetWriter and partition writers.
 - **Rust engine**: Parquet 52 compatibility — use `File` directly for `ParquetRecordBatchReaderBuilder::try_new()` (parquet 52’s `ChunkReader` is implemented for `File`, not `BufReader`). Removed unused `BufReader` import and `PARQUET_READ_BUFFER_BYTES`.

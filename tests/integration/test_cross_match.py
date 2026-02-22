@@ -248,7 +248,7 @@ def test_matches_equal_reference_brute_force(tmp_path: Path) -> None:
 def test_rust_matches_equal_reference_brute_force(tmp_path: Path) -> None:
     """
     If the Rust engine (pleiades_core) is built with the full implementation,
-    run cross_match(use_rust=True) and assert (id_a, id_b) set equals reference.
+    run cross_match() and assert (id_a, id_b) set equals reference.
     Skipped if pleiades_core is not installed. Requires `uv run maturin develop`
     with the full Rust engine for this test to pass.
     """
@@ -271,7 +271,6 @@ def test_rust_matches_equal_reference_brute_force(tmp_path: Path) -> None:
         catalog_b=path_b,
         radius_arcsec=radius_arcsec,
         output_path=out,
-        use_rust=True,
     )
     if not out.is_file():
         pytest.skip(
@@ -295,7 +294,7 @@ def test_rust_matches_equal_reference_brute_force(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 def test_rust_with_prepartitioned_b_matches_reference(tmp_path: Path) -> None:
-    """With use_rust=True and catalog_b a shard directory, (id_a, id_b) set equals reference."""
+    """With catalog_b a shard directory, (id_a, id_b) set equals reference."""
     pytest.importorskip("pleiades_core")
     table_a, table_b, expected = make_catalogs_exact_n_pairs(
         n_pairs=4, radius_arcsec=2.0, n_a_extra=10, n_b_extra=10, seed=31
@@ -348,7 +347,6 @@ def test_rust_with_prepartitioned_b_matches_reference(tmp_path: Path) -> None:
             catalog_b=shard_dir,
             radius_arcsec=2.0,
             output_path=out,
-            use_rust=True,
         )
     except OSError as e:
         if "Is a directory" in str(e) or "21" in str(e):
@@ -366,7 +364,7 @@ def test_rust_with_prepartitioned_b_matches_reference(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 def test_rust_n_nearest_reduces_output(tmp_path: Path) -> None:
-    """With use_rust=True and n_nearest=1, at most one match per id_a."""
+    """With n_nearest=1, at most one match per id_a."""
     pytest.importorskip("pleiades_core")
     table_a, table_b, _ = make_catalogs_exact_n_pairs(
         n_pairs=5,
@@ -383,7 +381,6 @@ def test_rust_n_nearest_reduces_output(tmp_path: Path) -> None:
         catalog_b=path_b,
         radius_arcsec=2.0,
         output_path=out,
-        use_rust=True,
         n_nearest=1,
     )
     t = read_matches(out)
@@ -399,7 +396,7 @@ def test_rust_n_nearest_reduces_output(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 def test_rust_progress_callback_called(tmp_path: Path) -> None:
-    """With use_rust=True and progress_callback, callback is invoked."""
+    """With progress_callback, callback is invoked."""
     pytest.importorskip("pleiades_core")
     table_a, table_b = make_catalogs_no_pairs(
         n_a=20, n_b=20, radius_arcsec=2.0, seed=88
@@ -416,7 +413,6 @@ def test_rust_progress_callback_called(tmp_path: Path) -> None:
         catalog_b=path_b,
         radius_arcsec=2.0,
         output_path=out,
-        use_rust=True,
         progress_callback=progress,
     )
     if len(progress_calls) < 1:

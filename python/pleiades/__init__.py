@@ -4,6 +4,10 @@ Use cross_match() to join two Parquet catalogs by angular distance
 (e.g. Gaia vs SDSS) without loading full datasets into RAM.
 """
 
+from importlib.metadata import version
+
+__version__ = version("pleiades")
+
 from pleiades.analysis import (
     attach_match_coords,
     filter_matches_by_radius,
@@ -19,6 +23,7 @@ from pleiades.models import CrossMatchResult, MatchSummary
 from pleiades.validation import CatalogValidationError
 
 __all__ = [
+    "__version__",
     "attach_match_coords",
     "batch_cone_search",
     "CatalogValidationError",

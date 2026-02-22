@@ -5,8 +5,8 @@ From repo root:
   uv run python run_tests.py                    # tests only
   uv run python run_tests.py --benchmark        # tests + benchmark (small catalogs)
   uv run python run_tests.py --benchmark-only   # only benchmark (no tests)
-  uv run python run_tests.py --benchmark-only --benchmark-rows 50000 --rust
-  uv run python scripts/benchmark_cross_match.py --rows 100000 --rust  # or run script directly
+  uv run python run_tests.py --benchmark-only --benchmark-rows 50000
+  uv run python scripts/benchmark_cross_match.py --rows 100000  # or run script directly
 Rust tests are skipped if cargo is not available.
 """
 
@@ -64,7 +64,6 @@ def run_python_tests() -> bool:
 
 def run_benchmark(
     rows: int = 5000,
-    rust: bool = False,
     timeout: int = 120,
 ) -> bool:
     """Run benchmark_cross_match.py with small catalogs. Return True if success."""
@@ -74,8 +73,6 @@ def run_benchmark(
         print("Benchmark script not found; skipping.")
         return True
     cmd = [sys.executable, str(script), "--rows", str(rows)]
-    if rust:
-        cmd.append("--rust")
     try:
         proc = subprocess.run(
             cmd,
@@ -110,16 +107,11 @@ def main() -> int:
         metavar="N",
         help="Rows per catalog for benchmark (default: 5000).",
     )
-    parser.add_argument(
-        "--rust",
-        action="store_true",
-        help="Include Rust engine in benchmark (when --benchmark or --benchmark-only).",
-    )
     args = parser.parse_args()
 
     if args.benchmark_only:
         print("=== Benchmark (cross_match) only ===\n")
-        bench_ok = run_benchmark(rows=args.benchmark_rows, rust=args.rust)
+        bench_ok = run_benchmark(rows=args.benchmark_rows)
         if not bench_ok:
             return 1
         print("\nBenchmark done.")
@@ -138,7 +130,7 @@ def main() -> int:
 
     if args.benchmark:
         print("\n=== Benchmark (cross_match) ===\n")
-        bench_ok = run_benchmark(rows=args.benchmark_rows, rust=args.rust)
+        bench_ok = run_benchmark(rows=args.benchmark_rows)
         if not bench_ok:
             print("\nBenchmark failed.", file=sys.stderr)
             return 1
