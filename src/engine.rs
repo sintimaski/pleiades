@@ -33,7 +33,8 @@ use rayon::prelude::*;
 
 /// Larger write buffer for temp shard files (fewer syscalls).
 const SHARD_WRITE_BUFFER_BYTES: usize = 256 * 1024; // 256 KiB
-/// Read buffer for Parquet (fewer syscalls on partition and shard reads).
+/// Batch size when reading shard Parquet (larger = fewer decode cycles and larger I/O chunks).
+const SHARD_READ_BATCH_ROWS: usize = 131_072; // 128k
 
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
@@ -276,24 +277,62 @@ fn list_shard_paths(shard_dir: &Path) -> Result<(Vec<std::path::PathBuf>, usize)
 }
 
 /// Load one shard file, return rows whose pixel_id is in pixels_wanted. Shard ra/dec are in degrees.
+/// Uses a large batch size to reduce decode overhead; fast path for common shard schema (UInt64/Float64/Int64).
 fn load_one_shard(
     path: &Path,
     pixels_wanted: &HashSet<u64>,
 ) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-    .build()?;
+        .with_batch_size(SHARD_READ_BATCH_ROWS)
+        .build()?;
     let mut out: Vec<(IdVal, f64, f64)> = Vec::new();
     for batch in reader {
         let batch = batch?;
-        if batch.num_rows() == 0 {
+        let n = batch.num_rows();
+        if n == 0 {
             continue;
         }
         let pix_col = batch.column(column_index(&batch, "pixel_id"));
         let ra_col = batch.column(column_index(&batch, "ra"));
         let dec_col = batch.column(column_index(&batch, "dec"));
         let id_b_idx = column_index(&batch, "id_b");
-        for row in 0..batch.num_rows() {
+
+        // Fast path: shard schema is always (pixel_id UInt64, id_b ?, ra Float64, dec Float64) from partition_b_to_temp.
+        if let (Some(pix_arr), Some(ra_arr), Some(dec_arr)) = (
+            pix_col.as_any().downcast_ref::<UInt64Array>(),
+            ra_col.as_any().downcast_ref::<Float64Array>(),
+            dec_col.as_any().downcast_ref::<Float64Array>(),
+        ) {
+            let ra_slice = ra_arr.values();
+            let dec_slice = dec_arr.values();
+            out.reserve(n);
+            let id_col = batch.column(id_b_idx);
+            if let Some(id_i64) = id_col.as_any().downcast_ref::<Int64Array>() {
+                for row in 0..n {
+                    if !pixels_wanted.contains(&pix_arr.value(row)) {
+                        continue;
+                    }
+                    out.push((IdVal::I64(id_i64.value(row)), ra_slice[row], dec_slice[row]));
+                }
+            } else {
+                for row in 0..n {
+                    if !pixels_wanted.contains(&pix_arr.value(row)) {
+                        continue;
+                    }
+                    out.push((
+                        get_id_value(&batch, "id_b", id_b_idx, row),
+                        ra_slice[row],
+                        dec_slice[row],
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // Fallback: other column types (e.g. Float32 ra/dec, Dictionary id_b).
+        out.reserve(n);
+        for row in 0..n {
             let pix_val = match pix_col.data_type() {
                 DataType::UInt64 => pix_col.as_any().downcast_ref::<UInt64Array>().unwrap().value(row),
                 DataType::Int64 => pix_col.as_any().downcast_ref::<Int64Array>().unwrap().value(row) as u64,
@@ -961,23 +1000,34 @@ pub fn cross_match_impl(
         let (ra_deg_a, dec_deg_a) = ra_dec_degrees(&batch_a, ra_idx, dec_idx, from_radians)?;
 
         let t_index = std::time::Instant::now();
-        let mut id_a_flat: Vec<IdVal> = Vec::with_capacity(n_a);
-        let mut ra_flat: Vec<f64> = Vec::with_capacity(n_a);
-        let mut dec_flat: Vec<f64> = Vec::with_capacity(n_a);
-        let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
-        for row in 0..batch_a.num_rows() {
-            let ra_deg = ra_deg_a[row];
-            let dec_deg = dec_deg_a[row];
-            let lon = ra_deg * DEG_TO_RAD;
-            let lat = dec_deg * DEG_TO_RAD;
-            let pix = layer.hash(lon, lat);
-            let id_val = get_id_value(&batch_a, &id_a_col, id_a_idx, row);
-            let idx = id_a_flat.len();
-            id_a_flat.push(id_val);
-            ra_flat.push(ra_deg);
-            dec_flat.push(dec_deg);
-            index.entry(pix).or_default().push(idx);
-        }
+        // Build id_a_flat and HEALPix index in parallel (was sequential hot path).
+        let id_a_flat: Vec<IdVal> = (0..n_a)
+            .into_par_iter()
+            .map(|row| get_id_value(&batch_a, &id_a_col, id_a_idx, row))
+            .collect();
+        let ra_flat: Vec<f64> = ra_deg_a.to_vec();
+        let dec_flat: Vec<f64> = dec_deg_a.to_vec();
+        let index: HashMap<u64, Vec<usize>> = (0..n_a)
+            .into_par_iter()
+            .map(|row| {
+                let lon = ra_deg_a[row] * DEG_TO_RAD;
+                let lat = dec_deg_a[row] * DEG_TO_RAD;
+                (layer.hash(lon, lat), row)
+            })
+            .fold_with(
+                HashMap::<u64, Vec<usize>>::new(),
+                |mut m, (pix, row)| {
+                    m.entry(pix).or_default().push(row);
+                    m
+                },
+            )
+            .reduce_with(|mut a: HashMap<u64, Vec<usize>>, b| {
+                for (pix, v) in b {
+                    a.entry(pix).or_default().extend(v);
+                }
+                a
+            })
+            .unwrap_or_else(HashMap::new);
         if verbose {
             verbose_log_timed("  index", t_index.elapsed().as_secs_f64(), "");
         }

@@ -51,4 +51,35 @@ catalog_a.parquet     catalog_b.parquet (or shard dir)
 | **Memory** | `batch_size_a`, `batch_size_b`, `n_shards`. Smaller = less RAM, more I/O. |
 | **Throughput** | Rayon in Rust. Pre-partition B + pass directory; use `progress_callback` (e.g. tqdm). |
 
-- Tuning and GPU: [PERFORMANCE.md](PERFORMANCE.md)
+### Decode and copy (load B from shards)
+
+When B is loaded from shards, cost is **Parquet decode** + **copy into Rust structs** + **memory bandwidth** (not disk if cached). Implemented:
+
+- **Large batch size** (`SHARD_READ_BATCH_ROWS` 128k): fewer decode cycles and larger reads.
+- **Fast path in `load_one_shard`**: Shard schema is fixed (UInt64 pixel_id, Float64 ra/dec from `partition_b_to_temp`). We downcast columns once per batch, use slice access for ra/dec (`ra_arr.values()[row]`), reserve capacity, and specialize Int64 `id_b` to avoid per-row `get_id_value` dispatch and extra branches.
+
+Possible later improvements: columnar B representation (`ra_b: &[f64], dec_b: &[f64]`) so the join hot path streams ra/dec without touching ids; predicate pushdown on shard Parquet by pixel_id if the format allows.
+
+---
+
+## Parallelism (threads and I/O)
+
+**Already in place:**
+
+- **A reads:** A dedicated thread prefetches catalog A (1–2 batches ahead) so Parquet I/O overlaps with join work. Main thread consumes batches; reader thread keeps filling the channel.
+- **B reads (shards):** When `catalog_b` is a directory of shards, **multiple shard files are read in parallel** (Rayon `par_iter` over the shard indices needed for the chunk). So many threads read different `shard_*.parquet` files at once.
+- **Join:** The inner B-loop (haversine, candidate search) is parallelized with Rayon over B rows. Thread count follows `RAYON_NUM_THREADS` or `std::thread::available_parallelism()`.
+- **B prefetch:** When using shards, a second background thread loads the *next* chunk’s B rows while the main thread runs the join for the *current* chunk (pipeline overlap).
+- **Index build (A chunk):** Building the HEALPix index (pixel → row indices) and `id_a_flat` for each A chunk is done in parallel with Rayon (`par_iter` + `fold_with`/`reduce_with`), so this hot path is no longer sequential.
+
+**Still single-threaded:**
+
+- **Partitioning B** (when `catalog_b` is a file): one sequential read of B and sequential writes to shard files. Parallelizing would require splitting the B file by row ranges and merging shard writes (more complex).
+- **Single-file Parquet decode:** Each Parquet file (A or one B shard) is decoded by one reader in one thread. The underlying crate reads row groups sequentially; parallel row-group decode would need API support.
+
+**Could add later:**
+
+- **Parallel partition of B:** e.g. stream B in chunks, assign chunks to a Rayon pool, each worker writes to its shard(s) with synchronized writers (or per-thread buffers then merge).
+- **Parallel row-group reads:** If the Parquet/Arrow API allows, decode different row groups of the same file in parallel (helps when one large file is the bottleneck).
+
+So: **yes, multiple threads already read input** (A in a prefetch thread; B shards in parallel). Adding more threads to “read the same file” would only help if we split the file (e.g. by row groups) and decode in parallel, which the current reader API doesn’t expose; for **multiple files** (shards), we already do it.

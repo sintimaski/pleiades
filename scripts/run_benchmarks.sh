@@ -41,6 +41,8 @@ echo "  extra args: ${*:-none}"
 echo "---"
 
 # 1M-row fixtures; tool defaults (batch 250k, n_shards 16) match this scale
+# Optional: set RAYON_NUM_THREADS to cap or boost parallelism (e.g. 8).
+RAYON_NUM_THREADS=10
 ROWS=1000000
 BATCH=$((ROWS / 4))
 CATALOG_A="${FIXTURES_DIR}/catalog_a_${ROWS}.parquet"
