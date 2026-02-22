@@ -51,15 +51,7 @@ def main() -> int:
         generate_catalog(path_a, args.rows, 42, "source_id")
         generate_catalog(path_b, n_b, 123, "object_id")
 
-        # runs: list[tuple[str, bool]] = [("Python", False)]
-        runs: list[tuple[str, bool]] = []
-        if args.rust:
-            try:
-                import astrojoin_core  # noqa: F401
-                runs.append(("Rust", True))
-            except ImportError:
-                print("Rust engine not available (maturin develop). Skipping Rust run.")
-
+        runs: list[tuple[str, bool]] = [("Rust", True)]
         for label, use_rust in runs:
             t0 = time.perf_counter()
             result = astrojoin.cross_match(
