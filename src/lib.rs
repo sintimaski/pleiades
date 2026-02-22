@@ -1,4 +1,4 @@
-//! AstroJoin Rust engine: out-of-core spatial cross-match for astronomical catalogs.
+//! Pleiades Rust engine: out-of-core spatial cross-match for astronomical catalogs.
 //!
 //! Built as a Python extension via PyO3/Maturin. Uses cdshealpix (HEALPix),
 //! Arrow/Parquet for streaming I/O, and haversine for angular distance.
@@ -108,7 +108,7 @@ fn cross_match(
         .unbind())
 }
 
-/// Returns true if the extension was built with the `wgpu` feature (GPU join available when ASTROJOIN_GPU=wgpu).
+/// Returns true if the extension was built with the `wgpu` feature (GPU join available when PLEIADES_GPU=wgpu).
 #[cfg(feature = "python")]
 #[pyfunction]
 fn has_wgpu_feature() -> bool {
@@ -118,7 +118,7 @@ fn has_wgpu_feature() -> bool {
 /// Python module entry point.
 #[cfg(feature = "python")]
 #[pymodule]
-fn astrojoin_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn pleiades_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cross_match, m)?)?;
     m.add_function(wrap_pyfunction!(has_wgpu_feature, m)?)?;
     Ok(())

@@ -1,4 +1,4 @@
-"""Unit tests for astrojoin.analysis module."""
+"""Unit tests for pleiades.analysis module."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import astrojoin
-from astrojoin.models import MatchSummary
+import pleiades
+from pleiades.models import MatchSummary
 
 
 @pytest.mark.unit
@@ -29,7 +29,7 @@ class TestSummarizeMatches:
             ),
             empty,
         )
-        summary = astrojoin.summarize_matches(empty)
+        summary = pleiades.summarize_matches(empty)
         assert summary.num_matches == 0
         assert summary.num_unique_id_a == 0
         assert summary.num_unique_id_b == 0
@@ -50,7 +50,7 @@ class TestSummarizeMatches:
             ),
             matches,
         )
-        summary = astrojoin.summarize_matches(matches)
+        summary = pleiades.summarize_matches(matches)
         assert summary.num_matches == 3
         assert summary.num_unique_id_a == 2
         assert summary.num_unique_id_b == 3
@@ -64,7 +64,7 @@ class TestSummarizeMatches:
     def test_summarize_matches_file_not_found(self) -> None:
         """summarize_matches raises FileNotFoundError for missing file."""
         with pytest.raises(FileNotFoundError, match="Matches file not found"):
-            astrojoin.summarize_matches("/nonexistent/matches.parquet")
+            pleiades.summarize_matches("/nonexistent/matches.parquet")
 
 
 @pytest.mark.unit
@@ -84,7 +84,7 @@ class TestMatchStats:
             ),
             path,
         )
-        stats = astrojoin.match_stats(path)
+        stats = pleiades.match_stats(path)
         assert stats["num_matches"] == 2
         assert stats["num_unique_id_a"] == 2
         assert stats["separation_arcsec_min"] == 0.5
@@ -105,7 +105,7 @@ class TestMatchStats:
             ),
             path,
         )
-        stats = astrojoin.match_stats(
+        stats = pleiades.match_stats(
             path, separation_percentiles=[25.0, 50.0, 75.0]
         )
         assert "separation_percentiles" in stats
@@ -132,7 +132,7 @@ class TestMatchQualitySummary:
             ),
             path,
         )
-        q = astrojoin.match_quality_summary(path, rows_a=10, rows_b=5)
+        q = pleiades.match_quality_summary(path, rows_a=10, rows_b=5)
         assert q["num_matches"] == 2
         assert q["fraction_id_a_matched"] == 0.2
         assert q["fraction_id_b_matched"] == 0.4
@@ -150,7 +150,7 @@ class TestMatchQualitySummary:
             ),
             path,
         )
-        q = astrojoin.match_quality_summary(path, rows_a=100, rows_b=50)
+        q = pleiades.match_quality_summary(path, rows_a=100, rows_b=50)
         assert q["fraction_id_a_matched"] == 0.0
         assert q["fraction_id_b_matched"] == 0.0
         assert q["num_matches"] == 0
@@ -196,7 +196,7 @@ class TestAttachMatchCoords:
             ),
             cat_b,
         )
-        astrojoin.attach_match_coords(
+        pleiades.attach_match_coords(
             matches, cat_a, cat_b, out,
             id_col_a="source_id", id_col_b="object_id",
         )
@@ -238,7 +238,7 @@ class TestMergeMatchToCatalog:
             ),
             catalog,
         )
-        astrojoin.merge_match_to_catalog(
+        pleiades.merge_match_to_catalog(
             matches, catalog, out, catalog_side="a", id_col_catalog="source_id"
         )
         t = pq.read_table(out)
@@ -271,7 +271,7 @@ class TestMergeMatchToCatalog:
             ),
             catalog,
         )
-        astrojoin.merge_match_to_catalog(
+        pleiades.merge_match_to_catalog(
             matches, catalog, out, catalog_side="b", id_col_catalog="object_id"
         )
         t = pq.read_table(out)
@@ -296,7 +296,7 @@ class TestMergeMatchToCatalog:
             catalog,
         )
         with pytest.raises(ValueError, match="not in catalog columns"):
-            astrojoin.merge_match_to_catalog(
+            pleiades.merge_match_to_catalog(
                 matches, catalog, out, id_col_catalog="nonexistent"
             )
 
@@ -315,11 +315,11 @@ class TestMergeMatchToCatalog:
             matches,
         )
         with pytest.raises(FileNotFoundError, match="Matches file not found"):
-            astrojoin.merge_match_to_catalog(
+            pleiades.merge_match_to_catalog(
                 "/nonexistent/m.parquet", cat, tmp_path / "out.parquet"
             )
         with pytest.raises(FileNotFoundError, match="Catalog not found"):
-            astrojoin.merge_match_to_catalog(
+            pleiades.merge_match_to_catalog(
                 matches, "/nonexistent/c.parquet", tmp_path / "out.parquet"
             )
 
@@ -342,7 +342,7 @@ class TestFilterMatchesByRadius:
             ),
             inp,
         )
-        n = astrojoin.filter_matches_by_radius(inp, 2.0, out)
+        n = pleiades.filter_matches_by_radius(inp, 2.0, out)
         assert n == 2
         t = pq.read_table(out)
         assert t.num_rows == 2
@@ -351,7 +351,7 @@ class TestFilterMatchesByRadius:
     def test_filter_matches_by_radius_file_not_found(self) -> None:
         """Raises FileNotFoundError when matches file missing."""
         with pytest.raises(FileNotFoundError, match="Matches file not found"):
-            astrojoin.filter_matches_by_radius(
+            pleiades.filter_matches_by_radius(
                 "/nonexistent/m.parquet", 1.0, "/tmp/out.parquet"
             )
 
@@ -363,7 +363,7 @@ class TestMultiRadiusCrossMatch:
     def test_multi_radius_cross_match_writes_per_radius(self, tmp_path: Path) -> None:
         """Produces one file per radius and returns path map."""
         fixtures = Path(__file__).resolve().parent.parent / "fixtures"
-        result = astrojoin.multi_radius_cross_match(
+        result = pleiades.multi_radius_cross_match(
             catalog_a=fixtures / "catalog_a_small.parquet",
             catalog_b=fixtures / "catalog_b_small.parquet",
             radii_arcsec=[1.0, 2.0, 5.0],

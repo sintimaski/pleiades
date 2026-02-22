@@ -82,7 +82,7 @@ def run_one(
     progress_callback: object | None = None,
 ) -> tuple[float, float | None, int] | None:
     """Run cross_match once; return (time_sec, max_rss_bytes or None, matches_count) or None if cancelled."""
-    import astrojoin
+    import pleiades
     t0 = time.perf_counter()
     kwargs: dict = {
         "catalog_a": path_a,
@@ -98,7 +98,7 @@ def run_one(
     if progress_callback is not None:
         kwargs["progress_callback"] = progress_callback
     try:
-        result = astrojoin.cross_match(**kwargs)
+        result = pleiades.cross_match(**kwargs)
     except OSError as e:
         if "cancelled" in str(e).lower():
             return None
@@ -156,7 +156,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # Ensure we run from repo root so astrojoin is importable
+    # Ensure we run from repo root so pleiades is importable
     script_dir = Path(__file__).resolve().parent
     repo_root = script_dir.parent
     if str(repo_root) not in sys.path:
@@ -171,7 +171,7 @@ def main() -> int:
     if args.out_of_core_only:
         memory_list = [False]
 
-    tmp = Path(tempfile.mkdtemp(prefix="astrojoin_tune_"))
+    tmp = Path(tempfile.mkdtemp(prefix="pleiades_tune_"))
     path_a = tmp / "catalog_a.parquet"
     path_b = tmp / "catalog_b.parquet"
 
@@ -181,7 +181,7 @@ def main() -> int:
     generate_catalog(path_b, args.rows, 123, "object_id")
 
     # Suppress Rust verbose logs during tuning
-    env_verbose = os.environ.pop("ASTROJOIN_VERBOSE", None)
+    env_verbose = os.environ.pop("PLEIADES_VERBOSE", None)
 
     cancel_requested: list[bool] = [False]
 
@@ -266,7 +266,7 @@ def main() -> int:
                 })
 
     if env_verbose is not None:
-        os.environ["ASTROJOIN_VERBOSE"] = env_verbose
+        os.environ["PLEIADES_VERBOSE"] = env_verbose
 
     valid = [r for r in results if r["time_sec"] != float("inf")]
     if not valid:

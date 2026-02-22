@@ -1,7 +1,7 @@
-# Cursor Rules for AstroJoin Project
+# Cursor Rules for Pleiades Project
 
 ## Project Context
-AstroJoin is a high-performance out-of-core spatial cross-matcher for astronomical catalogs. It provides a Python API backed by a native Rust engine (PyO3/Maturin). The engine uses HEALPix indexing (cdshealpix), Apache Arrow, and chunked streaming to join billion-row datasets without exceeding RAM.
+Pleiades is a high-performance out-of-core spatial cross-matcher for astronomical catalogs. It provides a Python API backed by a native Rust engine (PyO3/Maturin). The engine uses HEALPix indexing (cdshealpix), Apache Arrow, and chunked streaming to join billion-row datasets without exceeding RAM.
 
 ## Python Coding Standards
 
@@ -88,7 +88,7 @@ project_root/
 ├── src/                    # Rust crate source (engine)
 │   └── lib.rs
 ├── python/                 # Python package (public API)
-│   └── astrojoin/
+│   └── pleiades/
 │       ├── __init__.py
 │       └── ...
 ├── tests/                  # Python test files
@@ -105,8 +105,8 @@ project_root/
 
 ### README.md
 - Project overview and one-liner (out-of-core spatial join for astronomy)
-- Installation: `uv sync` and `pip install astrojoin` (or editable install)
-- Usage example: `astrojoin.cross_match(catalog_a=..., catalog_b=..., radius_arcsec=..., output_path=...)`
+- Installation: `uv sync` and `pip install pleiades` (or editable install)
+- Usage example: `pleiades.cross_match(catalog_a=..., catalog_b=..., radius_arcsec=..., output_path=...)`
 - Architecture summary (Python API → Rust engine → HEALPix + Arrow + chunked I/O)
 - Contributing and license
 

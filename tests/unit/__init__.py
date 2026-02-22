@@ -1,1 +1,1 @@
-"""Unit tests for AstroJoin."""
+"""Unit tests for Pleiades."""

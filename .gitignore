@@ -58,3 +58,4 @@ data/
 
 # Tests and benchmarks
 logs/
+run_benchmarks.sh

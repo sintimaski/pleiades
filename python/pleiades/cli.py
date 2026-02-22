@@ -1,4 +1,4 @@
-"""Command-line interface for AstroJoin."""
+"""Command-line interface for Pleiades."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ def _path(s: str) -> Path:
 
 def cmd_cross_match(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Run cross-match from CLI."""
-    import astrojoin
+    import pleiades
 
-    result = astrojoin.cross_match(
+    result = pleiades.cross_match(
         catalog_a=args.catalog_a,
         catalog_b=args.catalog_b,
         radius_arcsec=float(args.radius),
@@ -37,9 +37,9 @@ def cmd_cross_match(parser: argparse.ArgumentParser, args: argparse.Namespace) -
 
 def cmd_summarize(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Summarize a matches file."""
-    import astrojoin
+    import pleiades
 
-    summary = astrojoin.summarize_matches(args.matches)
+    summary = pleiades.summarize_matches(args.matches)
     print(f"Matches: {summary.num_matches}")
     print(f"Unique id_a: {summary.num_unique_id_a}, id_b: {summary.num_unique_id_b}")
     print(
@@ -53,9 +53,9 @@ def cmd_summarize(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
 def cmd_cone_search(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Run cone search from CLI."""
-    import astrojoin
+    import pleiades
 
-    n = astrojoin.cone_search(
+    n = pleiades.cone_search(
         catalog_path=args.catalog,
         ra_deg=float(args.ra),
         dec_deg=float(args.dec),
@@ -68,9 +68,9 @@ def cmd_cone_search(parser: argparse.ArgumentParser, args: argparse.Namespace) -
 
 def cmd_partition(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Partition a catalog by HEALPix into shards."""
-    import astrojoin
+    import pleiades
 
-    astrojoin.partition_catalog(
+    pleiades.partition_catalog(
         catalog_path=args.catalog,
         output_dir=args.output_dir,
         depth=args.depth,
@@ -84,9 +84,9 @@ def cmd_partition(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
 
 def main() -> int:
-    """Entry point for astrojoin command."""
+    """Entry point for pleiades command."""
     parser = argparse.ArgumentParser(
-        prog="astrojoin",
+        prog="pleiades",
         description="Out-of-core spatial cross-matcher for astronomical catalogs",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)

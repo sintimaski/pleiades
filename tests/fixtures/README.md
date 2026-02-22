@@ -1,6 +1,6 @@
 # Test data
 
-Synthetic Parquet catalogs for AstroJoin tests. All use **ra** and **dec** in **degrees**.
+Synthetic Parquet catalogs for Pleiades tests. All use **ra** and **dec** in **degrees**.
 
 | File | Rows | Description |
 |------|------|-------------|

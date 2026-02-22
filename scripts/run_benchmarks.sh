@@ -24,8 +24,8 @@ echo "Running benchmarks (args: ${*:-default})"
 echo "  stdout -> $LOG_STDOUT"
 echo "---"
 
-# ASTROJOIN_GPU=wgpu ASTROJOIN_GPU_MIN_PAIRS=0 uv run python scripts/benchmark_cross_match.py "$@" 2> /dev/null | tee "$LOG_STDOUT"
-uv run python scripts/benchmark_cross_match.py "$@" 2> /dev/null | tee "$LOG_STDOUT"
+PLEIADES_GPU=wgpu PLEIADES_GPU_MIN_PAIRS=0 uv run python scripts/benchmark_cross_match.py "$@" 2> "$LOG_STDOUT"
+# uv run python scripts/benchmark_cross_match.py --rows 1000000 --batch-size 500000 --verbose 2> "$LOG_STDOUT"
 
 echo "---"
-echo "Done. Logs: $LOG_STDOUT, $LOG_STDERR"
+echo "Done. Logs: $LOG_STDOUT"

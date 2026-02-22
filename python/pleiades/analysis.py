@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from astrojoin.models import MatchSummary
+from pleiades.models import MatchSummary
 
 
 def match_stats(
@@ -384,7 +384,7 @@ def multi_radius_cross_match(
     Writes one Parquet per radius to output_dir (e.g. matches_1.0.parquet).
     Returns a mapping radius_arcsec -> output file path.
     """
-    from astrojoin.cross_match import cross_match
+    from pleiades.cross_match import cross_match
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

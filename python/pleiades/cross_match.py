@@ -17,8 +17,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from astropy.coordinates import Latitude, Longitude
 
-from astrojoin.models import CrossMatchResult
-from astrojoin.validation import (
+from pleiades.models import CrossMatchResult
+from pleiades.validation import (
     validate_catalog_schema,
     validate_cross_match_args,
     validate_prepartitioned_dir,
@@ -399,7 +399,7 @@ def cross_match(
 
     Matching is done by the Rust engine (use_rust=True, default). Python is used
     for the API, validation, and helpers; the heavy work runs in the Rust extension.
-    If the extension is not installed, install with ``pip install astrojoin`` (wheels
+    If the extension is not installed, install with ``pip install pleiades`` (wheels
     include it) or from source: ``uv run maturin develop``. Set use_rust=False to
     use the Python implementation (slow, for testing or environments without the wheel).
 
@@ -458,22 +458,22 @@ def cross_match(
 
     if use_rust:
         try:
-            import astrojoin_core  # type: ignore[import-untyped]
+            import pleiades_core  # type: ignore[import-untyped]
 
-            gpu_env = os.environ.get("ASTROJOIN_GPU")
+            gpu_env = os.environ.get("PLEIADES_GPU")
             if gpu_env == "wgpu" and not getattr(
-                astrojoin_core, "has_wgpu_feature", lambda: False
+                pleiades_core, "has_wgpu_feature", lambda: False
             )():
                 import sys
 
                 print(
-                    "astrojoin: ASTROJOIN_GPU=wgpu is set but the extension was not built "
+                    "pleiades: PLEIADES_GPU=wgpu is set but the extension was not built "
                     "with GPU support. Rebuild with: uv run maturin develop --features wgpu",
                     file=sys.stderr,
                 )
 
             try:
-                result = astrojoin_core.cross_match(
+                result = pleiades_core.cross_match(
                     str(catalog_a),
                     str(catalog_b),
                     radius_arcsec,
@@ -502,7 +502,7 @@ def cross_match(
                         UserWarning,
                         stacklevel=2,
                     )
-                    result = astrojoin_core.cross_match(
+                    result = pleiades_core.cross_match(
                         str(catalog_a),
                         str(catalog_b),
                         radius_arcsec,
@@ -520,7 +520,7 @@ def cross_match(
                         progress_callback=progress_callback,
                     )
                 elif "progress_callback" in err_str or "n_nearest" in err_str:
-                    result = astrojoin_core.cross_match(
+                    result = pleiades_core.cross_match(
                         str(catalog_a),
                         str(catalog_b),
                         radius_arcsec,
@@ -543,7 +543,7 @@ def cross_match(
                         "(uv run maturin develop)"
                     ) from e
                 else:
-                    result = astrojoin_core.cross_match(
+                    result = pleiades_core.cross_match(
                         str(catalog_a),
                         str(catalog_b),
                         radius_arcsec,
@@ -560,7 +560,7 @@ def cross_match(
             if result is not None and isinstance(result, dict):
                 out_path = result["output_path"]
                 if include_coords and catalog_b.is_file():
-                    from astrojoin.analysis import attach_match_coords
+                    from pleiades.analysis import attach_match_coords
 
                     attach_match_coords(
                         out_path,
@@ -601,8 +601,8 @@ def cross_match(
         except ImportError:
             if use_rust:
                 raise ImportError(
-                    "AstroJoin requires the Rust engine for cross-match. "
-                    "Install it with: pip install astrojoin (wheels include it), "
+                    "Pleiades requires the Rust engine for cross-match. "
+                    "Install it with: pip install pleiades (wheels include it), "
                     "or from source: uv run maturin develop"
                 ) from None
             # use_rust=False: fall back to Python implementation
@@ -628,7 +628,7 @@ def cross_match(
             for p in sorted(shard_path.glob("shard_*.parquet")):
                 rows_b_read += pq.read_table(p).num_rows
         else:
-            with tempfile.TemporaryDirectory(prefix="astrojoin_b_") as shard_dir:
+            with tempfile.TemporaryDirectory(prefix="pleiades_b_") as shard_dir:
                 shard_path = Path(shard_dir)
                 id_b_name, type_b = _partition_b_to_shards(
                     catalog_b,
@@ -878,7 +878,7 @@ def cross_match(
         matches_count = pq.read_table(output_path).num_rows
 
     if include_coords and not b_is_prepartitioned:
-        from astrojoin.analysis import attach_match_coords
+        from pleiades.analysis import attach_match_coords
 
         attach_match_coords(
             output_path,
@@ -950,7 +950,7 @@ def cross_match_iter(
             id_col=id_col_b,
             must_have_id=True,
         )
-        with tempfile.TemporaryDirectory(prefix="astrojoin_b_") as shard_dir:
+        with tempfile.TemporaryDirectory(prefix="pleiades_b_") as shard_dir:
             shard_path = Path(shard_dir)
             id_b_name, type_b = _partition_b_to_shards(
                 catalog_b,

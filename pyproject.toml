@@ -1,5 +1,5 @@
 [project]
-name = "astrojoin"
+name = "pleiades"
 version = "0.1.0"
 description = "High-performance out-of-core spatial cross-matcher for astronomical catalogs"
 readme = "README.md"
@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.scripts]
-astrojoin = "astrojoin.cli:main"
+pleiades = "pleiades.cli:main"
 
 [dependency-groups]
 dev = [
@@ -89,7 +89,7 @@ markers = [
 ]
 
 [tool.coverage.run]
-source = ["python/astrojoin"]
+source = ["python/pleiades"]
 omit = ["**/__init__.py", "**/_core*"]
 
 [tool.coverage.report]

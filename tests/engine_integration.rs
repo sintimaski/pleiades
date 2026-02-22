@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::array::{Float32Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use astrojoin_core::engine::cross_match_impl;
+use pleiades_core::engine::cross_match_impl;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;

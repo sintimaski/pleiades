@@ -1,5 +1,5 @@
 //! Optional wgpu-based GPU haversine kernel for cross-match distance computation.
-//! Enabled with the `wgpu` feature and activated by setting ASTROJOIN_GPU=wgpu.
+//! Enabled with the `wgpu` feature and activated by setting PLEIADES_GPU=wgpu.
 //!
 //! Computes angular separation in arcsec for N (ra_a, dec_a, ra_b, dec_b) pairs in a single
 //! compute dispatch. Used when the engine has collected candidate pairs from the HEALPix index.
@@ -62,7 +62,7 @@ fn init_gpu() -> Option<GpuContext> {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    label: Some("astrojoin-gpu"),
+                    label: Some("pleiades-gpu"),
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::downlevel_defaults(),
                     memory_hints: wgpu::MemoryHints::default(),

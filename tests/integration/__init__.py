@@ -1,1 +1,1 @@
-"""Integration tests for AstroJoin."""
+"""Integration tests for Pleiades."""

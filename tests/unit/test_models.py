@@ -1,10 +1,10 @@
-"""Unit tests for astrojoin.models."""
+"""Unit tests for pleiades.models."""
 
 from __future__ import annotations
 
 import pytest
 
-from astrojoin.models import CrossMatchResult, MatchSummary
+from pleiades.models import CrossMatchResult, MatchSummary
 
 
 @pytest.mark.unit

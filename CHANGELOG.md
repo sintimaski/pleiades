@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `attach_match_coords(matches_path, catalog_a_path, catalog_b_path, output_path, ...)`: add ra_a, dec_a, ra_b, dec_b to a match file.
   - `batch_cone_search(catalog_path, queries, output_path)`: multi-query cone search with query_index and separation_arcsec.
   - `cross_match(..., include_coords=False)`: when True (and B is a file), append ra/dec columns to the match output.
-- **CLI** (`astrojoin`): subcommands `cross-match`, `summarize-matches`, `cone-search`, `partition-catalog`.
+- **CLI** (`pleiades`): subcommands `cross-match`, `summarize-matches`, `cone-search`, `partition-catalog`.
 - **Validation**: `validate_cross_match_args(radius_arcsec, n_nearest, depth, n_shards)`; clearer column-not-found errors with suggested names.
 - **Benchmark**: `scripts/benchmark_cross_match.py` for synthetic catalogs (Python and optional Rust).
 
@@ -41,5 +41,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rust: progress callback GIL and type handling for PyO3.
 - Validation: reject NaN and infinite `radius_arcsec`.
 
-[Unreleased]: https://github.com/your-org/astrojoin/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/your-org/astrojoin/releases/tag/v0.1.0
+[Unreleased]: https://github.com/your-org/pleiades/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/your-org/pleiades/releases/tag/v0.1.0

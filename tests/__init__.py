@@ -1,1 +1,1 @@
-"""AstroJoin test suite."""
+"""Pleiades test suite."""

@@ -1,4 +1,4 @@
-# AstroJoin
+# Pleiades
 
 **High-performance out-of-core spatial cross-matcher for astronomical catalogs.**
 
@@ -9,9 +9,9 @@ Cross-match two Parquet catalogs by angular distance (e.g. Gaia × SDSS) using H
 **Plug and play** (no Rust required):
 
 ```bash
-pip install astrojoin
+pip install pleiades
 # or
-uv add astrojoin
+uv add pleiades
 ```
 
 This installs the Python package and the Rust extension wheel for your platform (Python 3.10–3.12). You can use `use_rust=True` immediately. For preparing real catalogs (Gaia, LSST, SDSS, etc.), see [DATA_SOURCES.md](DATA_SOURCES.md).
@@ -29,9 +29,9 @@ uv run maturin develop   # build Rust extension for current env
 ### Cross-match (Python API)
 
 ```python
-import astrojoin
+import pleiades
 
-result = astrojoin.cross_match(
+result = pleiades.cross_match(
     catalog_a="catalog_a.parquet",
     catalog_b="catalog_b.parquet",
     radius_arcsec=2.0,
@@ -50,16 +50,16 @@ result = astrojoin.cross_match(
 
 ```bash
 # Cross-match (Rust engine by default; use --no-rust for Python path)
-astrojoin cross-match catalog_a.parquet catalog_b.parquet -r 2.0 -o matches.parquet
+pleiades cross-match catalog_a.parquet catalog_b.parquet -r 2.0 -o matches.parquet
 
 # Summarize matches
-astrojoin summarize-matches matches.parquet
+pleiades summarize-matches matches.parquet
 
 # Cone search
-astrojoin cone-search catalog.parquet 180.0 0.0 -r 3600 -o cone.parquet
+pleiades cone-search catalog.parquet 180.0 0.0 -r 3600 -o cone.parquet
 
 # Partition a catalog into HEALPix shards (for use as pre-partitioned B)
-astrojoin partition-catalog catalog.parquet ./shards --depth 8 --n-shards 512
+pleiades partition-catalog catalog.parquet ./shards --depth 8 --n-shards 512
 ```
 
 ### Analysis and helpers
@@ -93,7 +93,7 @@ def progress(chunk_ix, total, rows_a, matches):
     pbar.n = rows_a
     pbar.set_postfix(matches=matches)
     pbar.refresh()
-astrojoin.cross_match(..., progress_callback=progress)
+pleiades.cross_match(..., progress_callback=progress)
 pbar.close()
 ```
 
@@ -108,7 +108,7 @@ For tuning (batch sizes, n_shards, depth) and notes on CPU SIMD vs GPU (CUDA, wg
 
 ## Project layout
 
-- `python/astrojoin/` – Python API, cross-match, analysis, cone search, CLI (HEALPix + stream I/O).
+- `python/pleiades/` – Python API, cross-match, analysis, cone search, CLI (HEALPix + stream I/O).
 - `src/` – Rust engine (arrow, cdshealpix, HEALPix join, pre-partitioned B, rayon); optional, built with `maturin develop`.
 - `tests/` – Unit and integration tests; `tests/fixtures/` – small Parquet catalogs.
 - `scripts/` – `benchmark_cross_match.py`, `generate_large_catalog.py`, etc.
@@ -119,7 +119,7 @@ For tuning (batch sizes, n_shards, depth) and notes on CPU SIMD vs GPU (CUDA, wg
 - **Lint/format**: `uv run ruff check . && uv run ruff format .`
 - **Type check**: `uv run mypy python/`
 - **Tests** (Python + Rust): `uv run python run_tests.py` — or Python only: `uv run pytest`. Add `--benchmark` to run a small cross-match benchmark after tests; use `--benchmark-only` to run only the benchmark (no tests); use `--rust` to include the Rust engine.
-- **Coverage**: `uv run pytest tests/ --cov=python/astrojoin --cov-report=term-missing`
+- **Coverage**: `uv run pytest tests/ --cov=python/pleiades --cov-report=term-missing`
 - **Pre-commit**: `uv run pre-commit install` then `pre-commit run --all-files`
 - **Publishing (plug-and-play wheels)**: From the project root, `uv run maturin build --release` builds wheels for the current platform; upload to PyPI with `uv run maturin publish`. For many platforms (Linux/macOS/Windows × Python 3.10–3.12), use CI (e.g. the provided GitHub Actions workflow) to build and publish on tag push.
 

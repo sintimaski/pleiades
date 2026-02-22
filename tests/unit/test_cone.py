@@ -1,4 +1,4 @@
-"""Unit tests for astrojoin.cone module."""
+"""Unit tests for pleiades.cone module."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import astrojoin
-from astrojoin.validation import CatalogValidationError
+import pleiades
+from pleiades.validation import CatalogValidationError
 
 
 @pytest.mark.unit
@@ -20,7 +20,7 @@ class TestConeSearch:
         """cone_search returns rows within radius and writes separation."""
         fixtures = Path(__file__).resolve().parent.parent / "fixtures"
         out = tmp_path / "cone.parquet"
-        n = astrojoin.cone_search(
+        n = pleiades.cone_search(
             catalog_path=fixtures / "catalog_a_small.parquet",
             ra_deg=180.0,
             dec_deg=0.0,
@@ -49,7 +49,7 @@ class TestConeSearch:
             catalog_one,
         )
         out = tmp_path / "cone_empty.parquet"
-        n = astrojoin.cone_search(
+        n = pleiades.cone_search(
             catalog_path=catalog_one,
             ra_deg=0.0,
             dec_deg=0.0,
@@ -64,7 +64,7 @@ class TestConeSearch:
     def test_cone_search_file_not_found(self) -> None:
         """cone_search raises FileNotFoundError for missing catalog."""
         with pytest.raises(FileNotFoundError, match="Catalog not found"):
-            astrojoin.cone_search(
+            pleiades.cone_search(
                 catalog_path="/nonexistent.parquet",
                 ra_deg=0.0,
                 dec_deg=0.0,
@@ -78,7 +78,7 @@ class TestConeSearch:
         pq.write_table(pa.table({"id": [1], "ra": [0.0]}), bad)
         out = tmp_path / "out.parquet"
         with pytest.raises(CatalogValidationError, match="dec"):
-            astrojoin.cone_search(
+            pleiades.cone_search(
                 catalog_path=bad,
                 ra_deg=0.0,
                 dec_deg=0.0,
@@ -102,7 +102,7 @@ class TestConeSearch:
             cat,
         )
         out = tmp_path / "cone_rad.parquet"
-        n = astrojoin.cone_search(
+        n = pleiades.cone_search(
             catalog_path=cat,
             ra_deg=180.0,
             dec_deg=0.0,
@@ -137,7 +137,7 @@ class TestBatchConeSearch:
             (10.0, 0.0, 10.0),
             (30.0, 0.0, 10.0),
         ]
-        n = astrojoin.batch_cone_search(catalog, queries, out)
+        n = pleiades.batch_cone_search(catalog, queries, out)
         assert n == 2
         t = pq.read_table(out)
         assert "query_index" in t.column_names
@@ -157,7 +157,7 @@ class TestBatchConeSearch:
             catalog,
         )
         out = tmp_path / "empty.parquet"
-        n = astrojoin.batch_cone_search(
+        n = pleiades.batch_cone_search(
             catalog, [(100.0, 100.0, 1.0)], out
         )
         assert n == 0

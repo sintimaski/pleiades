@@ -9,13 +9,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from astrojoin.cross_match import (
+from pleiades.cross_match import (
     DEC_COL,
     RA_COL,
     RA_DEC_UNITS_DEFAULT,
     _angular_distance_arcsec,
 )
-from astrojoin.validation import validate_catalog_schema
+from pleiades.validation import validate_catalog_schema
 
 BATCH_SIZE = 100_000
 RAD_TO_DEG = 180.0 / math.pi

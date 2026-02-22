@@ -1,4 +1,4 @@
-"""Generate small synthetic Parquet catalogs for testing AstroJoin.
+"""Generate small synthetic Parquet catalogs for testing Pleiades.
 
 Creates two catalogs (A and B) with ra, dec in degrees and optional id columns.
 A few sources in A are placed within 2 arcsec of sources in B for match testing.

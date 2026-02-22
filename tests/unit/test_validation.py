@@ -1,4 +1,4 @@
-"""Unit tests for astrojoin.validation module."""
+"""Unit tests for pleiades.validation module."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from astrojoin.validation import (
+from pleiades.validation import (
     CatalogValidationError,
     validate_catalog_schema,
     validate_cross_match_args,

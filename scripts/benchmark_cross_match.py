@@ -5,7 +5,7 @@ Uses Int64 IDs for both catalogs so the Rust engine and Parquet encoding behave
 reliably at scale. For pre-generated files (e.g. to avoid OOM), use
 --catalog-a / --catalog-b or run scripts/generate_benchmark_fixtures.py first.
 
-With --verbose, sets ASTROJOIN_VERBOSE=1 so the Rust engine prints timing logs
+With --verbose, sets PLEIADES_VERBOSE=1 so the Rust engine prints timing logs
 (index, load B, join, write per chunk; partition B and total) to stderr, and
 prints per-chunk memory (peak RSS on Unix, current on Windows) after each chunk.
 
@@ -80,7 +80,7 @@ def generate_catalog(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark astrojoin.cross_match")
+    parser = argparse.ArgumentParser(description="Benchmark pleiades.cross_match")
     parser.add_argument("--rows", type=int, default=100_000, help="Rows in catalog A (ignored if --catalog-a)")
     parser.add_argument("--rows-b", type=int, default=None, help="Rows in catalog B (default: same as A)")
     parser.add_argument("--radius", type=float, default=2.0, help="Match radius (arcsec)")
@@ -101,7 +101,7 @@ def main() -> int:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Set ASTROJOIN_VERBOSE=1 for Rust engine timing logs (stderr)",
+        help="Set PLEIADES_VERBOSE=1 for Rust engine timing logs (stderr)",
     )
     parser.add_argument(
         "--batch-size",
@@ -118,19 +118,19 @@ def main() -> int:
     n_b = args.rows_b if args.rows_b is not None else args.rows
 
     if args.verbose:
-        os.environ["ASTROJOIN_VERBOSE"] = "1"
+        os.environ["PLEIADES_VERBOSE"] = "1"
         print("Rust timing logs (stderr):", flush=True)
 
-    import astrojoin
+    import pleiades
 
     if args.catalog_a is not None and args.catalog_b is not None:
         path_a = args.catalog_a
         path_b = args.catalog_b
-        out = args.output or Path(tempfile.gettempdir()) / "astrojoin_bench_matches.parquet"
+        out = args.output or Path(tempfile.gettempdir()) / "pleiades_bench_matches.parquet"
         if not path_a.is_file() or not path_b.is_file():
             raise FileNotFoundError(f"Pre-generated catalogs must exist: {path_a}, {path_b}")
     else:
-        tmp = Path(tempfile.mkdtemp(prefix="astrojoin_bench_"))
+        tmp = Path(tempfile.mkdtemp(prefix="pleiades_bench_"))
         path_a = tmp / "catalog_a.parquet"
         path_b = tmp / "catalog_b.parquet"
         out = args.output or tmp / "matches.parquet"
@@ -169,7 +169,7 @@ def main() -> int:
     for label, use_rust in runs:
         t0 = time.perf_counter()
         try:
-            result = astrojoin.cross_match(
+            result = pleiades.cross_match(
                 catalog_a=path_a,
                 catalog_b=path_b,
                 radius_arcsec=args.radius,

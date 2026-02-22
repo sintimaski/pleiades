@@ -1,4 +1,4 @@
-"""Pytest configuration and shared fixtures for AstroJoin tests."""
+"""Pytest configuration and shared fixtures for Pleiades tests."""
 
 from __future__ import annotations
 

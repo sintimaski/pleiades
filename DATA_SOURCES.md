@@ -6,7 +6,7 @@ References for **real** Parquet catalogs (RA/Dec, large-scale) suitable for cros
 
 ## Parquet field analysis and implementation support
 
-Summary of **typical Parquet columns** in the catalogs below and how the **current AstroJoin implementation** handles them.
+Summary of **typical Parquet columns** in the catalogs below and how the **current Pleiades implementation** handles them.
 
 ### Catalog schemas (from documentation and web search)
 

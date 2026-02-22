@@ -370,14 +370,14 @@ pub type ProgressCallback = Option<Box<dyn Fn(usize, Option<usize>, u64, u64) ->
 
 #[inline]
 fn verbose_log(msg: &str) {
-    if env::var("ASTROJOIN_VERBOSE").is_ok() {
-        eprintln!("[astrojoin] {}", msg);
+    if env::var("PLEIADES_VERBOSE").is_ok() {
+        eprintln!("[pleiades] {}", msg);
     }
 }
 
 fn verbose_log_timed(phase: &str, elapsed_secs: f64, extra: &str) {
-    if env::var("ASTROJOIN_VERBOSE").is_ok() {
-        eprintln!("[astrojoin] {}: {:.3}s {}", phase, elapsed_secs, extra);
+    if env::var("PLEIADES_VERBOSE").is_ok() {
+        eprintln!("[pleiades] {}: {:.3}s {}", phase, elapsed_secs, extra);
     }
 }
 
@@ -766,7 +766,7 @@ pub fn cross_match_impl(
     let from_radians = is_radians(ra_dec_units);
     let layer = get(depth);
     let t0 = std::time::Instant::now();
-    let verbose = env::var("ASTROJOIN_VERBOSE").is_ok();
+    let verbose = env::var("PLEIADES_VERBOSE").is_ok();
 
     if verbose {
         match std::thread::available_parallelism() {
@@ -980,7 +980,7 @@ pub fn cross_match_impl(
 
         #[cfg(feature = "wgpu")]
         {
-            let use_gpu = env::var("ASTROJOIN_GPU").as_deref() == Ok("wgpu") && crate::gpu::gpu_available();
+            let use_gpu = env::var("PLEIADES_GPU").as_deref() == Ok("wgpu") && crate::gpu::gpu_available();
             if use_gpu {
                 // Collect (a_ix, b_ix) candidate pairs from HEALPix index (no distance yet).
                 let mut pairs: Vec<(usize, usize)> = Vec::new();
@@ -999,7 +999,7 @@ pub fn cross_match_impl(
                 }
                 // GPU is only faster when pair count is very high (amortizes upload/readback).
                 // Below threshold use CPU to avoid ~10–20× slowdown from chunk sync overhead.
-                let min_pairs_for_gpu: usize = env::var("ASTROJOIN_GPU_MIN_PAIRS")
+                let min_pairs_for_gpu: usize = env::var("PLEIADES_GPU_MIN_PAIRS")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(80_000_000);
@@ -1075,7 +1075,7 @@ pub fn cross_match_impl(
                 } else if use_gpu_this_chunk && pairs.is_empty() && verbose {
                     verbose_log_timed("  join (GPU)", t_join.elapsed().as_secs_f64(), "(0 matches)");
                 } else {
-                    // pairs below ASTROJOIN_GPU_MIN_PAIRS: use CPU (faster due to GPU chunk/sync overhead).
+                    // pairs below PLEIADES_GPU_MIN_PAIRS: use CPU (faster due to GPU chunk/sync overhead).
                     let per_row = run_cpu_join(
                         &b_rows,
                         index_ref,

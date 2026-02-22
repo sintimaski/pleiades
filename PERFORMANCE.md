@@ -17,11 +17,11 @@
 | `n_shards`       | Number of HEALPix shards (default 512). More shards = smaller per-shard files and more targeted loading; fewer = less overhead, coarser granularity. |
 | `depth`          | HEALPix depth (default 8). Higher = finer pixels, more neighbors to check, better selectivity on dense catalogs. |
 
-**Verbose timing:** Set `ASTROJOIN_VERBOSE=1` (or any value) to log partition, per-chunk index/load/join/write, and total time. With verbose, the engine also logs detected parallelism and the Rayon thread pool size. If you see only one thread (e.g. in a container or restricted environment), set **`RAYON_NUM_THREADS`** to the number of threads to use (e.g. `export RAYON_NUM_THREADS=8`).
+**Verbose timing:** Set `PLEIADES_VERBOSE=1` (or any value) to log partition, per-chunk index/load/join/write, and total time. With verbose, the engine also logs detected parallelism and the Rayon thread pool size. If you see only one thread (e.g. in a container or restricted environment), set **`RAYON_NUM_THREADS`** to the number of threads to use (e.g. `export RAYON_NUM_THREADS=8`).
 
 **Tune on your machine:** Run `uv run python scripts/tune_cross_match_params.py --rows 200000` to sweep batch sizes (and optionally `--sweep-shards`, `--sweep-memory`) and get a recommended config for your hardware.
 
-**Pre-partitioned B:** If you run multiple cross-matches with the same B, partition B once (e.g. `astrojoin.partition_catalog(...)`) and pass the shard directory as `catalog_b`. The engine will skip partitioning and load only the shards needed per A chunk.
+**Pre-partitioned B:** If you run multiple cross-matches with the same B, partition B once (e.g. `pleiades.partition_catalog(...)`) and pass the shard directory as `catalog_b`. The engine will skip partitioning and load only the shards needed per A chunk.
 
 **keep_b_in_memory (default: False):** When `catalog_b` is a file, setting this to `True` partitions B into RAM instead of temp shard files, so there is no shard I/O after the initial B read. **This is not the default on purpose:** the project is *out-of-core* — it is designed to run on laptops and machines with limited RAM by streaming and using disk. Use `keep_b_in_memory=True` only when B is small enough to fit comfortably in memory (e.g. B is a few hundred MB and you have plenty of free RAM). On memory-constrained machines or for large B, leave it `False` so the engine stays within a bounded memory footprint.
 
@@ -89,12 +89,12 @@ An optional **wgpu** backend is available for the join phase. It does the follow
    - Rust-only: `cargo build --features wgpu`
 2. At runtime, set the environment variable to use the GPU for the join phase:
    ```bash
-   export ASTROJOIN_GPU=wgpu
+   export PLEIADES_GPU=wgpu
    uv run python scripts/benchmark_cross_match.py --rust --verbose ...
    ```
 
-If you set `ASTROJOIN_GPU=wgpu` but the extension was built *without* the wgpu feature, the Python layer prints a one-line warning to stderr and the join runs on CPU. With verbose logging, the engine reports `join (GPU)` when the GPU was used and `join (CPU)` when the CPU path was used.
+If you set `PLEIADES_GPU=wgpu` but the extension was built *without* the wgpu feature, the Python layer prints a one-line warning to stderr and the join runs on CPU. With verbose logging, the engine reports `join (GPU)` when the GPU was used and `join (CPU)` when the CPU path was used.
 
-If `ASTROJOIN_GPU=wgpu` is set and the extension has the feature but no GPU adapter is available, the engine falls back to the CPU join automatically.
+If `PLEIADES_GPU=wgpu` is set and the extension has the feature but no GPU adapter is available, the engine falls back to the CPU join automatically.
 
-**When the GPU is used:** Because of buffer size limits, the GPU path processes pairs in chunks (each with upload, compute, readback, and sync). For small or medium pair counts this overhead can make the GPU **slower** than the CPU (e.g. 15+ s vs 1–2 s per chunk). So by default the engine uses the GPU only when the number of candidate pairs in a chunk is **≥ 80M** (`ASTROJOIN_GPU_MIN_PAIRS`, default 80_000_000). Below that, it uses the CPU join even when `ASTROJOIN_GPU=wgpu` is set. To force GPU for all chunk sizes (for benchmarking), set `ASTROJOIN_GPU_MIN_PAIRS=0`.
+**When the GPU is used:** Because of buffer size limits, the GPU path processes pairs in chunks (each with upload, compute, readback, and sync). For small or medium pair counts this overhead can make the GPU **slower** than the CPU (e.g. 15+ s vs 1–2 s per chunk). So by default the engine uses the GPU only when the number of candidate pairs in a chunk is **≥ 80M** (`PLEIADES_GPU_MIN_PAIRS`, default 80_000_000). Below that, it uses the CPU join even when `PLEIADES_GPU=wgpu` is set. To force GPU for all chunk sizes (for benchmarking), set `PLEIADES_GPU_MIN_PAIRS=0`.

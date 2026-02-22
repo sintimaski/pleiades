@@ -17,7 +17,7 @@
 | **1.1** | **Wheels workflow**: Sdist job uses `uv run maturin` but CI does not install `uv`. Add a step to install uv (e.g. `curl -LsSf https://astral.sh/uv/install.sh \| sh` or `pip install uv`) or use `maturin build --release --sdist-only` after installing maturin. |
 | **1.2** | **Sdist artifact path**: Maturin puts sdist in `target/wheels/`. Confirm the sdist job uploads the correct path (e.g. `target/wheels/*.tar.gz` or the single file produced there). |
 | **1.3** | **Publish job**: First download uses `path: dist` and `pattern: wheels-*` with `merge-multiple: true`; second download uses `path: dist` for sdist. With merge, wheel files may be in `dist/`; sdist may create `dist/sdist/`. Add a “Flatten” step that collects all `dist/**/*.whl` and `dist/**/*.tar.gz` into one directory (e.g. `dist/out/`) and run `twine upload dist/out/*`. Fix the current “Flatten” step that references `artifacts` (should be `dist` or the actual download path). |
-| **1.4** | **Test PyPI install**: Create a TestPyPI release (or use the real PyPI after 0.1.0) and run `pip install astrojoin` in a clean env; then `python -c "import astrojoin; astrojoin.cross_match(...)"` to confirm plug-and-play. |
+| **1.4** | **Test PyPI install**: Create a TestPyPI release (or use the real PyPI after 0.1.0) and run `pip install pleiades` in a clean env; then `python -c "import pleiades; pleiades.cross_match(...)"` to confirm plug-and-play. |
 | **1.5** | **CI tests**: Add a job that runs on push/PR: checkout, install project (e.g. `uv sync` + `uv run maturin develop` or install from built wheel), run `uv run pytest tests/ -q` (and optionally `run_tests.py`) on Python 3.10, 3.11, 3.12. |
 
 ### 2. Documentation (medium)
@@ -32,7 +32,7 @@
 
 | Step | Action |
 |------|--------|
-| **3.1** | **CLI coverage**: `cli.py` is 0% in coverage because tests invoke the CLI via subprocess. Optionally add unit tests that import `astrojoin.cli` and call `main()` with `sys.argv` mocked (or use a small in-process helper) so the CLI branch is exercised for coverage. |
+| **3.1** | **CLI coverage**: `cli.py` is 0% in coverage because tests invoke the CLI via subprocess. Optionally add unit tests that import `pleiades.cli` and call `main()` with `sys.argv` mocked (or use a small in-process helper) so the CLI branch is exercised for coverage. |
 | **3.2** | **Integration**: Add (or document) one integration test that uses real-sized fixtures (or skipped if no large fixtures) to stress the Rust path and pre-partitioned B. |
 | **3.3** | **Python 3.13**: When PyO3 supports 3.13, add it to `requires-python` and to the CI/test matrix. |
 
@@ -40,7 +40,7 @@
 
 | Step | Action |
 |------|--------|
-| **4.1** | **Optional tqdm helper**: Provide `astrojoin.progress_tqdm()` that returns a `progress_callback` wrapping tqdm (if tqdm is installed), so users can do `cross_match(..., progress_callback=astrojoin.progress_tqdm())` without writing the closure. Make tqdm an optional dependency. |
+| **4.1** | **Optional tqdm helper**: Provide `pleiades.progress_tqdm()` that returns a `progress_callback` wrapping tqdm (if tqdm is installed), so users can do `cross_match(..., progress_callback=pleiades.progress_tqdm())` without writing the closure. Make tqdm an optional dependency. |
 | **4.2** | **Rust edge cases**: Consider validating in Rust that ra/dec are finite (or document that non-finite coords are undefined). |
 
 ### 5. Roadmap (from ARCHITECTURE)

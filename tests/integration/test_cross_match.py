@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import astrojoin
+import pleiades
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -30,7 +30,7 @@ def _run_cross_match(
     output_path: Path,
     radius_arcsec: float = 2.0,
 ) -> None:
-    astrojoin.cross_match(
+    pleiades.cross_match(
         catalog_a=path_a,
         catalog_b=path_b,
         radius_arcsec=radius_arcsec,
@@ -207,7 +207,7 @@ def test_output_schema_and_separations_bounded(tmp_path: Path) -> None:
 def test_matches_equal_reference_brute_force(tmp_path: Path) -> None:
     """
     Ground truth: brute-force reference (every A vs every B, same haversine).
-    Generate random A and B, get reference match set, run astrojoin (partition_b
+    Generate random A and B, get reference match set, run pleiades (partition_b
     and non-partition path), assert our output (id_a, id_b) set equals reference exactly.
     """
     radius_arcsec = 2.0
@@ -225,7 +225,7 @@ def test_matches_equal_reference_brute_force(tmp_path: Path) -> None:
 
     for partition_b in (True, False):
         out = tmp_path / f"matches_partition_b_{partition_b}.parquet"
-        astrojoin.cross_match(
+        pleiades.cross_match(
             catalog_a=path_a,
             catalog_b=path_b,
             radius_arcsec=radius_arcsec,
@@ -247,12 +247,12 @@ def test_matches_equal_reference_brute_force(tmp_path: Path) -> None:
 @pytest.mark.integration
 def test_rust_matches_equal_reference_brute_force(tmp_path: Path) -> None:
     """
-    If the Rust engine (astrojoin_core) is built with the full implementation,
+    If the Rust engine (pleiades_core) is built with the full implementation,
     run cross_match(use_rust=True) and assert (id_a, id_b) set equals reference.
-    Skipped if astrojoin_core is not installed. Requires `uv run maturin develop`
+    Skipped if pleiades_core is not installed. Requires `uv run maturin develop`
     with the full Rust engine for this test to pass.
     """
-    pytest.importorskip("astrojoin_core")
+    pytest.importorskip("pleiades_core")
     radius_arcsec = 2.0
     table_a, table_b = make_catalogs_random(n_a=60, n_b=50, seed=999)
     reference_set = reference_cross_match_brute_force(
@@ -266,7 +266,7 @@ def test_rust_matches_equal_reference_brute_force(tmp_path: Path) -> None:
     )
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out = tmp_path / "matches_rust.parquet"
-    astrojoin.cross_match(
+    pleiades.cross_match(
         catalog_a=path_a,
         catalog_b=path_b,
         radius_arcsec=radius_arcsec,
@@ -296,7 +296,7 @@ def test_rust_matches_equal_reference_brute_force(tmp_path: Path) -> None:
 @pytest.mark.integration
 def test_rust_with_prepartitioned_b_matches_reference(tmp_path: Path) -> None:
     """With use_rust=True and catalog_b a shard directory, (id_a, id_b) set equals reference."""
-    pytest.importorskip("astrojoin_core")
+    pytest.importorskip("pleiades_core")
     table_a, table_b, expected = make_catalogs_exact_n_pairs(
         n_pairs=4, radius_arcsec=2.0, n_a_extra=10, n_b_extra=10, seed=31
     )
@@ -341,7 +341,7 @@ def test_rust_with_prepartitioned_b_matches_reference(tmp_path: Path) -> None:
         w.close()
     out = tmp_path / "matches_rust_shards.parquet"
     try:
-        astrojoin.cross_match(
+        pleiades.cross_match(
             catalog_a=path_a,
             catalog_b=shard_dir,
             radius_arcsec=2.0,
@@ -365,14 +365,14 @@ def test_rust_with_prepartitioned_b_matches_reference(tmp_path: Path) -> None:
 @pytest.mark.integration
 def test_rust_n_nearest_reduces_output(tmp_path: Path) -> None:
     """With use_rust=True and n_nearest=1, at most one match per id_a."""
-    pytest.importorskip("astrojoin_core")
+    pytest.importorskip("pleiades_core")
     table_a, table_b, _ = make_catalogs_exact_n_pairs(
         n_pairs=5, radius_arcsec=2.0, separation_arcsec=1.0,
         n_a_extra=5, n_b_extra=15, seed=42
     )
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out = tmp_path / "matches_n1.parquet"
-    astrojoin.cross_match(
+    pleiades.cross_match(
         catalog_a=path_a,
         catalog_b=path_b,
         radius_arcsec=2.0,
@@ -394,7 +394,7 @@ def test_rust_n_nearest_reduces_output(tmp_path: Path) -> None:
 @pytest.mark.integration
 def test_rust_progress_callback_called(tmp_path: Path) -> None:
     """With use_rust=True and progress_callback, callback is invoked."""
-    pytest.importorskip("astrojoin_core")
+    pytest.importorskip("pleiades_core")
     table_a, table_b = make_catalogs_no_pairs(n_a=20, n_b=20, radius_arcsec=2.0, seed=88)
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out = tmp_path / "matches.parquet"
@@ -403,7 +403,7 @@ def test_rust_progress_callback_called(tmp_path: Path) -> None:
     def progress(chunk_ix: int, total: int | None, rows_a: int, matches: int) -> None:
         progress_calls.append((chunk_ix, total, rows_a, matches))
 
-    astrojoin.cross_match(
+    pleiades.cross_match(
         catalog_a=path_a,
         catalog_b=path_b,
         radius_arcsec=2.0,
@@ -422,7 +422,7 @@ def test_fixture_catalog_small_still_works(tmp_path: Path) -> None:
     """Legacy: run on pre-generated fixture catalogs; assert at least known pairs and schema."""
     fixtures = Path(__file__).resolve().parent.parent / "fixtures"
     out = tmp_path / "matches.parquet"
-    astrojoin.cross_match(
+    pleiades.cross_match(
         catalog_a=fixtures / "catalog_a_small.parquet",
         catalog_b=fixtures / "catalog_b_small.parquet",
         radius_arcsec=2.0,
@@ -445,7 +445,7 @@ def test_cross_match_returns_result_with_counts(tmp_path: Path) -> None:
     )
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out = tmp_path / "matches.parquet"
-    result = astrojoin.cross_match(
+    result = pleiades.cross_match(
         catalog_a=path_a,
         catalog_b=path_b,
         radius_arcsec=2.0,
@@ -505,10 +505,10 @@ def test_prepartitioned_b_directory_matches_file_path(tmp_path: Path) -> None:
         w.close()
     out_file = tmp_path / "matches_file.parquet"
     out_dir = tmp_path / "matches_dir.parquet"
-    astrojoin.cross_match(
+    pleiades.cross_match(
         catalog_a=path_a, catalog_b=path_b, radius_arcsec=2.0, output_path=out_file
     )
-    astrojoin.cross_match(
+    pleiades.cross_match(
         catalog_a=path_a,
         catalog_b=shard_dir,
         radius_arcsec=2.0,
@@ -528,7 +528,7 @@ def test_partition_catalog_produces_shards(tmp_path: Path) -> None:
     table_a, table_b = make_catalogs_no_pairs(n_a=50, n_b=30, radius_arcsec=2.0, seed=1)
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out_dir = tmp_path / "shards"
-    astrojoin.partition_catalog(
+    pleiades.partition_catalog(
         catalog_path=path_b,
         output_dir=out_dir,
         depth=8,
@@ -554,7 +554,7 @@ def test_cross_match_include_coords_adds_ra_dec_columns(tmp_path: Path) -> None:
     )
     path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
     out = tmp_path / "matches_with_coords.parquet"
-    astrojoin.cross_match(
+    pleiades.cross_match(
         catalog_a=path_a,
         catalog_b=path_b,
         radius_arcsec=2.0,
