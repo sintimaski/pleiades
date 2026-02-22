@@ -13,6 +13,8 @@ crate-type = ["cdylib", "rlib"]
 default = ["python"]
 # Enable PyO3 bindings for maturin/Python extension build.
 python = ["pyo3"]
+# Optional wgpu-based GPU haversine kernel (Vulkan/Metal/D3D12/WebGPU).
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
 arrow = "52"
@@ -22,6 +24,9 @@ cdshealpix = "0.9"
 rayon = "1.10"
 tempfile = "3"
 pyo3 = { version = "0.23", optional = true, features = ["extension-module"] }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

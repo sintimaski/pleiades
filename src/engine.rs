@@ -676,6 +676,61 @@ fn build_id_column_single(ids: &[IdVal]) -> Arc<dyn Array> {
     }
 }
 
+/// CPU join: for each B row, find A candidates in same/neighbor HEALPix pixels and compute
+/// haversine distance; return per-row matches (candidate_ix, b_row_ix, sep_arcsec).
+fn run_cpu_join(
+    b_rows: &[(IdVal, f64, f64)],
+    index_ref: &HashMap<u64, Vec<usize>>,
+    ra_flat_ref: &[f64],
+    dec_flat_ref: &[f64],
+    radius: f64,
+    depth_local: u8,
+) -> Vec<Vec<(usize, usize, f64)>> {
+    let layer = get(depth_local);
+    b_rows
+        .par_iter()
+        .enumerate()
+        .map(|(b_row_ix, (_id_b, ra_b_deg, dec_b_deg))| {
+            let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
+            let mut pixels_to_look = Vec::with_capacity(9);
+            pixels_to_look.push(center_pix);
+            nested::append_bulk_neighbours(depth_local, center_pix, &mut pixels_to_look);
+            let mut row_matches = Vec::new();
+            for pix in &pixels_to_look {
+                if let Some(candidate_ixs) = index_ref.get(pix) {
+                    let chunks = candidate_ixs.chunks_exact(4);
+                    let remainder = chunks.remainder();
+                    for chunk in chunks {
+                        let mut ra1 = [0.0_f64; 4];
+                        let mut dec1 = [0.0_f64; 4];
+                        for (i, &ix) in chunk.iter().enumerate() {
+                            ra1[i] = ra_flat_ref[ix];
+                            dec1[i] = dec_flat_ref[ix];
+                        }
+                        let mut seps = [0.0_f64; 4];
+                        haversine_arcsec_4(&ra1, &dec1, *ra_b_deg, *dec_b_deg, &mut seps);
+                        for (i, &candidate_ix) in chunk.iter().enumerate() {
+                            let sep = seps[i];
+                            if sep <= radius {
+                                row_matches.push((candidate_ix, b_row_ix, sep));
+                            }
+                        }
+                    }
+                    for &candidate_ix in remainder {
+                        let ra_a = ra_flat_ref[candidate_ix];
+                        let dec_a = dec_flat_ref[candidate_ix];
+                        let sep = haversine_arcsec(ra_a, dec_a, *ra_b_deg, *dec_b_deg);
+                        if sep <= radius {
+                            row_matches.push((candidate_ix, b_row_ix, sep));
+                        }
+                    }
+                }
+            }
+            row_matches
+        })
+        .collect()
+}
+
 /// Cross-match two Parquet catalogs: stream A in chunks, build HEALPix index per chunk,
 /// stream B (or load B from pre-partitioned shards), haversine filter, write matches.
 /// When catalog_b is a directory with shard_*.parquet, B is loaded by pixel from shards.
@@ -914,58 +969,175 @@ pub fn cross_match_impl(
         let dec_flat_ref = &dec_flat;
         let radius = radius_arcsec;
         let depth_local = depth;
-        let per_row: Vec<Vec<(usize, usize, f64)>> = b_rows
-            .par_iter()
-            .enumerate()
-            .map(|(b_row_ix, (_id_b, ra_b_deg, dec_b_deg))| {
-                let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
-                let mut pixels_to_look = Vec::with_capacity(9);
-                pixels_to_look.push(center_pix);
-                nested::append_bulk_neighbours(depth_local, center_pix, &mut pixels_to_look);
-                let mut row_matches = Vec::new();
-                for pix in &pixels_to_look {
-                    if let Some(candidate_ixs) = index_ref.get(pix) {
-                        let chunks = candidate_ixs.chunks_exact(4);
-                        let remainder = chunks.remainder();
-                        for chunk in chunks {
-                            let mut ra1 = [0.0_f64; 4];
-                            let mut dec1 = [0.0_f64; 4];
-                            for (i, &ix) in chunk.iter().enumerate() {
-                                ra1[i] = ra_flat_ref[ix];
-                                dec1[i] = dec_flat_ref[ix];
-                            }
-                            let mut seps = [0.0_f64; 4];
-                            haversine_arcsec_4(&ra1, &dec1, *ra_b_deg, *dec_b_deg, &mut seps);
-                            for (i, &candidate_ix) in chunk.iter().enumerate() {
-                                let sep = seps[i];
-                                if sep <= radius {
-                                    row_matches.push((candidate_ix, b_row_ix, sep));
-                                }
-                            }
-                        }
-                        for &candidate_ix in remainder {
-                            let ra_a = ra_flat_ref[candidate_ix];
-                            let dec_a = dec_flat_ref[candidate_ix];
-                            let sep = haversine_arcsec(ra_a, dec_a, *ra_b_deg, *dec_b_deg);
-                            if sep <= radius {
-                                row_matches.push((candidate_ix, b_row_ix, sep));
+
+        #[cfg(feature = "wgpu")]
+        {
+            let use_gpu = env::var("ASTROJOIN_GPU").as_deref() == Ok("wgpu") && crate::gpu::gpu_available();
+            if use_gpu {
+                // Collect (a_ix, b_ix) candidate pairs from HEALPix index (no distance yet).
+                let mut pairs: Vec<(usize, usize)> = Vec::new();
+                for (b_row_ix, (_id_b, ra_b_deg, dec_b_deg)) in b_rows.iter().enumerate() {
+                    let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
+                    let mut pixels_to_look = Vec::with_capacity(9);
+                    pixels_to_look.push(center_pix);
+                    nested::append_bulk_neighbours(depth_local, center_pix, &mut pixels_to_look);
+                    for pix in &pixels_to_look {
+                        if let Some(candidate_ixs) = index_ref.get(pix) {
+                            for &candidate_ix in candidate_ixs {
+                                pairs.push((candidate_ix, b_row_ix));
                             }
                         }
                     }
                 }
-                row_matches
-            })
-            .collect();
-        matches_id_a.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
-        matches_id_b.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
-        matches_sep.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
-        for row_matches in per_row {
-            for (candidate_ix, b_row_ix, sep) in row_matches {
-                matches_id_a.push(id_a_flat[candidate_ix].clone());
-                matches_id_b.push(b_rows[b_row_ix].0.clone());
-                matches_sep.push(sep);
+                // GPU is only faster when pair count is very high (amortizes upload/readback).
+                // Below threshold use CPU to avoid ~10–20× slowdown from chunk sync overhead.
+                let min_pairs_for_gpu: usize = env::var("ASTROJOIN_GPU_MIN_PAIRS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(80_000_000);
+                let use_gpu_this_chunk = pairs.len() >= min_pairs_for_gpu;
+                if use_gpu_this_chunk && !pairs.is_empty() {
+                    let ra_a_f32: Vec<f32> = pairs
+                        .iter()
+                        .map(|&(a_ix, _)| ra_flat_ref[a_ix] as f32)
+                        .collect();
+                    let dec_a_f32: Vec<f32> = pairs
+                        .iter()
+                        .map(|&(a_ix, _)| dec_flat_ref[a_ix] as f32)
+                        .collect();
+                    let ra_b_f32: Vec<f32> = pairs
+                        .iter()
+                        .map(|&(_, b_ix)| {
+                            let (_, ra, _) = b_rows[b_ix];
+                            ra as f32
+                        })
+                        .collect();
+                    let dec_b_f32: Vec<f32> = pairs
+                        .iter()
+                        .map(|&(_, b_ix)| {
+                            let (_, _, dec) = b_rows[b_ix];
+                            dec as f32
+                        })
+                        .collect();
+                    match crate::gpu::haversine_pairs_gpu(
+                        &ra_a_f32,
+                        &dec_a_f32,
+                        &ra_b_f32,
+                        &dec_b_f32,
+                    ) {
+                        Ok(seps_f32) => {
+                            for (i, &(a_ix, b_ix)) in pairs.iter().enumerate() {
+                                let sep = seps_f32[i] as f64;
+                                if sep <= radius {
+                                    matches_id_a.push(id_a_flat[a_ix].clone());
+                                    matches_id_b.push(b_rows[b_ix].0.clone());
+                                    matches_sep.push(sep);
+                                }
+                            }
+                            if verbose {
+                                verbose_log_timed("  join (GPU)", t_join.elapsed().as_secs_f64(), &format!("({} matches)", matches_id_a.len()));
+                            }
+                        }
+                        Err(_) => {
+                            if verbose {
+                                verbose_log("  join (GPU failed, CPU fallback)");
+                            }
+                            let per_row = run_cpu_join(
+                                &b_rows,
+                                index_ref,
+                                ra_flat_ref,
+                                dec_flat_ref,
+                                radius,
+                                depth_local,
+                            );
+                            for row_matches in per_row {
+                                for (candidate_ix, b_row_ix, sep) in row_matches {
+                                    matches_id_a.push(id_a_flat[candidate_ix].clone());
+                                    matches_id_b.push(b_rows[b_row_ix].0.clone());
+                                    matches_sep.push(sep);
+                                }
+                            }
+                            if verbose {
+                                verbose_log_timed("  join (CPU fallback)", t_join.elapsed().as_secs_f64(), &format!("({} matches)", matches_id_a.len()));
+                            }
+                        }
+                    }
+                } else if use_gpu_this_chunk && pairs.is_empty() && verbose {
+                    verbose_log_timed("  join (GPU)", t_join.elapsed().as_secs_f64(), "(0 matches)");
+                } else {
+                    // pairs below ASTROJOIN_GPU_MIN_PAIRS: use CPU (faster due to GPU chunk/sync overhead).
+                    let per_row = run_cpu_join(
+                        &b_rows,
+                        index_ref,
+                        ra_flat_ref,
+                        dec_flat_ref,
+                        radius,
+                        depth_local,
+                    );
+                    matches_id_a.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+                    matches_id_b.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+                    matches_sep.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+                    for row_matches in per_row {
+                        for (candidate_ix, b_row_ix, sep) in row_matches {
+                            matches_id_a.push(id_a_flat[candidate_ix].clone());
+                            matches_id_b.push(b_rows[b_row_ix].0.clone());
+                            matches_sep.push(sep);
+                        }
+                    }
+                    if verbose {
+                        verbose_log_timed(
+                            "  join (CPU)",
+                            t_join.elapsed().as_secs_f64(),
+                            &format!("({} matches, {} pairs below GPU threshold)", matches_id_a.len(), pairs.len()),
+                        );
+                    }
+                }
+            } else {
+                let per_row = run_cpu_join(
+                    &b_rows,
+                    index_ref,
+                    ra_flat_ref,
+                    dec_flat_ref,
+                    radius,
+                    depth_local,
+                );
+                matches_id_a.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+                matches_id_b.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+                matches_sep.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+                for row_matches in per_row {
+                    for (candidate_ix, b_row_ix, sep) in row_matches {
+                        matches_id_a.push(id_a_flat[candidate_ix].clone());
+                        matches_id_b.push(b_rows[b_row_ix].0.clone());
+                        matches_sep.push(sep);
+                    }
+                }
+                if verbose {
+                    verbose_log_timed("  join (CPU)", t_join.elapsed().as_secs_f64(), &format!("({} matches)", matches_id_a.len()));
+                }
             }
         }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let per_row = run_cpu_join(
+                &b_rows,
+                index_ref,
+                ra_flat_ref,
+                dec_flat_ref,
+                radius,
+                depth_local,
+            );
+            matches_id_a.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+            matches_id_b.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+            matches_sep.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+            for row_matches in per_row {
+                for (candidate_ix, b_row_ix, sep) in row_matches {
+                    matches_id_a.push(id_a_flat[candidate_ix].clone());
+                    matches_id_b.push(b_rows[b_row_ix].0.clone());
+                    matches_sep.push(sep);
+                }
+            }
+        }
+        #[cfg(not(feature = "wgpu"))]
         if verbose {
             verbose_log_timed("  join", t_join.elapsed().as_secs_f64(), &format!("({} matches)", matches_id_a.len()));
         }

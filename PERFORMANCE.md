@@ -69,4 +69,27 @@ There is **no single “easy and cross-platform”** GPU path that works everywh
    - **NVIDIA-only is OK:** Add an optional CUDA path (e.g. feature-gated crate, or a separate Python path using CuPy/RAPIDS for the distance kernel) and keep the Rust engine for I/O and HEALPix.  
    - **Must support Mac/AMD/Intel:** Consider wgpu compute: implement a small compute shader that, given buffers of (ra, dec) for A and B candidates, writes distances; call it from Rust and merge results. This is more engineering but stays cross-platform.
 
-We do not currently ship a GPU backend; the above is a roadmap if you want to add one.
+### wgpu backend (optional)
+
+An optional **wgpu** backend is available for the haversine distance kernel. It uses a WGSL compute shader to compute angular separation (arcsec) for the candidate (A, B) pairs produced by the HEALPix index; the rest of the pipeline (Parquet I/O, HEALPix indexing, match filtering, output) is unchanged.
+
+**How to enable**
+
+1. **Build the extension with the `wgpu` feature** (required; the default build does not include it). You need a Vulkan, Metal, or D3D12 backend on your machine.
+   - **Development / editable install** (e.g. when using `uv run python` from the repo):
+     ```bash
+     uv run maturin develop --features wgpu
+     ```
+   - Wheel: `maturin build --features wgpu`
+   - Rust-only: `cargo build --features wgpu`
+2. At runtime, set the environment variable to use the GPU for the join phase:
+   ```bash
+   export ASTROJOIN_GPU=wgpu
+   uv run python scripts/benchmark_cross_match.py --rust --verbose ...
+   ```
+
+If you set `ASTROJOIN_GPU=wgpu` but the extension was built *without* the wgpu feature, the Python layer prints a one-line warning to stderr and the join runs on CPU. With verbose logging, the engine reports `join (GPU)` when the GPU was used and `join (CPU)` when the CPU path was used.
+
+If `ASTROJOIN_GPU=wgpu` is set and the extension has the feature but no GPU adapter is available, the engine falls back to the CPU join automatically.
+
+**When the GPU is used:** Because of buffer size limits, the GPU path processes pairs in chunks (each with upload, compute, readback, and sync). For small or medium pair counts this overhead can make the GPU **slower** than the CPU (e.g. 15+ s vs 1–2 s per chunk). So by default the engine uses the GPU only when the number of candidate pairs in a chunk is **≥ 80M** (`ASTROJOIN_GPU_MIN_PAIRS`, default 80_000_000). Below that, it uses the CPU join even when `ASTROJOIN_GPU=wgpu` is set. To force GPU for all chunk sizes (for benchmarking), set `ASTROJOIN_GPU_MIN_PAIRS=0`.

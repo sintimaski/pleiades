@@ -7,6 +7,9 @@
 
 pub mod engine;
 
+#[cfg(feature = "wgpu")]
+pub mod gpu;
+
 #[cfg(feature = "python")]
 use std::path::Path;
 
@@ -105,10 +108,18 @@ fn cross_match(
         .unbind())
 }
 
+/// Returns true if the extension was built with the `wgpu` feature (GPU join available when ASTROJOIN_GPU=wgpu).
+#[cfg(feature = "python")]
+#[pyfunction]
+fn has_wgpu_feature() -> bool {
+    cfg!(feature = "wgpu")
+}
+
 /// Python module entry point.
 #[cfg(feature = "python")]
 #[pymodule]
 fn astrojoin_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cross_match, m)?)?;
+    m.add_function(wrap_pyfunction!(has_wgpu_feature, m)?)?;
     Ok(())
 }

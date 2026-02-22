@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -458,6 +459,18 @@ def cross_match(
     if use_rust:
         try:
             import astrojoin_core  # type: ignore[import-untyped]
+
+            gpu_env = os.environ.get("ASTROJOIN_GPU")
+            if gpu_env == "wgpu" and not getattr(
+                astrojoin_core, "has_wgpu_feature", lambda: False
+            )():
+                import sys
+
+                print(
+                    "astrojoin: ASTROJOIN_GPU=wgpu is set but the extension was not built "
+                    "with GPU support. Rebuild with: uv run maturin develop --features wgpu",
+                    file=sys.stderr,
+                )
 
             try:
                 result = astrojoin_core.cross_match(
