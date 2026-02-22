@@ -32,6 +32,7 @@ ENV/
 target/
 Cargo.lock
 .cargo_home/
+.cursorrules
 
 # IDE / Editor
 .idea/
