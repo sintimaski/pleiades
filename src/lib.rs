@@ -88,7 +88,11 @@ fn cross_match(
     dict.set_item("matches_count", stats.matches_count as i64)?;
     dict.set_item("chunks_processed", stats.chunks_processed as i64)?;
     dict.set_item("time_seconds", stats.time_seconds)?;
-    Ok(dict.into_py(py))
+    Ok(dict
+        .into_pyobject(py)
+        .unwrap()
+        .into_any()
+        .unbind())
 }
 
 /// Python module entry point.

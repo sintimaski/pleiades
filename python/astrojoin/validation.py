@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import math
 from pathlib import Path
 
 import pyarrow as pa
@@ -32,6 +33,12 @@ def validate_cross_match_args(
     """
     Validate cross_match parameters. Raises CatalogValidationError if invalid.
     """
+    if math.isnan(radius_arcsec):
+        raise CatalogValidationError("radius_arcsec must not be NaN")
+    if not math.isfinite(radius_arcsec):
+        raise CatalogValidationError(
+            f"radius_arcsec must be finite, got {radius_arcsec!r}"
+        )
     if radius_arcsec <= 0:
         raise CatalogValidationError(
             f"radius_arcsec must be positive, got {radius_arcsec!r}"

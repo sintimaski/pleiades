@@ -81,6 +81,7 @@ catalog_a.parquet          catalog_b.parquet
 ## 5. Rust engine (optional)
 
 - **Location**: `src/engine.rs`, `src/lib.rs`; built with `maturin develop`.
-- **Flow**: Stream A in batches → build HEALPix index (pixel → candidates); for each A chunk, re-stream B, for each B row get center+8 neighbours via cdshealpix, lookup candidates, haversine filter, write matches.
-- **Use**: `cross_match(..., use_rust=True)` (falls back to Python if `astrojoin_core` not installed).
-- **Validation**: `test_rust_matches_equal_reference_brute_force` compares Rust output to `reference_cross_match_brute_force` on the same inputs; skipped if the extension is not built or is the stub.
+- **Flow**: Stream A in batches → build HEALPix index (pixel → candidates). **If catalog_b is a file**: re-stream B per A chunk, each B row → center+8 neighbours via cdshealpix, lookup candidates, haversine filter (inner loop parallelized with rayon), write matches. **If catalog_b is a directory** (pre-partitioned B): list `shard_*.parquet`, for each A chunk compute pixels_wanted (chunk pixels + neighbours), load only B rows from shards for those pixels, then same haversine join. Supports `n_nearest` (post-pass filter) and **progress_callback** (invoked per A chunk).
+- **Return value**: Rust engine returns **CrossMatchStats** (output_path, rows_a_read, rows_b_read, matches_count, chunks_processed, time_seconds), exposed to Python as a dict and converted to **CrossMatchResult**.
+- **Use**: `cross_match(..., use_rust=True)` (falls back to Python if `astrojoin_core` not installed). Pre-partitioned B and progress callback work with the Rust path.
+- **Validation**: `test_rust_matches_equal_reference_brute_force` and `test_rust_with_prepartitioned_b_matches_reference` compare Rust output to reference; `test_rust_progress_callback_called` checks progress is invoked.

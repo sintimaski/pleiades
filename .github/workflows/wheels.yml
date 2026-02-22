@@ -1,0 +1,114 @@
+# Build wheels for PyPI (plug-and-play install). Run on push to main or tag.
+name: Wheels
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+jobs:
+  wheels:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --find-interpreter
+          target: ${{ matrix.target }}
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: target/wheels/
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        run: uv run maturin build --release --sdist-only
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: target/wheels/
+
+  publish:
+    needs: [wheels, sdist]
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          command: upload
+          args: dist/*
+        # Or use: run: uv run maturin publish --no-build (if dist already has wheels from a single job)
+        # This step expects dist/ to contain wheels + sdist from all jobs; download-artifact merge
+        # puts each artifact in a subdir. So we need to flatten or use a different approach.
+        # Simpler: build everything in one job with a matrix that uploads in the same job (not possible
+        # for different runners). Alternative: build on one runner with manylinux + cross or use
+        # maturin publish from sdist only and let PyPI build from sdist (PyPI doesn't build wheels).
+        # So for "publish on release" we have two options:
+        # A) Build all wheels in one job (e.g. manylinux only on Linux) and upload.
+        # B) Build per runner, then in publish job re-download all artifacts, flatten into one dist/,
+        #    and run twine upload dist/* (or maturin upload).
+        # Let me fix the publish job: we need to collect wheels from all artifacts. download-artifact
+        # with merge-multiple puts each artifact in a folder named after the artifact. So we'd have
+        # dist/wheels-x86_64-.../file.whl etc. So we need to move files. I'll add a step to copy
+        # all *.whl and *.tar.gz into a single dist/ and then publish.
+        # Actually the action "download-artifact" with pattern and merge-multiple merges into one dir
+        # but I think each artifact is still in its own subfolder. Let me use a simpler publish:
+        # only publish from sdist (pip will build locally for users - no, that's not plug-and-play).
+        # So we must collect wheels. Use a run step to glob and copy:
+        #   find dist -name '*.whl' -exec cp {} dist/ \;
+        # No - that would require dist to be a single folder. Let me structure so that download-artifact
+        # gets wheels-* and merge puts them in dist/ with subdirs wheels-x86_64..., wheels-aarch64...
+        # So dist/wheels-x86_64-unknown-linux-gnu/*.whle, etc. Then:
+        #   mkdir -p dist/all && find dist -name '*.whl' -exec cp {} dist/all/ \; && find dist -name '*.tar.gz' -exec cp {} dist/all/ \;
+        #   uv run maturin upload dist/all/*
+        # But maturin upload might expect a specific layout. Let me check - maturin upload just takes paths.
+        # So: we copy all wheels and sdist into one folder and run maturin upload dist/all/*
+        # I'll add the flatten step and use twine or maturin upload.
+</think>
+Fixing the publish job: collecting artifact paths and adding a flatten step.
+<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
+StrReplace

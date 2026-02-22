@@ -126,6 +126,18 @@ class TestValidateCrossMatchArgs:
         with pytest.raises(CatalogValidationError, match="positive"):
             validate_cross_match_args(-1.0)
 
+    def test_nan_radius_raises(self) -> None:
+        """NaN radius raises with clear message."""
+        with pytest.raises(CatalogValidationError, match="NaN"):
+            validate_cross_match_args(float("nan"))
+
+    def test_inf_radius_raises(self) -> None:
+        """Infinite radius raises."""
+        with pytest.raises(CatalogValidationError, match="finite"):
+            validate_cross_match_args(float("inf"))
+        with pytest.raises(CatalogValidationError, match="finite"):
+            validate_cross_match_args(-float("inf"))
+
     def test_n_nearest_one_ok(self) -> None:
         """n_nearest=1 passes."""
         validate_cross_match_args(1.0, n_nearest=1)
