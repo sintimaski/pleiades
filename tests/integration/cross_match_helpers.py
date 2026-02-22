@@ -289,6 +289,11 @@ def read_matches(path: Path) -> pa.Table:
     return pq.read_table(path)
 
 
+def match_table_id_b_col(t: pa.Table) -> str:
+    """Return the id_b column name in a cross_match output table (id_b or object_id)."""
+    return "id_b" if "id_b" in t.column_names else "object_id"
+
+
 def match_set_from_table(
     t: pa.Table, id_a_col: str, id_b_col: str
 ) -> set[tuple[Any, Any]]:

@@ -79,6 +79,7 @@ fn test_cross_match_one_pair_same_position() {
         None,
         "deg",
         None,
+        false,
         None,
     )
     .unwrap();
@@ -151,6 +152,7 @@ fn test_cross_match_no_matches() {
         None,
         "deg",
         None,
+        false,
         None,
     )
     .unwrap();
@@ -229,6 +231,7 @@ fn test_cross_match_one_pair_within_radius() {
         None,
         "deg",
         None,
+        false,
         None,
     )
     .unwrap();
@@ -307,6 +310,7 @@ fn test_cross_match_float32_ra_dec() {
         None,
         "deg",
         None,
+        false,
         None,
     )
     .unwrap();
@@ -381,6 +385,7 @@ fn test_cross_match_radians_units() {
         None,
         "rad",
         None,
+        false,
         None,
     )
     .unwrap();

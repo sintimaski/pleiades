@@ -104,6 +104,8 @@ uv run python scripts/benchmark_cross_match.py --rows 100000
 uv run python scripts/benchmark_cross_match.py --rows 50000 --rust   # compare Python vs Rust
 ```
 
+For tuning (batch sizes, n_shards, depth) and notes on CPU SIMD vs GPU (CUDA, wgpu, OpenCL), see [PERFORMANCE.md](PERFORMANCE.md).
+
 ## Project layout
 
 - `python/astrojoin/` – Python API, cross-match, analysis, cone search, CLI (HEALPix + stream I/O).

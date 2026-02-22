@@ -6,7 +6,8 @@ reliably at scale. For pre-generated files (e.g. to avoid OOM), use
 --catalog-a / --catalog-b or run scripts/generate_benchmark_fixtures.py first.
 
 With --verbose, sets ASTROJOIN_VERBOSE=1 so the Rust engine prints timing logs
-(index, load B, join, write per chunk; partition B and total) to stderr.
+(index, load B, join, write per chunk; partition B and total) to stderr, and
+prints per-chunk memory (peak RSS on Unix, current on Windows) after each chunk.
 
 For best throughput, build the Rust extension in release mode:
   uv run maturin develop --release
@@ -107,6 +108,11 @@ def main() -> int:
         default=None,
         help="Override batch_size_a and batch_size_b (default 100000); larger = fewer chunks, more RAM",
     )
+    parser.add_argument(
+        "--keep-b-in-memory",
+        action="store_true",
+        help="Partition B into RAM (no shard I/O). Use only when B is small; default is out-of-core (disk).",
+    )
     args = parser.parse_args()
     n_b = args.rows_b if args.rows_b is not None else args.rows
 
@@ -134,6 +140,16 @@ def main() -> int:
     batch_kw: dict = {}
     if args.batch_size is not None:
         batch_kw = {"batch_size_a": args.batch_size, "batch_size_b": args.batch_size}
+    if args.keep_b_in_memory:
+        batch_kw["keep_b_in_memory"] = True
+    if args.verbose:
+        # Per-chunk memory: callback runs after each chunk completes
+        def _progress_with_memory(chunk_ix: int, _total: int | None, rows_a: int, matches_count: int) -> None:
+            rss_bytes, is_peak = _get_max_rss_bytes()
+            rss_str = _format_memory_bytes(rss_bytes) if rss_bytes is not None else "N/A"
+            kind = "peak RSS" if is_peak else "current RSS"
+            print(f"[chunk {chunk_ix}] rows_a={rows_a} matches={matches_count} memory={rss_str} ({kind})", flush=True)
+        batch_kw["progress_callback"] = _progress_with_memory
     for label, use_rust in runs:
         t0 = time.perf_counter()
         result = astrojoin.cross_match(

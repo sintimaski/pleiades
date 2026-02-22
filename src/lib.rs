@@ -19,7 +19,7 @@ use pyo3::prelude::*;
 /// matches_count, chunks_processed, time_seconds).
 #[cfg(feature = "python")]
 #[pyfunction]
-#[pyo3(signature = (catalog_a, catalog_b, radius_arcsec, output_path, depth=8, batch_size_a=100_000, batch_size_b=100_000, n_shards=512, ra_col="ra", dec_col="dec", id_col_a=None, id_col_b=None, ra_dec_units="deg", n_nearest=None, progress_callback=None))]
+#[pyo3(signature = (catalog_a, catalog_b, radius_arcsec, output_path, depth=8, batch_size_a=100_000, batch_size_b=100_000, n_shards=512, ra_col="ra", dec_col="dec", id_col_a=None, id_col_b=None, ra_dec_units="deg", n_nearest=None, keep_b_in_memory=false, progress_callback=None))]
 fn cross_match(
     py: Python<'_>,
     catalog_a: &str,
@@ -36,6 +36,7 @@ fn cross_match(
     id_col_b: Option<&str>,
     ra_dec_units: &str,
     n_nearest: Option<u32>,
+    keep_b_in_memory: bool,
     progress_callback: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let path_a = Path::new(catalog_a);
@@ -81,6 +82,7 @@ fn cross_match(
         id_col_b,
         ra_dec_units,
         n_nearest,
+        keep_b_in_memory,
         progress,
     )
     .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;

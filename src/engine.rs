@@ -24,7 +24,6 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchReader};
-use cdshealpix::haversine_dist;
 use cdshealpix::nested::{self, get};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -53,14 +52,54 @@ pub enum IdVal {
     Str(String),
 }
 
+/// Haversine angular distance in radians (inputs in radians).
+/// Standard formula: a = sin²(Δφ/2) + cos(φ₁)cos(φ₂)sin²(Δλ/2); θ = 2 asin(√a).
+#[inline(always)]
+fn haversine_rad(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    let a = (dlat * 0.5).sin().mul_add(
+        (dlat * 0.5).sin(),
+        lat1.cos() * lat2.cos() * (dlon * 0.5).sin() * (dlon * 0.5).sin(),
+    );
+    let c = 2.0 * (a.sqrt().min(1.0).asin());
+    c
+}
+
 /// Haversine angular distance in arcsec (inputs in degrees).
+#[inline(always)]
 fn haversine_arcsec(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
     let lon1 = ra1_deg * DEG_TO_RAD;
     let lat1 = dec1_deg * DEG_TO_RAD;
     let lon2 = ra2_deg * DEG_TO_RAD;
     let lat2 = dec2_deg * DEG_TO_RAD;
-    let rad = haversine_dist(lon1, lat1, lon2, lat2);
-    rad * RAD_TO_ARCSEC
+    haversine_rad(lon1, lat1, lon2, lat2) * RAD_TO_ARCSEC
+}
+
+/// Compute 4 haversine distances (arcsec) in one batch. Same (ra2_deg, dec2_deg) for all four.
+/// Writes to `out[0..4]`. Enables compiler autovectorization and better cache use.
+#[inline(always)]
+fn haversine_arcsec_4(
+    ra1_deg: &[f64; 4],
+    dec1_deg: &[f64; 4],
+    ra2_deg: f64,
+    dec2_deg: f64,
+    out: &mut [f64; 4],
+) {
+    let lon2 = ra2_deg * DEG_TO_RAD;
+    let lat2 = dec2_deg * DEG_TO_RAD;
+    let cos_lat2 = lat2.cos();
+    for i in 0..4 {
+        let lon1 = ra1_deg[i] * DEG_TO_RAD;
+        let lat1 = dec1_deg[i] * DEG_TO_RAD;
+        let dlat = lat2 - lat1;
+        let dlon = lon2 - lon1;
+        let a = (dlat * 0.5).sin().mul_add(
+            (dlat * 0.5).sin(),
+            lat1.cos() * cos_lat2 * (dlon * 0.5).sin() * (dlon * 0.5).sin(),
+        );
+        out[i] = 2.0 * (a.sqrt().min(1.0).asin()) * RAD_TO_ARCSEC;
+    }
 }
 
 /// Resolve ID column name: use provided or first non-ra/dec column.
@@ -80,7 +119,11 @@ fn id_column(batch: &RecordBatch, ra_col: &str, dec_col: &str, id_col: Option<&s
 
 /// Infer Arrow DataType for ID column (value type when Dictionary).
 fn id_type(batch: &RecordBatch, col_name: &str) -> DataType {
-    let schema = batch.schema();
+    id_type_from_schema(batch.schema().as_ref(), col_name)
+}
+
+/// Infer ID column type from schema (for use when no batch is available).
+fn id_type_from_schema(schema: &Schema, col_name: &str) -> DataType {
     let field = schema
         .field_with_name(col_name)
         .expect("id column missing");
@@ -88,6 +131,25 @@ fn id_type(batch: &RecordBatch, col_name: &str) -> DataType {
         DataType::Dictionary(_, value_type) => (**value_type).clone(),
         other => other.clone(),
     }
+}
+
+/// Resolve ID column name from schema (when no batch is available).
+fn id_column_from_schema(
+    schema: &Schema,
+    ra_col: &str,
+    dec_col: &str,
+    id_col: Option<&str>,
+) -> String {
+    if let Some(c) = id_col {
+        return c.to_string();
+    }
+    for i in 0..schema.fields().len() {
+        let name = schema.field(i).name();
+        if name.to_lowercase() != ra_col && name.to_lowercase() != dec_col {
+            return name.clone();
+        }
+    }
+    "index".to_string()
 }
 
 /// Extract ID value from batch row. Supports Dictionary-encoded columns (Parquet often uses these).
@@ -281,22 +343,21 @@ fn load_b_from_shards(
     Ok(out)
 }
 
-/// Compute pixels in chunk A plus all 8 neighbors (halo).
+/// Compute pixels in chunk A plus all 8 neighbors (halo). Parallel over rows.
 fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) -> HashSet<u64> {
     let layer = get(depth);
-    let mut pixels = HashSet::new();
-    for i in 0..ra_deg.len() {
-        let lon = ra_deg[i] * DEG_TO_RAD;
-        let lat = dec_deg[i] * DEG_TO_RAD;
-        let center = layer.hash(lon, lat);
-        pixels.insert(center);
-        let mut neighbours = vec![center];
-        nested::append_bulk_neighbours(depth, center, &mut neighbours);
-        for p in neighbours {
-            pixels.insert(p);
-        }
-    }
-    pixels
+    (0..ra_deg.len())
+        .into_par_iter()
+        .flat_map(|i| {
+            let lon = ra_deg[i] * DEG_TO_RAD;
+            let lat = dec_deg[i] * DEG_TO_RAD;
+            let center = layer.hash(lon, lat);
+            let mut neighbours = Vec::with_capacity(9);
+            neighbours.push(center);
+            nested::append_bulk_neighbours(depth, center, &mut neighbours);
+            neighbours
+        })
+        .collect()
 }
 
 /// Progress callback type: (chunk_ix, total_or_none, rows_a_read, matches_count).
@@ -316,7 +377,8 @@ fn verbose_log_timed(phase: &str, elapsed_secs: f64, extra: &str) {
 }
 
 /// Partition catalog B (single file) into HEALPix shards in a temp directory.
-/// Returns (temp_dir_guard, shard_dir_path, n_shards). Caller must keep the guard alive.
+/// Returns (temp_dir_guard, shard_dir_path, rows_written, original_id_b_column_name).
+/// Caller must keep the guard alive.
 fn partition_b_to_temp(
     catalog_b: &Path,
     depth: u8,
@@ -326,23 +388,68 @@ fn partition_b_to_temp(
     dec_col: &str,
     id_col_b: Option<&str>,
     from_radians: bool,
-) -> Result<(TempDir, PathBuf, u64), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(TempDir, PathBuf, u64, String), Box<dyn std::error::Error + Send + Sync>> {
     let layer = get(depth);
     let temp_dir = tempfile::tempdir().map_err(|e| format!("temp dir: {}", e))?;
     let shard_dir = temp_dir.path().to_path_buf();
 
     let file_b = File::open(catalog_b)?;
-    let mut reader =
-        ParquetRecordBatchReaderBuilder::try_new(file_b)?
-            .with_batch_size(batch_size_b)
-            .build()?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
+    let arrow_schema = builder.schema().clone();
+    let mut reader = builder.with_batch_size(batch_size_b).build()?;
 
     let first_batch = match reader.next() {
-        Some(Ok(b)) if b.num_rows() > 0 => b,
-        _ => return Err("catalog B has no rows".into()),
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return Err(e.into()),
+        None => {
+            let id_b_name_owned =
+                id_column_from_schema(arrow_schema.as_ref(), ra_col, dec_col, id_col_b);
+            let id_b_type = id_type_from_schema(arrow_schema.as_ref(), &id_b_name_owned);
+            let shard_schema = Arc::new(Schema::new(vec![
+                Field::new("pixel_id", DataType::UInt64, false),
+                Field::new("id_b", id_b_type, false),
+                Field::new("ra", DataType::Float64, false),
+                Field::new("dec", DataType::Float64, false),
+            ]));
+            for s in 0..n_shards {
+                let path = shard_dir.join(format!("shard_{:04}.parquet", s));
+                let f = File::create(&path).map_err(|e| format!("create shard {}: {}", s, e))?;
+                let mut w = ArrowWriter::try_new(
+                    BufWriter::new(f),
+                    Arc::clone(&shard_schema),
+                    Some(WriterProperties::builder().build()),
+                )?;
+                w.write(&RecordBatch::new_empty(Arc::clone(&shard_schema)))?;
+                w.close()?;
+            }
+            return Ok((temp_dir, shard_dir, 0, id_b_name_owned));
+        }
     };
 
     let id_b_name = id_column(&first_batch, ra_col, dec_col, id_col_b);
+    let id_b_name_owned = id_b_name.clone();
+
+    if first_batch.num_rows() == 0 {
+        let id_b_type = id_type(&first_batch, &id_b_name);
+        let shard_schema = Arc::new(Schema::new(vec![
+            Field::new("pixel_id", DataType::UInt64, false),
+            Field::new("id_b", id_b_type, false),
+            Field::new("ra", DataType::Float64, false),
+            Field::new("dec", DataType::Float64, false),
+        ]));
+        for s in 0..n_shards {
+            let path = shard_dir.join(format!("shard_{:04}.parquet", s));
+            let f = File::create(&path).map_err(|e| format!("create shard {}: {}", s, e))?;
+            let mut w = ArrowWriter::try_new(
+                BufWriter::new(f),
+                Arc::clone(&shard_schema),
+                Some(WriterProperties::builder().build()),
+            )?;
+            w.write(&RecordBatch::new_empty(Arc::clone(&shard_schema)))?;
+            w.close()?;
+        }
+        return Ok((temp_dir, shard_dir, 0, id_b_name_owned));
+    }
     let id_b_type = id_type(&first_batch, &id_b_name);
     let shard_schema = Arc::new(Schema::new(vec![
         Field::new("pixel_id", DataType::UInt64, false),
@@ -365,7 +472,7 @@ fn partition_b_to_temp(
 
     let mut rows_written: u64 = 0;
     let mut buffers: Vec<Vec<(u64, IdVal, f64, f64)>> = (0..n_shards).map(|_| Vec::new()).collect();
-    const FLUSH_AT: usize = 16_384;
+    const FLUSH_AT: usize = 65_536;
 
     let mut process_batch = |batch: &RecordBatch| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ra_idx = column_index(batch, ra_col);
@@ -455,7 +562,102 @@ fn partition_b_to_temp(
         w.take().unwrap().close()?;
     }
 
-    Ok((temp_dir, shard_dir, rows_written))
+    Ok((temp_dir, shard_dir, rows_written, id_b_name_owned))
+}
+
+/// Partition catalog B (single file) into in-memory shard buffers (no disk writes).
+/// Returns (shard_buffers, original_id_b_column_name, rows_read). Use with load_b_from_memory.
+fn partition_b_to_memory(
+    catalog_b: &Path,
+    depth: u8,
+    n_shards: usize,
+    batch_size_b: usize,
+    ra_col: &str,
+    dec_col: &str,
+    id_col_b: Option<&str>,
+    from_radians: bool,
+) -> Result<(Vec<Vec<(u64, IdVal, f64, f64)>>, String, u64), Box<dyn std::error::Error + Send + Sync>> {
+    let layer = get(depth);
+    let file_b = File::open(catalog_b)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
+    let arrow_schema = builder.schema().clone();
+    let mut reader = builder.with_batch_size(batch_size_b).build()?;
+
+    let first_batch = match reader.next() {
+        Some(Ok(b)) => b,
+        Some(Err(e)) => return Err(e.into()),
+        None => {
+            let id_b_name_owned =
+                id_column_from_schema(arrow_schema.as_ref(), ra_col, dec_col, id_col_b);
+            let empty: Vec<Vec<(u64, IdVal, f64, f64)>> = (0..n_shards).map(|_| Vec::new()).collect();
+            return Ok((empty, id_b_name_owned, 0));
+        }
+    };
+
+    let id_b_name = id_column(&first_batch, ra_col, dec_col, id_col_b);
+    let id_b_name_owned = id_b_name.clone();
+    let mut buffers: Vec<Vec<(u64, IdVal, f64, f64)>> = (0..n_shards).map(|_| Vec::new()).collect();
+    let mut rows_read: u64 = 0;
+
+    let mut process_batch = |batch: &RecordBatch| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let ra_idx = column_index(batch, ra_col);
+        let dec_idx = column_index(batch, dec_col);
+        let id_b_idx = column_index(batch, &id_b_name);
+        let (ra_deg, dec_deg) = ra_dec_degrees(batch, ra_idx, dec_idx, from_radians)?;
+        let n = batch.num_rows();
+        let row_results: Vec<(usize, u64, IdVal, f64, f64)> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let lon = ra_deg[row] * DEG_TO_RAD;
+                let lat = dec_deg[row] * DEG_TO_RAD;
+                let pixel_id = layer.hash(lon, lat);
+                let shard_ix = (pixel_id % n_shards as u64) as usize;
+                let id_val = get_id_value(batch, &id_b_name, id_b_idx, row);
+                (shard_ix, pixel_id, id_val, ra_deg[row], dec_deg[row])
+            })
+            .collect();
+        for (shard_ix, pixel_id, id_val, ra, dec) in row_results {
+            buffers[shard_ix].push((pixel_id, id_val, ra, dec));
+        }
+        rows_read += n as u64;
+        Ok(())
+    };
+
+    process_batch(&first_batch)?;
+    for batch in reader {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        process_batch(&batch)?;
+    }
+    Ok((buffers, id_b_name_owned, rows_read))
+}
+
+/// Load B rows from in-memory shard buffers for the given set of pixel IDs (no I/O).
+fn load_b_from_memory(
+    shard_buffers: &[Vec<(u64, IdVal, f64, f64)>],
+    pixels_wanted: &HashSet<u64>,
+    n_shards: usize,
+) -> Vec<(IdVal, f64, f64)> {
+    let shard_indices: Vec<usize> = pixels_wanted
+        .iter()
+        .map(|&p| (p % n_shards as u64) as usize)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let out: Vec<(IdVal, f64, f64)> = shard_indices
+        .par_iter()
+        .filter(|&&s| s < shard_buffers.len())
+        .flat_map(|&s| {
+            shard_buffers[s]
+                .iter()
+                .filter(|(pix, _, _, _)| pixels_wanted.contains(pix))
+                .map(|(_, id_val, ra, dec)| (id_val.clone(), *ra, *dec))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out
 }
 
 fn build_id_column_single(ids: &[IdVal]) -> Arc<dyn Array> {
@@ -476,7 +678,8 @@ fn build_id_column_single(ids: &[IdVal]) -> Arc<dyn Array> {
 /// Cross-match two Parquet catalogs: stream A in chunks, build HEALPix index per chunk,
 /// stream B (or load B from pre-partitioned shards), haversine filter, write matches.
 /// When catalog_b is a directory with shard_*.parquet, B is loaded by pixel from shards.
-/// When catalog_b is a file, B is partitioned in-Rust to a temp dir first (one read), then shard path is used.
+/// When catalog_b is a file, B is partitioned in-Rust: to temp dir (one read + shard writes) or to memory (one read, no shard I/O).
+/// If keep_b_in_memory is true and B is a file, B is partitioned into RAM so no shard files are read per chunk (faster when B fits in RAM).
 /// Returns CrossMatchStats. If n_nearest is Some(n), keeps only n smallest-separation matches per id_a.
 pub fn cross_match_impl(
     catalog_a: &Path,
@@ -493,6 +696,7 @@ pub fn cross_match_impl(
     id_col_b: Option<&str>,
     ra_dec_units: &str,
     n_nearest: Option<u32>,
+    keep_b_in_memory: bool,
     progress_callback: ProgressCallback,
 ) -> Result<CrossMatchStats, Box<dyn std::error::Error + Send + Sync>> {
     let from_radians = is_radians(ra_dec_units);
@@ -503,14 +707,20 @@ pub fn cross_match_impl(
     let b_is_prepartitioned = catalog_b.is_dir();
     let _temp_partition: Option<TempDir>;
     let mut rows_b_from_partition: Option<u64> = None;
-    let (n_shards, shard_dir) = if b_is_prepartitioned {
+    let mut id_b_name_from_partition: Option<String> = None;
+    let shard_dir: Option<PathBuf>;
+    let b_in_memory: Option<Arc<Vec<Vec<(u64, IdVal, f64, f64)>>>>;
+
+    let n_shards = if b_is_prepartitioned {
         let (_paths, n) = list_shard_paths(catalog_b)?;
         verbose_log("using pre-partitioned B (directory)");
-        (n, Some(catalog_b.to_path_buf()))
-    } else {
-        verbose_log("partitioning B in-Rust (single read)...");
+        shard_dir = Some(catalog_b.to_path_buf());
+        b_in_memory = None;
+        n
+    } else if keep_b_in_memory {
+        verbose_log("partitioning B in-Rust (in-memory, single read, no shard I/O)...");
         let t_part = std::time::Instant::now();
-        let (temp_guard, dir_path, rows_b) = partition_b_to_temp(
+        let (buffers, id_b_orig, rows_b) = partition_b_to_memory(
             catalog_b,
             depth,
             n_shards,
@@ -521,11 +731,36 @@ pub fn cross_match_impl(
             from_radians,
         )?;
         rows_b_from_partition = Some(rows_b);
+        id_b_name_from_partition = Some(id_b_orig);
+        shard_dir = None;
+        b_in_memory = Some(Arc::new(buffers));
+        _temp_partition = None;
+        if verbose {
+            verbose_log_timed("partition B (memory)", t_part.elapsed().as_secs_f64(), &format!("({} rows, {} shards)", rows_b, n_shards));
+        }
+        n_shards
+    } else {
+        verbose_log("partitioning B in-Rust (single read)...");
+        let t_part = std::time::Instant::now();
+        let (temp_guard, dir_path, rows_b, id_b_orig) = partition_b_to_temp(
+            catalog_b,
+            depth,
+            n_shards,
+            batch_size_b,
+            ra_col,
+            dec_col,
+            id_col_b,
+            from_radians,
+        )?;
+        rows_b_from_partition = Some(rows_b);
+        id_b_name_from_partition = Some(id_b_orig);
         _temp_partition = Some(temp_guard);
+        shard_dir = Some(dir_path);
+        b_in_memory = None;
         if verbose {
             verbose_log_timed("partition B", t_part.elapsed().as_secs_f64(), &format!("({} rows, {} shards)", rows_b, n_shards));
         }
-        (n_shards, Some(dir_path))
+        n_shards
     };
 
     // Prefetch thread: read catalog A batches one ahead so I/O overlaps with compute.
@@ -607,7 +842,10 @@ pub fn cross_match_impl(
         let (ra_deg_a, dec_deg_a) = ra_dec_degrees(&batch_a, ra_idx, dec_idx, from_radians)?;
 
         let t_index = std::time::Instant::now();
-        let mut index: HashMap<u64, Vec<(IdVal, f64, f64)>> = HashMap::new();
+        let mut id_a_flat: Vec<IdVal> = Vec::with_capacity(n_a);
+        let mut ra_flat: Vec<f64> = Vec::with_capacity(n_a);
+        let mut dec_flat: Vec<f64> = Vec::with_capacity(n_a);
+        let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
         for row in 0..batch_a.num_rows() {
             let ra_deg = ra_deg_a[row];
             let dec_deg = dec_deg_a[row];
@@ -615,10 +853,11 @@ pub fn cross_match_impl(
             let lat = dec_deg * DEG_TO_RAD;
             let pix = layer.hash(lon, lat);
             let id_val = get_id_value(&batch_a, &id_a_col, id_a_idx, row);
-            index
-                .entry(pix)
-                .or_default()
-                .push((id_val, ra_deg, dec_deg));
+            let idx = id_a_flat.len();
+            id_a_flat.push(id_val);
+            ra_flat.push(ra_deg);
+            dec_flat.push(dec_deg);
+            index.entry(pix).or_default().push(idx);
         }
         if verbose {
             verbose_log_timed("  index", t_index.elapsed().as_secs_f64(), "");
@@ -629,37 +868,69 @@ pub fn cross_match_impl(
         let mut matches_sep: Vec<f64> = Vec::new();
 
         if id_b_name.is_none() {
-            id_b_name = Some("id_b".to_string());
+            id_b_name = Some(
+                id_b_name_from_partition
+                    .clone()
+                    .unwrap_or_else(|| "id_b".to_string()),
+            );
         }
         let t_load = std::time::Instant::now();
         let pixels_wanted = pixels_in_chunk_with_neighbors(&ra_deg_a, &dec_deg_a, depth);
-        let b_rows = load_b_from_shards(
-            shard_dir.as_ref().unwrap(),
-            &pixels_wanted,
-            n_shards,
-            from_radians,
-        )?;
+        let b_rows = if let Some(ref buf) = b_in_memory {
+            load_b_from_memory(buf, &pixels_wanted, n_shards)
+        } else {
+            load_b_from_shards(
+                shard_dir.as_ref().unwrap(),
+                &pixels_wanted,
+                n_shards,
+                from_radians,
+            )?
+        };
         let n_b_loaded = b_rows.len();
         if verbose {
             verbose_log_timed("  load B", t_load.elapsed().as_secs_f64(), &format!("({} rows)", n_b_loaded));
         }
         let t_join = std::time::Instant::now();
         let index_ref = &index;
+        let ra_flat_ref = &ra_flat;
+        let dec_flat_ref = &dec_flat;
         let radius = radius_arcsec;
         let depth_local = depth;
-        let per_row: Vec<Vec<(IdVal, IdVal, f64)>> = b_rows
+        let per_row: Vec<Vec<(usize, usize, f64)>> = b_rows
             .par_iter()
-            .map(|(id_b_val, ra_b_deg, dec_b_deg)| {
+            .enumerate()
+            .map(|(b_row_ix, (_id_b, ra_b_deg, dec_b_deg))| {
                 let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
-                let mut pixels_to_look = vec![center_pix];
+                let mut pixels_to_look = Vec::with_capacity(9);
+                pixels_to_look.push(center_pix);
                 nested::append_bulk_neighbours(depth_local, center_pix, &mut pixels_to_look);
                 let mut row_matches = Vec::new();
                 for pix in &pixels_to_look {
-                    if let Some(candidates) = index_ref.get(pix) {
-                        for (id_a, ra_a, dec_a) in candidates {
-                            let sep = haversine_arcsec(*ra_a, *dec_a, *ra_b_deg, *dec_b_deg);
+                    if let Some(candidate_ixs) = index_ref.get(pix) {
+                        let chunks = candidate_ixs.chunks_exact(4);
+                        let remainder = chunks.remainder();
+                        for chunk in chunks {
+                            let mut ra1 = [0.0_f64; 4];
+                            let mut dec1 = [0.0_f64; 4];
+                            for (i, &ix) in chunk.iter().enumerate() {
+                                ra1[i] = ra_flat_ref[ix];
+                                dec1[i] = dec_flat_ref[ix];
+                            }
+                            let mut seps = [0.0_f64; 4];
+                            haversine_arcsec_4(&ra1, &dec1, *ra_b_deg, *dec_b_deg, &mut seps);
+                            for (i, &candidate_ix) in chunk.iter().enumerate() {
+                                let sep = seps[i];
+                                if sep <= radius {
+                                    row_matches.push((candidate_ix, b_row_ix, sep));
+                                }
+                            }
+                        }
+                        for &candidate_ix in remainder {
+                            let ra_a = ra_flat_ref[candidate_ix];
+                            let dec_a = dec_flat_ref[candidate_ix];
+                            let sep = haversine_arcsec(ra_a, dec_a, *ra_b_deg, *dec_b_deg);
                             if sep <= radius {
-                                row_matches.push((id_a.clone(), id_b_val.clone(), sep));
+                                row_matches.push((candidate_ix, b_row_ix, sep));
                             }
                         }
                     }
@@ -667,10 +938,13 @@ pub fn cross_match_impl(
                 row_matches
             })
             .collect();
+        matches_id_a.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+        matches_id_b.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
+        matches_sep.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
         for row_matches in per_row {
-            for (id_a, id_b, sep) in row_matches {
-                matches_id_a.push(id_a);
-                matches_id_b.push(id_b);
+            for (candidate_ix, b_row_ix, sep) in row_matches {
+                matches_id_a.push(id_a_flat[candidate_ix].clone());
+                matches_id_b.push(b_rows[b_row_ix].0.clone());
                 matches_sep.push(sep);
             }
         }

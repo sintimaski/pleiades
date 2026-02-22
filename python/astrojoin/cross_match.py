@@ -378,6 +378,7 @@ def cross_match(
     n_shards: int = B_PARTITION_SHARDS,
     use_rust: bool = True,
     n_nearest: int | None = None,
+    keep_b_in_memory: bool = False,
     progress_callback: Callable[[int, int | None, int, int], None] | None = None,
     include_coords: bool = False,
 ) -> CrossMatchResult:
@@ -410,6 +411,11 @@ def cross_match(
     batch_size_a, batch_size_b: rows per Parquet read chunk (default 100k each).
     Smaller values use less RAM and are better on memory-constrained machines
     (e.g. laptops); larger values reduce I/O overhead.
+
+    keep_b_in_memory: when True and catalog_b is a file, partition B into RAM
+    instead of temp shard files (faster but uses more memory). Default False
+    on purpose: the pipeline is out-of-core and should run on limited RAM.
+    Set True only when B is small enough to fit comfortably in memory.
 
     Returns:
         CrossMatchResult with output_path, row counts, match count, and time.
@@ -465,10 +471,38 @@ def cross_match(
                     id_col_b=id_col_b,
                     ra_dec_units=ra_dec_units,
                     n_nearest=n_nearest,
+                    keep_b_in_memory=keep_b_in_memory,
                     progress_callback=progress_callback,
                 )
             except TypeError as e:
-                if "progress_callback" in str(e) or "n_nearest" in str(e):
+                err_str = str(e)
+                if "keep_b_in_memory" in err_str and keep_b_in_memory:
+                    # Older extension doesn't support keep_b_in_memory; retry without it
+                    import warnings
+                    warnings.warn(
+                        "Rust extension does not support keep_b_in_memory; rebuild with "
+                        "uv run maturin develop to enable in-memory B (faster when B fits in RAM).",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    result = astrojoin_core.cross_match(
+                        str(catalog_a),
+                        str(catalog_b),
+                        radius_arcsec,
+                        str(output_path),
+                        depth=depth,
+                        batch_size_a=batch_size_a,
+                        batch_size_b=batch_size_b,
+                        n_shards=n_shards,
+                        ra_col=ra_col,
+                        dec_col=dec_col,
+                        id_col_a=id_col_a,
+                        id_col_b=id_col_b,
+                        ra_dec_units=ra_dec_units,
+                        n_nearest=n_nearest,
+                        progress_callback=progress_callback,
+                    )
+                elif "progress_callback" in err_str or "n_nearest" in err_str:
                     result = astrojoin_core.cross_match(
                         str(catalog_a),
                         str(catalog_b),
@@ -484,7 +518,7 @@ def cross_match(
                         id_col_b=id_col_b,
                         ra_dec_units=ra_dec_units,
                     )
-                elif "ra_dec_units" not in str(e):
+                elif "ra_dec_units" not in err_str:
                     raise
                 elif ra_dec_units.lower() != "deg":
                     raise ValueError(

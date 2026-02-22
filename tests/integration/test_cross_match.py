@@ -17,6 +17,7 @@ from tests.integration.cross_match_helpers import (
     make_catalogs_pair_at_exact_radius,
     make_catalogs_random,
     match_set_from_table,
+    match_table_id_b_col,
     read_matches,
     reference_cross_match_brute_force,
     write_catalogs,
@@ -54,7 +55,7 @@ def test_exact_n_pairs_generated(tmp_path: Path) -> None:
 
     t = read_matches(out)
     assert t.num_rows == 5, f"expected exactly 5 matches, got {t.num_rows}"
-    got_set = match_set_from_table(t, "source_id", "object_id")
+    got_set = match_set_from_table(t, "source_id", match_table_id_b_col(t))
     expected_set = {(e[0], e[1]) for e in expected}
     assert got_set == expected_set, (
         f"match pairs differ: got {got_set}, expected {expected_set}"
@@ -93,7 +94,7 @@ def test_pair_at_exact_radius_boundary(tmp_path: Path) -> None:
     t = read_matches(out)
     assert t.num_rows == 1, f"expected 1 match at boundary, got {t.num_rows}"
     assert t.column("source_id")[0].as_py() == id_a
-    assert t.column("object_id")[0].as_py() == id_b
+    assert t.column(match_table_id_b_col(t))[0].as_py() == id_b
     sep = t.column("separation_arcsec")[0].as_py()
     assert sep <= radius
     assert abs(sep - expected_sep) < 0.01
@@ -111,7 +112,7 @@ def test_one_to_many_matches(tmp_path: Path) -> None:
 
     t = read_matches(out)
     assert t.num_rows == 4, f"expected 4 matches (one-to-many), got {t.num_rows}"
-    got_set = match_set_from_table(t, "source_id", "object_id")
+    got_set = match_set_from_table(t, "source_id", match_table_id_b_col(t))
     expected_set = {(e[0], e[1]) for e in expected}
     assert got_set == expected_set
 
@@ -128,7 +129,7 @@ def test_many_to_one_matches(tmp_path: Path) -> None:
 
     t = read_matches(out)
     assert t.num_rows == 3, f"expected 3 matches (many-to-one), got {t.num_rows}"
-    got_set = match_set_from_table(t, "source_id", "object_id")
+    got_set = match_set_from_table(t, "source_id", match_table_id_b_col(t))
     expected_set = {(e[0], e[1]) for e in expected}
     assert got_set == expected_set
 
@@ -195,7 +196,7 @@ def test_output_schema_and_separations_bounded(tmp_path: Path) -> None:
 
     t = read_matches(out)
     assert "source_id" in t.column_names
-    assert "object_id" in t.column_names
+    assert match_table_id_b_col(t) in t.column_names
     assert "separation_arcsec" in t.column_names
     sep = t.column("separation_arcsec")
     for i in range(t.num_rows):
@@ -232,7 +233,7 @@ def test_matches_equal_reference_brute_force(tmp_path: Path) -> None:
             partition_b=partition_b,
         )
         t = read_matches(out)
-        our_set = match_set_from_table(t, "source_id", "object_id")
+        our_set = match_set_from_table(t, "source_id", match_table_id_b_col(t))
         assert our_set == reference_set, (
             f"partition_b={partition_b}: our matches differ from reference. "
             f"Only in reference: {reference_set - our_set!r}. "
@@ -515,10 +516,8 @@ def test_prepartitioned_b_directory_matches_file_path(tmp_path: Path) -> None:
     )
     t_file = read_matches(out_file)
     t_dir = read_matches(out_dir)
-    set_file = match_set_from_table(t_file, "source_id", "object_id")
-    # Pre-partitioned path writes id_b column (shard schema), not object_id
-    id_b_col = "id_b" if "id_b" in t_dir.column_names else "object_id"
-    set_dir = match_set_from_table(t_dir, "source_id", id_b_col)
+    set_file = match_set_from_table(t_file, "source_id", match_table_id_b_col(t_file))
+    set_dir = match_set_from_table(t_dir, "source_id", match_table_id_b_col(t_dir))
     assert set_file == set_dir
     assert len(set_dir) == 4
 
