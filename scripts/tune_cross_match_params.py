@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -78,24 +79,32 @@ def run_one(
     batch_size: int,
     n_shards: int,
     keep_b_in_memory: bool,
-) -> tuple[float, float | None, int]:
-    """Run cross_match once; return (time_sec, max_rss_bytes or None, matches_count)."""
+    progress_callback: object | None = None,
+) -> tuple[float, float | None, int] | None:
+    """Run cross_match once; return (time_sec, max_rss_bytes or None, matches_count) or None if cancelled."""
     import astrojoin
-    rss_before, _ = _get_max_rss_bytes()
     t0 = time.perf_counter()
-    result = astrojoin.cross_match(
-        catalog_a=path_a,
-        catalog_b=path_b,
-        radius_arcsec=radius_arcsec,
-        output_path=out_path,
-        use_rust=True,
-        batch_size_a=batch_size,
-        batch_size_b=batch_size,
-        n_shards=n_shards,
-        keep_b_in_memory=keep_b_in_memory,
-    )
+    kwargs: dict = {
+        "catalog_a": path_a,
+        "catalog_b": path_b,
+        "radius_arcsec": radius_arcsec,
+        "output_path": out_path,
+        "use_rust": True,
+        "batch_size_a": batch_size,
+        "batch_size_b": batch_size,
+        "n_shards": n_shards,
+        "keep_b_in_memory": keep_b_in_memory,
+    }
+    if progress_callback is not None:
+        kwargs["progress_callback"] = progress_callback
+    try:
+        result = astrojoin.cross_match(**kwargs)
+    except OSError as e:
+        if "cancelled" in str(e).lower():
+            return None
+        raise
     elapsed = time.perf_counter() - t0
-    rss_after, is_peak = _get_max_rss_bytes()
+    rss_after, _ = _get_max_rss_bytes()
     max_rss = float(rss_after) if rss_after is not None else None
     return (elapsed, max_rss, result.matches_count)
 
@@ -174,6 +183,17 @@ def main() -> int:
     # Suppress Rust verbose logs during tuning
     env_verbose = os.environ.pop("ASTROJOIN_VERBOSE", None)
 
+    cancel_requested: list[bool] = [False]
+
+    def _on_sigint(_signum: int, _frame: object) -> None:
+        cancel_requested[0] = True
+        print("\nCancelling after current chunk (Ctrl+C again to force)...", flush=True)
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
+    def _progress(_chunk: int, _total: int | None, _rows: int, _matches: int) -> bool:
+        return not cancel_requested[0]
+
     results: list[dict] = []
     total_runs = (
         len(args.batch_sizes)
@@ -199,7 +219,7 @@ def main() -> int:
                             flush=True,
                         )
                     try:
-                        elapsed, max_rss, matches = run_one(
+                        one = run_one(
                             path_a,
                             path_b,
                             out_path,
@@ -207,7 +227,13 @@ def main() -> int:
                             batch_size,
                             n_shards,
                             keep_b_in_memory,
+                            progress_callback=_progress,
                         )
+                        if one is None:
+                            if not args.quiet:
+                                print("cancelled")
+                            return 130
+                        elapsed, max_rss, matches = one
                         times.append(elapsed)
                         if max_rss is not None:
                             rss_list.append(max_rss)

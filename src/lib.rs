@@ -52,7 +52,7 @@ fn cross_match(
         let cb = cb.clone().unbind();
         Some(Box::new(move |chunk_ix, total, rows_a, matches_count| {
             Python::with_gil(|py| {
-                let _ = cb.call1(
+                let res = cb.call1(
                     py,
                     (
                         chunk_ix as i64,
@@ -61,7 +61,11 @@ fn cross_match(
                         matches_count as i64,
                     ),
                 );
-            });
+                match res.and_then(|r| r.extract::<bool>(py)) {
+                    Ok(false) => false, // cancel
+                    _ => true,          // continue (None, True, or error)
+                }
+            })
         }))
     } else {
         None

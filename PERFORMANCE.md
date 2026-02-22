@@ -17,13 +17,15 @@
 | `n_shards`       | Number of HEALPix shards (default 512). More shards = smaller per-shard files and more targeted loading; fewer = less overhead, coarser granularity. |
 | `depth`          | HEALPix depth (default 8). Higher = finer pixels, more neighbors to check, better selectivity on dense catalogs. |
 
-**Verbose timing:** Set `ASTROJOIN_VERBOSE=1` (or any value) to log partition, per-chunk index/load/join/write, and total time. Useful to see whether time is in I/O, load B, or join.
+**Verbose timing:** Set `ASTROJOIN_VERBOSE=1` (or any value) to log partition, per-chunk index/load/join/write, and total time. With verbose, the engine also logs detected parallelism and the Rayon thread pool size. If you see only one thread (e.g. in a container or restricted environment), set **`RAYON_NUM_THREADS`** to the number of threads to use (e.g. `export RAYON_NUM_THREADS=8`).
 
 **Tune on your machine:** Run `uv run python scripts/tune_cross_match_params.py --rows 200000` to sweep batch sizes (and optionally `--sweep-shards`, `--sweep-memory`) and get a recommended config for your hardware.
 
 **Pre-partitioned B:** If you run multiple cross-matches with the same B, partition B once (e.g. `astrojoin.partition_catalog(...)`) and pass the shard directory as `catalog_b`. The engine will skip partitioning and load only the shards needed per A chunk.
 
 **keep_b_in_memory (default: False):** When `catalog_b` is a file, setting this to `True` partitions B into RAM instead of temp shard files, so there is no shard I/O after the initial B read. **This is not the default on purpose:** the project is *out-of-core* — it is designed to run on laptops and machines with limited RAM by streaming and using disk. Use `keep_b_in_memory=True` only when B is small enough to fit comfortably in memory (e.g. B is a few hundred MB and you have plenty of free RAM). On memory-constrained machines or for large B, leave it `False` so the engine stays within a bounded memory footprint.
+
+**Cancellation (Ctrl+C):** The engine invokes the progress callback after each chunk. If the callback returns `False`, the run stops at the next chunk boundary and raises an error (so Ctrl+C can take effect within a chunk or two instead of after the whole run). The benchmark and tune scripts install a SIGINT handler and pass a progress callback that returns `False` when you press Ctrl+C.
 
 ## Low-level I/O ideas (cross-platform)
 

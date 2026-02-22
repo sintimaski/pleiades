@@ -361,7 +361,8 @@ fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) ->
 }
 
 /// Progress callback type: (chunk_ix, total_or_none, rows_a_read, matches_count).
-pub type ProgressCallback = Option<Box<dyn Fn(usize, Option<usize>, u64, u64) + Send>>;
+/// Return true to continue, false to cancel (e.g. on Ctrl+C); engine stops at chunk boundary.
+pub type ProgressCallback = Option<Box<dyn Fn(usize, Option<usize>, u64, u64) -> bool + Send>>;
 
 #[inline]
 fn verbose_log(msg: &str) {
@@ -704,6 +705,22 @@ pub fn cross_match_impl(
     let t0 = std::time::Instant::now();
     let verbose = env::var("ASTROJOIN_VERBOSE").is_ok();
 
+    if verbose {
+        match std::thread::available_parallelism() {
+            Ok(p) => verbose_log(&format!(
+                "parallelism: {} threads (set RAYON_NUM_THREADS to override)",
+                p.get()
+            )),
+            Err(_) => verbose_log("parallelism: unknown (set RAYON_NUM_THREADS if needed)"),
+        }
+        let n_rayon = (0..1)
+            .into_par_iter()
+            .map(|_| rayon::current_num_threads())
+            .find_any(|_| true)
+            .unwrap_or(1);
+        verbose_log(&format!("Rayon pool: {} threads", n_rayon));
+    }
+
     let b_is_prepartitioned = catalog_b.is_dir();
     let _temp_partition: Option<TempDir>;
     let mut rows_b_from_partition: Option<u64> = None;
@@ -810,6 +827,7 @@ pub fn cross_match_impl(
     let mut rows_b_read: u64;
     let mut matches_count: u64 = 0;
     let mut chunks_processed: usize = 0;
+    let mut cancelled = false;
 
     while let Ok(msg) = rx_a.recv() {
         let batch_a = match msg {
@@ -972,7 +990,10 @@ pub fn cross_match_impl(
         matches_count += matches_id_a.len() as u64;
 
         if let Some(ref progress) = progress_callback {
-            progress(chunks_processed, None, rows_a_read, matches_count);
+            if !progress(chunks_processed, None, rows_a_read, matches_count) {
+                cancelled = true;
+                break;
+            }
         }
 
         if let Some(ref mut w) = writer {
@@ -1001,6 +1022,10 @@ pub fn cross_match_impl(
 
     if let Err(e) = reader_handle.join() {
         std::panic::resume_unwind(e);
+    }
+
+    if cancelled {
+        return Err("cancelled by user".into());
     }
 
     if let Some(r) = rows_b_from_partition {

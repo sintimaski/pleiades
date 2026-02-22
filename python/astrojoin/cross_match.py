@@ -379,7 +379,7 @@ def cross_match(
     use_rust: bool = True,
     n_nearest: int | None = None,
     keep_b_in_memory: bool = False,
-    progress_callback: Callable[[int, int | None, int, int], None] | None = None,
+    progress_callback: Callable[[int, int | None, int, int], None | bool] | None = None,
     include_coords: bool = False,
 ) -> CrossMatchResult:
     """
@@ -416,6 +416,10 @@ def cross_match(
     instead of temp shard files (faster but uses more memory). Default False
     on purpose: the pipeline is out-of-core and should run on limited RAM.
     Set True only when B is small enough to fit comfortably in memory.
+
+    progress_callback: if provided, called after each chunk with
+    (chunk_ix, total_or_none, rows_a_read, matches_count). Return False to
+    cancel (Rust engine stops at next chunk boundary; reduces Ctrl+C delay).
 
     Returns:
         CrossMatchResult with output_path, row counts, match count, and time.

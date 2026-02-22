@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -142,24 +143,45 @@ def main() -> int:
         batch_kw = {"batch_size_a": args.batch_size, "batch_size_b": args.batch_size}
     if args.keep_b_in_memory:
         batch_kw["keep_b_in_memory"] = True
-    if args.verbose:
-        # Per-chunk memory: callback runs after each chunk completes
-        def _progress_with_memory(chunk_ix: int, _total: int | None, rows_a: int, matches_count: int) -> None:
+
+    # Ctrl+C: set flag so progress_callback returns False next chunk (stops within ~1 chunk delay)
+    cancel_requested: list[bool] = [False]
+
+    def _on_sigint(_sig: int, _frame: object) -> None:
+        cancel_requested[0] = True
+        print("\nCancelling after current chunk...", flush=True)
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
+    def _progress(chunk_ix: int, total: int | None, rows_a: int, matches_count: int) -> bool:
+        if args.verbose:
             rss_bytes, is_peak = _get_max_rss_bytes()
             rss_str = _format_memory_bytes(rss_bytes) if rss_bytes is not None else "N/A"
             kind = "peak RSS" if is_peak else "current RSS"
-            print(f"[chunk {chunk_ix}] rows_a={rows_a} matches={matches_count} memory={rss_str} ({kind})", flush=True)
-        batch_kw["progress_callback"] = _progress_with_memory
+            print(
+                f"[chunk {chunk_ix}] rows_a={rows_a} matches={matches_count} memory={rss_str} ({kind})",
+                flush=True,
+            )
+        return not cancel_requested[0]
+
+    batch_kw["progress_callback"] = _progress
+
     for label, use_rust in runs:
         t0 = time.perf_counter()
-        result = astrojoin.cross_match(
-            catalog_a=path_a,
-            catalog_b=path_b,
-            radius_arcsec=args.radius,
-            output_path=out,
-            use_rust=use_rust,
-            **batch_kw,
-        )
+        try:
+            result = astrojoin.cross_match(
+                catalog_a=path_a,
+                catalog_b=path_b,
+                radius_arcsec=args.radius,
+                output_path=out,
+                use_rust=use_rust,
+                **batch_kw,
+            )
+        except OSError as e:
+            if "cancelled" in str(e).lower():
+                print("Cancelled.", flush=True)
+                return 130
+            raise
         elapsed = time.perf_counter() - t0
         max_rss, is_peak = _get_max_rss_bytes()
         print(
