@@ -113,7 +113,7 @@ uv run python scripts/benchmark_cross_match.py --rows 50000 --rust   # compare P
 
 ## Development
 
-- **Rust extension**: Recommended: `uv run maturin develop` (uses the project’s Python 3.10–3.13). If you use `cargo build --features python` and your default Python is 3.14 or newer, PyO3 will error; either set `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` to build with the stable ABI, or point to a 3.10–3.13 interpreter, e.g. `PYO3_PYTHON=python3.12 cargo build --features python`.
+- **Rust extension**: Recommended: `uv run maturin develop` (uses the project’s Python 3.10–3.12). If you use `cargo build --features python` and your default Python is outside that range, PyO3 may error; either set `PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1` to build with the stable ABI, or point to a supported interpreter, e.g. `PYO3_PYTHON=python3.12 cargo build --features python`.
 - **Lint/format**: `uv run ruff check . && uv run ruff format .`
 - **Type check**: `uv run mypy python/`
 - **Tests** (Python + Rust): `uv run python run_tests.py` — or Python only: `uv run pytest`. Add `--benchmark` to run a small cross-match benchmark after tests; use `--benchmark-only` to run only the benchmark (no tests); use `--rust` to include the Rust engine.
@@ -123,4 +123,4 @@ uv run python scripts/benchmark_cross_match.py --rows 50000 --rust   # compare P
 
 ## License
 
-See repository license.
+MIT License. See [LICENSE](LICENSE).

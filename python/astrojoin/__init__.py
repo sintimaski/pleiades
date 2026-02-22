@@ -16,10 +16,12 @@ from astrojoin.analysis import (
 from astrojoin.cone import batch_cone_search, cone_search
 from astrojoin.cross_match import cross_match, cross_match_iter, partition_catalog
 from astrojoin.models import CrossMatchResult, MatchSummary
+from astrojoin.validation import CatalogValidationError
 
 __all__ = [
     "attach_match_coords",
     "batch_cone_search",
+    "CatalogValidationError",
     "cone_search",
     "cross_match",
     "cross_match_iter",

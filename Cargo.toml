@@ -3,6 +3,7 @@ name = "astrojoin-core"
 version = "0.1.0"
 edition = "2021"
 description = "Rust engine for out-of-core spatial cross-matching (HEALPix + Arrow)"
+license = "MIT"
 
 [lib]
 name = "astrojoin_core"

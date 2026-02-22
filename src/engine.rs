@@ -1,5 +1,9 @@
 //! Cross-match engine: stream Parquet A/B, HEALPix index, haversine join, write matches.
 //! Supports pre-partitioned B (shard directory), n_nearest, parallelism, and progress callback.
+//!
+//! Uses `.expect()`/`.unwrap()` only on Arrow schema and column types that we control
+//! (Parquet read with known ra/dec/id columns); invalid external data is rejected by the
+//! Python validation layer before the engine is invoked.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};

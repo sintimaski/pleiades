@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def _path(s: str) -> Path:
+    """Convert a CLI path string to a Path (used for type consistency)."""
     return Path(s)
 
 

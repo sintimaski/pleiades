@@ -3,6 +3,8 @@
 //! Built as a Python extension via PyO3/Maturin. Uses cdshealpix (HEALPix),
 //! Arrow/Parquet for streaming I/O, and haversine for angular distance.
 
+#![forbid(unsafe_code)]
+
 pub mod engine;
 
 #[cfg(feature = "python")]
@@ -90,7 +92,7 @@ fn cross_match(
     dict.set_item("time_seconds", stats.time_seconds)?;
     Ok(dict
         .into_pyobject(py)
-        .unwrap()
+        .expect("PyDict into_pyobject")
         .into_any()
         .unbind())
 }
