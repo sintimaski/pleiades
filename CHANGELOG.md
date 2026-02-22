@@ -6,6 +6,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- **B prefetch overlap:** Send current and next chunk’s B load requests at chunk start; index runs in parallel with load B for the first chunk, join with load B for the next (two requests in flight).
+- **load_one_shard fast path:** Downcast columns once per batch, slice access for ra/dec, reserve capacity, Int64 id_b specialization; 128k-row batch size for shard Parquet reads.
+- **macOS:** Optional feature `macos_readahead` (build with `--features macos_readahead`) enables kernel read-ahead on shard files via `fcntl(F_RDAHEAD)`.
+- **I/O profiling:** `scripts/profile_io.sh` runs the benchmark under `time -l` and optionally `fs_usage` (macOS) for disk I/O and resource stats.
+
 ### Changed
 
 - **Rust only:** `cross_match()` always uses the Rust engine
@@ -14,6 +21,7 @@
   - CLI `--rust` / `--no-rust` removed
 - Docs and benchmarks updated (README, scripts)
 - Parquet 52 compatibility in Rust; ruff/mypy and test cleanups
+- Crate: `#![forbid(unsafe_code)]` relaxed only when `macos_readahead` is enabled (single fcntl FFI)
 
 ---
 

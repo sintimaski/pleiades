@@ -3,7 +3,8 @@
 //! Built as a Python extension via PyO3/Maturin. Uses cdshealpix (HEALPix),
 //! Arrow/Parquet for streaming I/O, and haversine for angular distance.
 
-#![forbid(unsafe_code)]
+// Forbid unsafe except when macos_readahead is enabled (single fcntl FFI call in engine).
+#![cfg_attr(not(feature = "macos_readahead"), forbid(unsafe_code))]
 
 pub mod engine;
 

@@ -58,6 +58,8 @@ When B is loaded from shards, cost is **Parquet decode** + **copy into Rust stru
 - **Large batch size** (`SHARD_READ_BATCH_ROWS` 128k): fewer decode cycles and larger reads.
 - **Fast path in `load_one_shard`**: Shard schema is fixed (UInt64 pixel_id, Float64 ra/dec from `partition_b_to_temp`). We downcast columns once per batch, use slice access for ra/dec (`ra_arr.values()[row]`), reserve capacity, and specialize Int64 `id_b` to avoid per-row `get_id_value` dispatch and extra branches.
 
+**macOS:** Optional build feature `macos_readahead` enables `fcntl(F_RDAHEAD)` on opened shard files so the kernel does read-ahead for sequential Parquet reads. Build with `maturin develop --features macos_readahead` on macOS.
+
 Possible later improvements: columnar B representation (`ra_b: &[f64], dec_b: &[f64]`) so the join hot path streams ra/dec without touching ids; predicate pushdown on shard Parquet by pixel_id if the format allows.
 
 ---
@@ -69,7 +71,7 @@ Possible later improvements: columnar B representation (`ra_b: &[f64], dec_b: &[
 - **A reads:** A dedicated thread prefetches catalog A (1–2 batches ahead) so Parquet I/O overlaps with join work. Main thread consumes batches; reader thread keeps filling the channel.
 - **B reads (shards):** When `catalog_b` is a directory of shards, **multiple shard files are read in parallel** (Rayon `par_iter` over the shard indices needed for the chunk). So many threads read different `shard_*.parquet` files at once.
 - **Join:** The inner B-loop (haversine, candidate search) is parallelized with Rayon over B rows. Thread count follows `RAYON_NUM_THREADS` or `std::thread::available_parallelism()`.
-- **B prefetch:** When using shards, a second background thread loads the *next* chunk’s B rows while the main thread runs the join for the *current* chunk (pipeline overlap).
+- **B prefetch:** When using shards, a background thread loads B for the current and next chunk (two requests in flight). The main thread sends both at chunk start, builds the index (while current B loads), then runs the join (while next B loads). So index and load B overlap for the first chunk, and join and load-next-B overlap for every chunk.
 - **Index build (A chunk):** Building the HEALPix index (pixel → row indices) and `id_a_flat` for each A chunk is done in parallel with Rayon (`par_iter` + `fold_with`/`reduce_with`), so this hot path is no longer sequential.
 
 **Still single-threaded:**

@@ -27,6 +27,7 @@ uv add pleiades
 
 - Wheels include the Rust extension (Python 3.10–3.12)
 - From source: `uv sync` then `uv run maturin develop`
+- **macOS:** for faster shard I/O, build with read-ahead enabled: `uv run maturin develop --features macos_readahead`
 - Real catalogs: [DATA_SOURCES.md](DATA_SOURCES.md)
 
 ---
@@ -168,7 +169,7 @@ uv run python scripts/generate_benchmark_fixtures.py   # big fixtures
 | `python/pleiades_core/` | Rust bindings (maturin) |
 | `src/`               | Rust engine |
 | `tests/`             | Unit + integration |
-| `scripts/`           | Benchmarks, fixtures |
+| `scripts/`           | Benchmarks, fixtures, I/O profiling (`profile_io.sh`) |
 
 ### Dev
 
@@ -180,6 +181,7 @@ uv run pytest tests/
 # or: uv run python run_tests.py --benchmark
 ```
 
+- **I/O profiling (macOS):** `./scripts/profile_io.sh` runs the benchmark under `time -l`; use `--fs-usage` for file-level I/O (requires sudo).
 - Publish: `maturin build --release`, `maturin publish`; use CI for multi-platform wheels
 
 ---

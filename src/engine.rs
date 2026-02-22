@@ -15,6 +15,9 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
+#[cfg(all(target_os = "macos", feature = "macos_readahead"))]
+use std::os::unix::io::AsRawFd;
+
 use tempfile::TempDir;
 
 use arrow::array::{
@@ -35,6 +38,20 @@ use rayon::prelude::*;
 const SHARD_WRITE_BUFFER_BYTES: usize = 256 * 1024; // 256 KiB
 /// Batch size when reading shard Parquet (larger = fewer decode cycles and larger I/O chunks).
 const SHARD_READ_BATCH_ROWS: usize = 131_072; // 128k
+
+/// On macOS, enable read-ahead on the file descriptor so sequential Parquet reads can be faster.
+#[cfg(all(target_os = "macos", feature = "macos_readahead"))]
+fn set_readahead(file: &File) {
+    // F_RDAHEAD = 64 on Darwin (bsd/sys/fcntl.h)
+    const F_RDAHEAD: libc::c_int = 64;
+    let fd = file.as_raw_fd();
+    unsafe {
+        libc::fcntl(fd, F_RDAHEAD, 1);
+    }
+}
+
+#[cfg(not(all(target_os = "macos", feature = "macos_readahead")))]
+fn set_readahead(_file: &File) {}
 
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
@@ -283,6 +300,7 @@ fn load_one_shard(
     pixels_wanted: &HashSet<u64>,
 ) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
     let file = File::open(path)?;
+    set_readahead(&file);
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
         .with_batch_size(SHARD_READ_BATCH_ROWS)
         .build()?;
@@ -888,7 +906,7 @@ pub fn cross_match_impl(
     let use_b_prefetch = shard_dir.is_some() && b_in_memory.is_none();
     let a_channel_cap = if use_b_prefetch { 2 } else { 1 };
     if verbose && use_b_prefetch {
-        verbose_log("B prefetch: overlapping load B with join (two A batches ahead)");
+        verbose_log("B prefetch: overlap index||load B and join||load B (two requests in flight)");
     }
 
     // Prefetch thread: read catalog A batches one ahead (or two when B prefetch) so I/O overlaps with compute.
@@ -929,8 +947,9 @@ pub fn cross_match_impl(
     });
 
     type BLoadResult = Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>>;
-    let (tx_b_request, rx_b_request) = mpsc::sync_channel::<Option<HashSet<u64>>>(1);
-    let (tx_b_response, rx_b_response) = mpsc::sync_channel::<BLoadResult>(1);
+    // Capacity 2: send current + next B request so index||load B and join||load B overlap.
+    let (tx_b_request, rx_b_request) = mpsc::sync_channel::<Option<HashSet<u64>>>(2);
+    let (tx_b_response, rx_b_response) = mpsc::sync_channel::<BLoadResult>(2);
     let b_prefetch_handle = if use_b_prefetch {
         let shard_dir_b = shard_dir.as_ref().unwrap().clone();
         Some(thread::spawn(move || {
@@ -999,6 +1018,21 @@ pub fn cross_match_impl(
 
         let (ra_deg_a, dec_deg_a) = ra_dec_degrees(&batch_a, ra_idx, dec_idx, from_radians)?;
 
+        let pixels_wanted = pixels_in_chunk_with_neighbors(&ra_deg_a, &dec_deg_a, depth);
+        // Send B load requests so prefetch runs in parallel: current chunk (when first), and next chunk.
+        if use_b_prefetch {
+            if prefetched_b.is_none() {
+                let _ = tx_b_request.send(Some(pixels_wanted.clone()));
+            }
+            if let Some(ref next) = next_batch {
+                let ra_idx_n = column_index(next, ra_col);
+                let dec_idx_n = column_index(next, dec_col);
+                let (ra_n, dec_n) = ra_dec_degrees(next, ra_idx_n, dec_idx_n, from_radians)?;
+                let pixels_next = pixels_in_chunk_with_neighbors(&ra_n, &dec_n, depth);
+                let _ = tx_b_request.send(Some(pixels_next));
+            }
+        }
+
         let t_index = std::time::Instant::now();
         // Build id_a_flat and HEALPix index in parallel (was sequential hot path).
         let id_a_flat: Vec<IdVal> = (0..n_a)
@@ -1044,28 +1078,13 @@ pub fn cross_match_impl(
             );
         }
         let t_load = std::time::Instant::now();
-        let pixels_wanted = pixels_in_chunk_with_neighbors(&ra_deg_a, &dec_deg_a, depth);
-        if use_b_prefetch {
-            if let Some(ref next) = next_batch {
-                let ra_idx_n = column_index(next, ra_col);
-                let dec_idx_n = column_index(next, dec_col);
-                let (ra_n, dec_n) = ra_dec_degrees(next, ra_idx_n, dec_idx_n, from_radians)?;
-                let pixels_next = pixels_in_chunk_with_neighbors(&ra_n, &dec_n, depth);
-                let _ = tx_b_request.send(Some(pixels_next));
-            }
-        }
         let b_rows = if use_b_prefetch {
-            prefetched_b
-                .take()
-                .unwrap_or_else(|| {
-                    load_b_from_shards(
-                        shard_dir.as_ref().unwrap(),
-                        &pixels_wanted,
-                        n_shards,
-                        from_radians,
-                    )
-                    .expect("load B for first chunk")
-                })
+            prefetched_b.take().unwrap_or_else(|| {
+                rx_b_response
+                    .recv()
+                    .expect("recv B for current chunk")
+                    .expect("load B")
+            })
         } else if let Some(ref buf) = b_in_memory {
             load_b_from_memory(buf, &pixels_wanted, n_shards)
         } else {
