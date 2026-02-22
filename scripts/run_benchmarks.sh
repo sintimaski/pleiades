@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run benchmarks using pregenerated fixtures (100k, 1M, 50M rows) and write logs.
+# Keeps only the 10 most recent runs in logs/ (older log files are removed).
 #
 # Generate fixtures first (one-time or when missing):
 #   uv run python scripts/generate_benchmark_fixtures.py
@@ -13,6 +14,7 @@
 
 set -euo pipefail
 
+KEEP_LAST_N_RUNS=10
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOGS_DIR="${PROJECT_ROOT}/logs"
@@ -23,10 +25,18 @@ LOG_STDERR="${LOGS_DIR}/benchmark_${TIMESTAMP}.stderr.log"
 
 mkdir -p "$LOGS_DIR"
 
+# Prune logs: keep only the $KEEP_LAST_N_RUNS most recent runs (by mtime)
+# Each run has benchmark_<timestamp>.log and optionally .stderr.log
+prune_logs() {
+  (cd "$LOGS_DIR" && ls -t benchmark_*.log 2>/dev/null) | tail -n +$((KEEP_LAST_N_RUNS + 1)) | while read -r f; do
+    rm -f "${LOGS_DIR}/${f}" "${LOGS_DIR}/${f%.log}.stderr.log"
+  done
+}
+
 cd "$PROJECT_ROOT"
 echo "Running benchmarks (pregenerated fixture)"
 echo "  fixtures dir: $FIXTURES_DIR"
-echo "  log: $LOG_STDOUT"
+echo "  log: $LOG_STDOUT (logs/ keeps last $KEEP_LAST_N_RUNS runs)"
 echo "  extra args: ${*:-none}"
 echo "---"
 
@@ -39,6 +49,8 @@ uv run python scripts/benchmark_cross_match.py \
     --catalog-b "$CATALOG_B" \
     --verbose \
     "$@" > "$LOG_STDOUT"
+
+prune_logs
 
 echo "---"
 echo "Done. Log: $LOG_STDOUT"

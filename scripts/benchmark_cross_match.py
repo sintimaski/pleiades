@@ -226,10 +226,14 @@ def main() -> int:
             raise
         elapsed = time.perf_counter() - t0
         max_rss, is_peak = _get_max_rss_bytes()
+        pairs = result.rows_a_read * result.rows_b_read
+        pairs_per_sec = pairs / elapsed if elapsed > 0 else 0
+        rows_per_sec = result.rows_a_read / elapsed if elapsed > 0 else 0
         print(
             f"{label}: {result.rows_a_read} x {result.rows_b_read} -> "
             f"{result.matches_count} matches in {elapsed:.2f}s "
-            f"({result.rows_a_read * result.rows_b_read / 1e9:.4f} G pairs)"
+            f"({pairs / 1e9:.4f} G pairs) "
+            f"| {pairs_per_sec / 1e6:.2f} M pairs/s, {rows_per_sec / 1e6:.2f} M rows(A)/s"
         )
         if max_rss is not None:
             kind = "peak RSS" if is_peak else "current RSS"
