@@ -55,3 +55,6 @@ Thumbs.db
 !tests/fixtures/*.parquet
 # POC / large generated data
 data/
+
+# Tests and benchmarks
+logs/

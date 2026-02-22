@@ -27,8 +27,12 @@ use arrow::record_batch::{RecordBatch, RecordBatchReader};
 use cdshealpix::nested::{self, get};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
+
+/// Larger write buffer for temp shard files (fewer syscalls).
+const SHARD_WRITE_BUFFER_BYTES: usize = 256 * 1024; // 256 KiB
 
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
@@ -399,6 +403,10 @@ fn partition_b_to_temp(
     let arrow_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size_b).build()?;
 
+    let temp_shard_props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .build();
+
     let first_batch = match reader.next() {
         Some(Ok(b)) => b,
         Some(Err(e)) => return Err(e.into()),
@@ -416,9 +424,9 @@ fn partition_b_to_temp(
                 let path = shard_dir.join(format!("shard_{:04}.parquet", s));
                 let f = File::create(&path).map_err(|e| format!("create shard {}: {}", s, e))?;
                 let mut w = ArrowWriter::try_new(
-                    BufWriter::new(f),
+                    BufWriter::with_capacity(SHARD_WRITE_BUFFER_BYTES, f),
                     Arc::clone(&shard_schema),
-                    Some(WriterProperties::builder().build()),
+                    Some(temp_shard_props.clone()),
                 )?;
                 w.write(&RecordBatch::new_empty(Arc::clone(&shard_schema)))?;
                 w.close()?;
@@ -442,9 +450,9 @@ fn partition_b_to_temp(
             let path = shard_dir.join(format!("shard_{:04}.parquet", s));
             let f = File::create(&path).map_err(|e| format!("create shard {}: {}", s, e))?;
             let mut w = ArrowWriter::try_new(
-                BufWriter::new(f),
+                BufWriter::with_capacity(SHARD_WRITE_BUFFER_BYTES, f),
                 Arc::clone(&shard_schema),
-                Some(WriterProperties::builder().build()),
+                Some(temp_shard_props.clone()),
             )?;
             w.write(&RecordBatch::new_empty(Arc::clone(&shard_schema)))?;
             w.close()?;
@@ -464,9 +472,9 @@ fn partition_b_to_temp(
             let path = shard_dir.join(format!("shard_{:04}.parquet", s));
             let f = File::create(&path).map_err(|e| format!("create shard {}: {}", s, e))?;
             Ok(Some(ArrowWriter::try_new(
-                BufWriter::new(f),
+                BufWriter::with_capacity(SHARD_WRITE_BUFFER_BYTES, f),
                 Arc::clone(&shard_schema),
-                Some(WriterProperties::builder().build()),
+                Some(temp_shard_props.clone()),
             )?))
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;

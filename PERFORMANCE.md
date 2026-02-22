@@ -44,6 +44,8 @@ Concepts or tools that can reduce I/O time and work across OSes (Windows, macOS,
 
 **Practical order to try:** (1) Larger batch sizes and buffer sizes (stay out-of-core); (2) temp dir on fast disk (SSD); (3) if still I/O-bound and B is small enough to fit in RAM, consider `keep_b_in_memory=True`; (4) mmap or overlapped B loading; (5) sequential access hints and compression choices for temp shards.
 
+**What the engine does for I/O:** Temp shard files (when not using `keep_b_in_memory`) are written with **no compression** and **256 KiB write buffers** to speed up partition and shard reads. For runs where B has ~1M rows and you have enough RAM, use **`--keep-b-in-memory`** (or `keep_b_in_memory=True` in the API): B is partitioned once into RAM and no shard I/O happens per chunk, so "load B" time goes away. Also set **`TMPDIR`** (or the platform temp dir) to an SSD so partition writes and shard reads are fast.
+
 ## Further CPU improvements
 
 - **SIMD (easy, cross-platform):** The inner hot path is haversine distance per (A, B) pair. Vectorizing this is the most impactful “acceleration” that works on all platforms:
