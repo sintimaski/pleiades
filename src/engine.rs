@@ -1019,20 +1019,22 @@ pub fn cross_match_impl(
                             dec as f32
                         })
                         .collect();
-                    match crate::gpu::haversine_pairs_gpu(
+                    let a_ix_u32: Vec<u32> = pairs.iter().map(|&(a, _)| a as u32).collect();
+                    let b_ix_u32: Vec<u32> = pairs.iter().map(|&(_, b)| b as u32).collect();
+                    match crate::gpu::haversine_pairs_gpu_compact(
                         &ra_a_f32,
                         &dec_a_f32,
                         &ra_b_f32,
                         &dec_b_f32,
+                        &a_ix_u32,
+                        &b_ix_u32,
+                        radius as f32,
                     ) {
-                        Ok(seps_f32) => {
-                            for (i, &(a_ix, b_ix)) in pairs.iter().enumerate() {
-                                let sep = seps_f32[i] as f64;
-                                if sep <= radius {
-                                    matches_id_a.push(id_a_flat[a_ix].clone());
-                                    matches_id_b.push(b_rows[b_ix].0.clone());
-                                    matches_sep.push(sep);
-                                }
+                        Ok(gpu_matches) => {
+                            for (a_ix, b_ix, sep) in gpu_matches {
+                                matches_id_a.push(id_a_flat[a_ix as usize].clone());
+                                matches_id_b.push(b_rows[b_ix as usize].0.clone());
+                                matches_sep.push(sep as f64);
                             }
                             if verbose {
                                 verbose_log_timed("  join (GPU)", t_join.elapsed().as_secs_f64(), &format!("({} matches)", matches_id_a.len()));

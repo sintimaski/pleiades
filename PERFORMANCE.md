@@ -71,7 +71,10 @@ There is **no single “easy and cross-platform”** GPU path that works everywh
 
 ### wgpu backend (optional)
 
-An optional **wgpu** backend is available for the haversine distance kernel. It uses a WGSL compute shader to compute angular separation (arcsec) for the candidate (A, B) pairs produced by the HEALPix index; the rest of the pipeline (Parquet I/O, HEALPix indexing, match filtering, output) is unchanged.
+An optional **wgpu** backend is available for the join phase. It does the following on GPU:
+
+- **Haversine + radius filter + compact output:** One compute shader computes angular separation (arcsec) for each candidate (A, B) pair, filters by radius on the GPU, and writes only matches `(a_ix, b_ix, sep)` via an atomic counter. So the CPU reads back only the match list (not all pair distances), which reduces transfer and avoids a separate CPU filter step.
+- **Candidate pairs** are still built on the CPU from the HEALPix index (same as before). Moving HEALPix hashing and pair construction to the GPU would require porting the nested scheme to WGSL and a GPU-friendly index layout; it is left as future work.
 
 **How to enable**
 
