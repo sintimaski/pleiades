@@ -8,9 +8,13 @@ reliably at scale. For pre-generated files (e.g. to avoid OOM), use
 With --verbose, sets ASTROJOIN_VERBOSE=1 so the Rust engine prints timing logs
 (index, load B, join, write per chunk; partition B and total) to stderr.
 
+For best throughput, build the Rust extension in release mode:
+  uv run maturin develop --release
+
 Usage:
   uv run python scripts/benchmark_cross_match.py [--rows 100000] [--rust]
   uv run python scripts/benchmark_cross_match.py --rows 1000000 --rust --verbose
+  uv run python scripts/benchmark_cross_match.py --rows 500000 --batch-size 250000
   uv run python scripts/benchmark_cross_match.py --catalog-a path/a.parquet --catalog-b path/b.parquet -o out.parquet
 """
 
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -25,6 +30,31 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+def _get_max_rss_bytes() -> tuple[float | None, bool]:
+    """Return (peak or current RSS in bytes, True if peak else current), or (None, False) if unavailable."""
+    if sys.platform == "win32":
+        try:
+            import psutil
+            return (float(psutil.Process().memory_info().rss), False)  # current
+        except ImportError:
+            return (None, False)
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        # macOS: ru_maxrss in bytes; Linux: in kilobytes
+        if sys.platform == "darwin":
+            return (float(ru.ru_maxrss), True)
+        return (float(ru.ru_maxrss) * 1024, True)
+    except (ImportError, AttributeError):
+        return (None, False)
+
+
+def _format_memory_bytes(b: float) -> str:
+    if b >= 1024 ** 3:
+        return f"{b / 1024**3:.2f} GiB"
+    return f"{b / 1024**2:.2f} MiB"
 
 
 def generate_catalog(
@@ -71,6 +101,12 @@ def main() -> int:
         action="store_true",
         help="Set ASTROJOIN_VERBOSE=1 for Rust engine timing logs (stderr)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override batch_size_a and batch_size_b (default 100000); larger = fewer chunks, more RAM",
+    )
     args = parser.parse_args()
     n_b = args.rows_b if args.rows_b is not None else args.rows
 
@@ -94,9 +130,10 @@ def main() -> int:
         generate_catalog(path_a, args.rows, 42, "source_id")
         generate_catalog(path_b, n_b, 123, "object_id")
 
-    print(f"Generated {args.rows} for catalogs a and b")
-
     runs: list[tuple[str, bool]] = [("Rust", True)]
+    batch_kw: dict = {}
+    if args.batch_size is not None:
+        batch_kw = {"batch_size_a": args.batch_size, "batch_size_b": args.batch_size}
     for label, use_rust in runs:
         t0 = time.perf_counter()
         result = astrojoin.cross_match(
@@ -105,13 +142,20 @@ def main() -> int:
             radius_arcsec=args.radius,
             output_path=out,
             use_rust=use_rust,
+            **batch_kw,
         )
         elapsed = time.perf_counter() - t0
+        max_rss, is_peak = _get_max_rss_bytes()
         print(
             f"{label}: {result.rows_a_read} x {result.rows_b_read} -> "
             f"{result.matches_count} matches in {elapsed:.2f}s "
             f"({result.rows_a_read * result.rows_b_read / 1e9:.4f} G pairs)"
         )
+        if max_rss is not None:
+            kind = "peak RSS" if is_peak else "current RSS"
+            print(f"Max memory: {_format_memory_bytes(max_rss)} ({kind})")
+        else:
+            print("Max memory: N/A (install psutil on Windows for current RSS)")
     return 0
 
 

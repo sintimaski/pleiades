@@ -29,6 +29,8 @@ use cdshealpix::nested::{self, get};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
+
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 const RAD_TO_ARCSEC: f64 = RAD_TO_DEG * 3600.0;
@@ -206,7 +208,50 @@ fn list_shard_paths(shard_dir: &Path) -> Result<(Vec<std::path::PathBuf>, usize)
     Ok((paths, n))
 }
 
-/// Load B rows from pre-partitioned shards for the given set of pixel IDs.
+/// Load one shard file, return rows whose pixel_id is in pixels_wanted. Shard ra/dec are in degrees.
+fn load_one_shard(
+    path: &Path,
+    pixels_wanted: &HashSet<u64>,
+) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+    let file = File::open(path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+    let mut out: Vec<(IdVal, f64, f64)> = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let pix_col = batch.column(column_index(&batch, "pixel_id"));
+        let ra_col = batch.column(column_index(&batch, "ra"));
+        let dec_col = batch.column(column_index(&batch, "dec"));
+        let id_b_idx = column_index(&batch, "id_b");
+        for row in 0..batch.num_rows() {
+            let pix_val = match pix_col.data_type() {
+                DataType::UInt64 => pix_col.as_any().downcast_ref::<UInt64Array>().unwrap().value(row),
+                DataType::Int64 => pix_col.as_any().downcast_ref::<Int64Array>().unwrap().value(row) as u64,
+                _ => continue,
+            };
+            if !pixels_wanted.contains(&pix_val) {
+                continue;
+            }
+            let id_val = get_id_value(&batch, "id_b", id_b_idx, row);
+            let ra = match ra_col.data_type() {
+                DataType::Float64 => ra_col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
+                DataType::Float32 => f64::from(ra_col.as_any().downcast_ref::<Float32Array>().unwrap().value(row)),
+                _ => continue,
+            };
+            let dec = match dec_col.data_type() {
+                DataType::Float64 => dec_col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
+                DataType::Float32 => f64::from(dec_col.as_any().downcast_ref::<Float32Array>().unwrap().value(row)),
+                _ => continue,
+            };
+            out.push((id_val, ra, dec));
+        }
+    }
+    Ok(out)
+}
+
+/// Load B rows from pre-partitioned shards for the given set of pixel IDs (shards loaded in parallel).
 /// Shard index = pixel_id % n_shards. Returns (id_b, ra_deg, dec_deg) for each row.
 /// Shard files always store ra/dec in degrees (written by partition_b_to_temp).
 fn load_b_from_shards(
@@ -216,47 +261,23 @@ fn load_b_from_shards(
     _from_radians: bool,
 ) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
     let (paths, _) = list_shard_paths(shard_dir)?;
-    let shard_indices: HashSet<usize> = pixels_wanted.iter().map(|&p| (p % n_shards as u64) as usize).collect();
-    let mut out: Vec<(IdVal, f64, f64)> = Vec::new();
-    for &s in &shard_indices {
-        if s >= paths.len() {
-            continue;
-        }
-        let file = File::open(&paths[s])?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-        for batch in reader {
-            let batch = batch?;
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let pix_col = batch.column(column_index(&batch, "pixel_id"));
-            let _id_col = batch.column(column_index(&batch, "id_b"));
-            let ra_col = batch.column(column_index(&batch, "ra"));
-            let dec_col = batch.column(column_index(&batch, "dec"));
-            for row in 0..batch.num_rows() {
-                let pix_val = match pix_col.data_type() {
-                    DataType::UInt64 => pix_col.as_any().downcast_ref::<UInt64Array>().unwrap().value(row),
-                    DataType::Int64 => pix_col.as_any().downcast_ref::<Int64Array>().unwrap().value(row) as u64,
-                    _ => continue,
-                };
-                if !pixels_wanted.contains(&pix_val) {
-                    continue;
-                }
-                let id_val = get_id_value(&batch, "id_b", column_index(&batch, "id_b"), row);
-                let ra = match ra_col.data_type() {
-                    DataType::Float64 => ra_col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
-                    DataType::Float32 => f64::from(ra_col.as_any().downcast_ref::<Float32Array>().unwrap().value(row)),
-                    _ => continue,
-                };
-                let dec = match dec_col.data_type() {
-                    DataType::Float64 => dec_col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
-                    DataType::Float32 => f64::from(dec_col.as_any().downcast_ref::<Float32Array>().unwrap().value(row)),
-                    _ => continue,
-                };
-                out.push((id_val, ra, dec));
-            }
-        }
-    }
+    let shard_indices: Vec<usize> = pixels_wanted
+        .iter()
+        .map(|&p| (p % n_shards as u64) as usize)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let vecs: Vec<Result<Vec<(IdVal, f64, f64)>, _>> = shard_indices
+        .par_iter()
+        .filter(|&&s| s < paths.len())
+        .map(|&s| load_one_shard(&paths[s], pixels_wanted))
+        .collect();
+    let out: Vec<(IdVal, f64, f64)> = vecs
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     Ok(out)
 }
 
@@ -351,13 +372,20 @@ fn partition_b_to_temp(
         let dec_idx = column_index(batch, dec_col);
         let id_b_idx = column_index(batch, &id_b_name);
         let (ra_deg, dec_deg) = ra_dec_degrees(batch, ra_idx, dec_idx, from_radians)?;
-        for row in 0..batch.num_rows() {
-            let lon = ra_deg[row] * DEG_TO_RAD;
-            let lat = dec_deg[row] * DEG_TO_RAD;
-            let pixel_id = layer.hash(lon, lat);
-            let shard_ix = (pixel_id % n_shards as u64) as usize;
-            let id_val = get_id_value(batch, &id_b_name, id_b_idx, row);
-            buffers[shard_ix].push((pixel_id, id_val, ra_deg[row], dec_deg[row]));
+        let n = batch.num_rows();
+        let row_results: Vec<(usize, u64, IdVal, f64, f64)> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let lon = ra_deg[row] * DEG_TO_RAD;
+                let lat = dec_deg[row] * DEG_TO_RAD;
+                let pixel_id = layer.hash(lon, lat);
+                let shard_ix = (pixel_id % n_shards as u64) as usize;
+                let id_val = get_id_value(batch, &id_b_name, id_b_idx, row);
+                (shard_ix, pixel_id, id_val, ra_deg[row], dec_deg[row])
+            })
+            .collect();
+        for (shard_ix, pixel_id, id_val, ra, dec) in row_results {
+            buffers[shard_ix].push((pixel_id, id_val, ra, dec));
         }
         for (s, buf) in buffers.iter_mut().enumerate() {
             while buf.len() >= FLUSH_AT {
@@ -616,21 +644,34 @@ pub fn cross_match_impl(
             verbose_log_timed("  load B", t_load.elapsed().as_secs_f64(), &format!("({} rows)", n_b_loaded));
         }
         let t_join = std::time::Instant::now();
-        for (id_b_val, ra_b_deg, dec_b_deg) in &b_rows {
-            let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
-            let mut pixels_to_look = vec![center_pix];
-            nested::append_bulk_neighbours(depth, center_pix, &mut pixels_to_look);
-            for pix in &pixels_to_look {
-                if let Some(candidates) = index.get(pix) {
-                    for (id_a, ra_a, dec_a) in candidates {
-                        let sep = haversine_arcsec(*ra_a, *dec_a, *ra_b_deg, *dec_b_deg);
-                        if sep <= radius_arcsec {
-                            matches_id_a.push(id_a.clone());
-                            matches_id_b.push(id_b_val.clone());
-                            matches_sep.push(sep);
+        let index_ref = &index;
+        let radius = radius_arcsec;
+        let depth_local = depth;
+        let per_row: Vec<Vec<(IdVal, IdVal, f64)>> = b_rows
+            .par_iter()
+            .map(|(id_b_val, ra_b_deg, dec_b_deg)| {
+                let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
+                let mut pixels_to_look = vec![center_pix];
+                nested::append_bulk_neighbours(depth_local, center_pix, &mut pixels_to_look);
+                let mut row_matches = Vec::new();
+                for pix in &pixels_to_look {
+                    if let Some(candidates) = index_ref.get(pix) {
+                        for (id_a, ra_a, dec_a) in candidates {
+                            let sep = haversine_arcsec(*ra_a, *dec_a, *ra_b_deg, *dec_b_deg);
+                            if sep <= radius {
+                                row_matches.push((id_a.clone(), id_b_val.clone(), sep));
+                            }
                         }
                     }
                 }
+                row_matches
+            })
+            .collect();
+        for row_matches in per_row {
+            for (id_a, id_b, sep) in row_matches {
+                matches_id_a.push(id_a);
+                matches_id_b.push(id_b);
+                matches_sep.push(sep);
             }
         }
         if verbose {
