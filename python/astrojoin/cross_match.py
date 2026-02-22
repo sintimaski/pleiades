@@ -407,6 +407,10 @@ def cross_match(
     ra_dec_units: "deg" (default) or "rad" — units of ra/dec columns in the
     catalogs. Used when use_rust=True; Python fallback assumes degrees.
 
+    batch_size_a, batch_size_b: rows per Parquet read chunk (default 100k each).
+    Smaller values use less RAM and are better on memory-constrained machines
+    (e.g. laptops); larger values reduce I/O overhead.
+
     Returns:
         CrossMatchResult with output_path, row counts, match count, and time.
     """

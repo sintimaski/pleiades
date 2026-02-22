@@ -1,8 +1,10 @@
 //! Cross-match engine: stream Parquet A/B, HEALPix index, haversine join, write matches.
 //! Supports pre-partitioned B (shard directory), n_nearest, parallelism, and progress callback.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -314,7 +316,7 @@ pub fn cross_match_impl(
     let mut first_dt_a: Option<DataType> = None;
     let mut first_dt_b: Option<DataType> = None;
     let mut out_schema: Option<Arc<Schema>> = None;
-    let mut writer: Option<ArrowWriter<File>> = None;
+    let mut writer: Option<ArrowWriter<BufWriter<File>>> = None;
     let mut rows_a_read: u64 = 0;
     let mut rows_b_read: u64 = 0;
     let mut matches_count: u64 = 0;
@@ -414,7 +416,7 @@ pub fn cross_match_impl(
                 ])));
                 let out_file = File::create(output_path)?;
                 writer = Some(ArrowWriter::try_new(
-                    out_file,
+                    BufWriter::new(out_file),
                     out_schema.clone().unwrap(),
                     Some(WriterProperties::builder().build()),
                 )?);
@@ -501,7 +503,7 @@ pub fn cross_match_impl(
                     ])));
                     let out_file = File::create(output_path)?;
                     writer = Some(ArrowWriter::try_new(
-                        out_file,
+                        BufWriter::new(out_file),
                         out_schema.clone().unwrap(),
                         Some(WriterProperties::builder().build()),
                     )?);
@@ -563,7 +565,7 @@ pub fn cross_match_impl(
         let empty_batch = RecordBatch::new_empty(empty_schema.clone());
         let out_file = File::create(output_path)?;
         let mut w = ArrowWriter::try_new(
-            out_file,
+            BufWriter::new(out_file),
             empty_schema,
             Some(WriterProperties::builder().build()),
         )?;
@@ -596,7 +598,35 @@ pub fn cross_match_impl(
     })
 }
 
+/// Entry for the per-id_a max-heap: keep n_nearest smallest by separation.
+#[derive(Clone)]
+struct NearestEntry {
+    sep: f64,
+    id_b: IdVal,
+}
+
+impl PartialEq for NearestEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.sep.total_cmp(&other.sep) == Ordering::Equal
+    }
+}
+
+impl Eq for NearestEntry {}
+
+impl PartialOrd for NearestEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NearestEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sep.total_cmp(&other.sep)
+    }
+}
+
 /// Keep only n_nearest smallest-separation matches per id_a; overwrite output file.
+/// Streams batches so memory is O(distinct id_a × n_nearest), not O(total rows).
 fn apply_n_nearest(
     output_path: &Path,
     id_a_col: &str,
@@ -606,40 +636,53 @@ fn apply_n_nearest(
     let file = File::open(output_path)?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
     let schema = reader.schema().clone();
-    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>()?;
-    if batches.is_empty() {
-        return Ok(());
-    }
-    let table = arrow::compute::concat_batches(&schema, &batches)?;
-    if table.num_rows() == 0 {
-        return Ok(());
-    }
-
-    let sep_arr = table
-        .column(schema.index_of("separation_arcsec")?)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or("separation_arcsec not Float64")?;
-
     let id_a_idx = schema.index_of(id_a_col)?;
     let id_b_idx = schema.index_of(id_b_col)?;
-    let mut by_a: HashMap<IdVal, Vec<(IdVal, f64)>> = HashMap::new();
-    for i in 0..table.num_rows() {
-        let id_a = get_id_value(&table, id_a_col, id_a_idx, i);
-        let id_b = get_id_value(&table, id_b_col, id_b_idx, i);
-        let sep = sep_arr.value(i);
-        by_a.entry(id_a).or_default().push((id_b, sep));
+    let sep_idx = schema.index_of("separation_arcsec")?;
+    let n_nearest_usize = n_nearest as usize;
+
+    // Per id_a: max-heap of (sep, id_b); we keep at most n_nearest smallest.
+    let mut by_a: HashMap<IdVal, BinaryHeap<NearestEntry>> = HashMap::new();
+
+    for batch in reader {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let sep_arr = batch
+            .column(sep_idx)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or("separation_arcsec not Float64")?;
+
+        for i in 0..batch.num_rows() {
+            let id_a = get_id_value(&batch, id_a_col, id_a_idx, i);
+            let id_b = get_id_value(&batch, id_b_col, id_b_idx, i);
+            let sep = sep_arr.value(i);
+            let heap = by_a.entry(id_a).or_default();
+            let entry = NearestEntry {
+                sep,
+                id_b,
+            };
+            if heap.len() < n_nearest_usize {
+                heap.push(entry);
+            } else if sep < heap.peek().map(|e| e.sep).unwrap_or(f64::MAX) {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
     }
 
     let mut out_id_a: Vec<IdVal> = Vec::new();
     let mut out_id_b: Vec<IdVal> = Vec::new();
     let mut out_sep: Vec<f64> = Vec::new();
-    for (id_a, mut list) in by_a {
-        list.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (id_b, sep) in list.into_iter().take(n_nearest as usize) {
+    for (id_a, heap) in by_a {
+        let mut list: Vec<_> = heap.into_iter().collect();
+        list.sort_by(|a, b| a.sep.total_cmp(&b.sep));
+        for e in list.into_iter().take(n_nearest_usize) {
             out_id_a.push(id_a.clone());
-            out_id_b.push(id_b);
-            out_sep.push(sep);
+            out_id_b.push(e.id_b);
+            out_sep.push(e.sep);
         }
     }
 
@@ -650,8 +693,9 @@ fn apply_n_nearest(
         vec![col_a, col_b, out_sep_arr],
     )?;
     let out_file = File::create(output_path)?;
+    let buf = BufWriter::new(out_file);
     let mut w = ArrowWriter::try_new(
-        out_file,
+        buf,
         schema,
         Some(WriterProperties::builder().build()),
     )?;
