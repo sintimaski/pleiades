@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pyarrow as pa
@@ -17,7 +18,7 @@ ROWS_DEFAULT = 10_000_000
 ROWS_PER_ROW_GROUP = 100_000
 
 
-def _simple_rng(seed: int):
+def _simple_rng(seed: int) -> Iterator[float]:
     state = seed & 0xFFFFFFFF
     while True:
         state = (state * 1103515245 + 12345) & 0x7FFFFFFF

@@ -79,8 +79,12 @@ disallow_untyped_defs = true
 strict_equality = true
 
 [[tool.mypy.overrides]]
-module = ["pyarrow.*", "astropy.*", "cdshealpix.*"]
+module = ["pyarrow.*", "astropy.*", "cdshealpix.*", "numpy.*", "numpy", "pleiades_core.*", "pleiades_core.pleiades_core"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["scripts.*"]
+disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

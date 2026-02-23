@@ -7,6 +7,7 @@ A few sources in A are placed within 2 arcsec of sources in B for match testing.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from pathlib import Path
 
 import pyarrow as pa
@@ -122,7 +123,7 @@ def make_catalog_with_pairs(
     return table_a, table_b
 
 
-def _simple_rng(seed: int):
+def _simple_rng(seed: int) -> Iterator[float]:
     """Simple deterministic PRNG (LCG). Yields floats in (0, 1)."""
     state = seed & 0xFFFFFFFF
     while True:

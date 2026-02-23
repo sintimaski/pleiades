@@ -348,8 +348,8 @@ def attach_match_coords(
             out[k] = (float(ra_col_arr[i].as_py()), float(dec_col_arr[i].as_py()))
         return out
 
-    a_map = build_id_to_ra_dec(catalog_a, id_col_a)
-    b_map = build_id_to_ra_dec(catalog_b, id_col_b)
+    a_map = build_id_to_ra_dec(catalog_a, id_col_a or "id")
+    b_map = build_id_to_ra_dec(catalog_b, id_col_b or "id")
     id_a_arr = matches.column(id_a_name)
     id_b_arr = matches.column(id_b_name)
     ra_a_list: list[float | None] = []

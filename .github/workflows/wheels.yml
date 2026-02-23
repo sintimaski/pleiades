@@ -112,7 +112,3 @@ jobs:
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
           directory: dist/out
-</think>
-Fixing the publish job: collecting artifact paths and adding a flatten step.
-<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>
-StrReplace

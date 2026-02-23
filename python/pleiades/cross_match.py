@@ -93,7 +93,7 @@ def _id_column(table: pa.Table, id_col: str | None) -> str:
         return id_col
     for name in table.column_names:
         if name.lower() not in (RA_COL, DEC_COL):
-            return name
+            return str(name)
     return "index"
 
 
@@ -441,7 +441,6 @@ def cross_match(
     b_is_prepartitioned = catalog_b.is_dir()
     if b_is_prepartitioned:
         n_shards, _ = validate_prepartitioned_dir(catalog_b)
-        shard_path = catalog_b
     else:
         if not catalog_b.is_file():
             raise FileNotFoundError(f"Catalog B not found: {catalog_b}")
