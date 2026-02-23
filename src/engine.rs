@@ -133,7 +133,7 @@ fn haversine_arcsec(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) ->
     haversine_rad(lon1, lat1, lon2, lat2) * RAD_TO_ARCSEC
 }
 
-/// Compute 4 haversine distances (arcsec). (lon2, lat2, cos_lat2) in radians for reuse per B row.
+/// SIMD-friendly haversine for 4 lanes: branchless loop for autovectorization (sin/cos/asin stay scalar per lane).
 #[inline(always)]
 fn haversine_arcsec_4_rad(
     ra1_deg: &[f64; 4],
@@ -148,15 +148,20 @@ fn haversine_arcsec_4_rad(
         let lat1 = dec1_deg[i] * DEG_TO_RAD;
         let dlat = lat2 - lat1;
         let dlon = lon2 - lon1;
-        let a = (dlat * 0.5).sin().mul_add(
-            (dlat * 0.5).sin(),
-            lat1.cos() * cos_lat2 * (dlon * 0.5).sin() * (dlon * 0.5).sin(),
+        let half_dlat = dlat * 0.5;
+        let half_dlon = dlon * 0.5;
+        let sin_half_dlat = half_dlat.sin();
+        let sin_half_dlon = half_dlon.sin();
+        let a = sin_half_dlat.mul_add(
+            sin_half_dlat,
+            lat1.cos() * cos_lat2 * sin_half_dlon * sin_half_dlon,
         );
-        out[i] = 2.0 * (a.sqrt().min(1.0).asin()) * RAD_TO_ARCSEC;
+        let sqrt_a = a.sqrt().min(1.0);
+        out[i] = 2.0 * sqrt_a.asin() * RAD_TO_ARCSEC;
     }
 }
 
-/// Same as haversine_arcsec_8 but (lon2, lat2, cos_lat2) already in radians. Saves repeated conversion per B row.
+/// SIMD-friendly haversine for 8 lanes: two 4-lane batches for cache and autovectorization.
 #[inline(always)]
 fn haversine_arcsec_8_rad(
     ra1_deg: &[f64; 8],
@@ -166,17 +171,20 @@ fn haversine_arcsec_8_rad(
     cos_lat2: f64,
     out: &mut [f64; 8],
 ) {
-    for i in 0..8 {
-        let lon1 = ra1_deg[i] * DEG_TO_RAD;
-        let lat1 = dec1_deg[i] * DEG_TO_RAD;
-        let dlat = lat2 - lat1;
-        let dlon = lon2 - lon1;
-        let a = (dlat * 0.5).sin().mul_add(
-            (dlat * 0.5).sin(),
-            lat1.cos() * cos_lat2 * (dlon * 0.5).sin() * (dlon * 0.5).sin(),
-        );
-        out[i] = 2.0 * (a.sqrt().min(1.0).asin()) * RAD_TO_ARCSEC;
-    }
+    let (ra1_4a, ra1_4b) = (
+        [ra1_deg[0], ra1_deg[1], ra1_deg[2], ra1_deg[3]],
+        [ra1_deg[4], ra1_deg[5], ra1_deg[6], ra1_deg[7]],
+    );
+    let (dec1_4a, dec1_4b) = (
+        [dec1_deg[0], dec1_deg[1], dec1_deg[2], dec1_deg[3]],
+        [dec1_deg[4], dec1_deg[5], dec1_deg[6], dec1_deg[7]],
+    );
+    let mut out_a = [0.0_f64; 4];
+    let mut out_b = [0.0_f64; 4];
+    haversine_arcsec_4_rad(&ra1_4a, &dec1_4a, lon2, lat2, cos_lat2, &mut out_a);
+    haversine_arcsec_4_rad(&ra1_4b, &dec1_4b, lon2, lat2, cos_lat2, &mut out_b);
+    out[0..4].copy_from_slice(&out_a);
+    out[4..8].copy_from_slice(&out_b);
 }
 
 /// Cheap reject: true if (ra_a, dec_a) vs (ra_b, dec_b) is definitely outside radius_deg.
@@ -499,14 +507,60 @@ fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) ->
         .unwrap_or_else(HashSet::new)
 }
 
+/// Merge collected per-row results into (index, pixels). Used for profiling when PLEIADES_PROFILE=1.
+fn merge_pixels_and_index(
+    collected: Vec<(u64, usize, Vec<u64>)>,
+) -> (HashMap<u64, Vec<usize>>, HashSet<u64>) {
+    let mut idx: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut pixels = HashSet::new();
+    for (center, row, neighbours) in collected {
+        idx.entry(center).or_default().push(row);
+        for p in neighbours {
+            pixels.insert(p);
+        }
+    }
+    (idx, pixels)
+}
+
+/// Merge collected (pixel, row) pairs into index. Used for profiling when PLEIADES_PROFILE=1.
+fn merge_index_only(collected: Vec<(u64, usize)>) -> HashMap<u64, Vec<usize>> {
+    let mut idx: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (pix, row) in collected {
+        idx.entry(pix).or_default().push(row);
+    }
+    idx
+}
+
 /// One pass over chunk A: build HEALPix index (pixel -> row indices) and pixel set (centers + neighbors).
 /// Hashes each (ra, dec) once instead of separate pixels then index passes.
+/// When PLEIADES_PROFILE=1, times "map" (parallel map+fold) and "merge" (single-threaded reduce) separately.
 fn pixels_and_index(
     ra_deg: &[f64],
     dec_deg: &[f64],
     depth: u8,
 ) -> (HashMap<u64, Vec<usize>>, HashSet<u64>) {
     let layer = get(depth);
+    let profile = env::var("PLEIADES_PROFILE").is_ok();
+    if profile {
+        let t_map = std::time::Instant::now();
+        let collected: Vec<(u64, usize, Vec<u64>)> = (0..ra_deg.len())
+            .into_par_iter()
+            .map(|row| {
+                let lon = ra_deg[row] * DEG_TO_RAD;
+                let lat = dec_deg[row] * DEG_TO_RAD;
+                let center = layer.hash(lon, lat);
+                let mut neighbours = Vec::with_capacity(9);
+                neighbours.push(center);
+                nested::append_bulk_neighbours(depth, center, &mut neighbours);
+                (center, row, neighbours)
+            })
+            .collect();
+        profile_log("pixels_and_index map", t_map.elapsed().as_secs_f64(), &format!("({} rows)", collected.len()));
+        let t_merge = std::time::Instant::now();
+        let result = merge_pixels_and_index(collected);
+        profile_log("pixels_and_index merge (HashSet/HashMap)", t_merge.elapsed().as_secs_f64(), &format!("({} pixels)", result.1.len()));
+        return result;
+    }
     (0..ra_deg.len())
         .into_par_iter()
         .map(|row| {
@@ -539,12 +593,30 @@ fn pixels_and_index(
 }
 
 /// Build HEALPix index only (pixel -> row indices). One hash per row, no neighbor set.
+/// When PLEIADES_PROFILE=1, times "map" and "merge" separately.
 fn index_only(
     ra_deg: &[f64],
     dec_deg: &[f64],
     depth: u8,
 ) -> HashMap<u64, Vec<usize>> {
     let layer = get(depth);
+    let profile = env::var("PLEIADES_PROFILE").is_ok();
+    if profile {
+        let t_map = std::time::Instant::now();
+        let collected: Vec<(u64, usize)> = (0..ra_deg.len())
+            .into_par_iter()
+            .map(|row| {
+                let lon = ra_deg[row] * DEG_TO_RAD;
+                let lat = dec_deg[row] * DEG_TO_RAD;
+                (layer.hash(lon, lat), row)
+            })
+            .collect();
+        profile_log("index_only map", t_map.elapsed().as_secs_f64(), &format!("({} rows)", collected.len()));
+        let t_merge = std::time::Instant::now();
+        let result = merge_index_only(collected);
+        profile_log("index_only merge (HashMap)", t_merge.elapsed().as_secs_f64(), &format!("({} pixels)", result.len()));
+        return result;
+    }
     (0..ra_deg.len())
         .into_par_iter()
         .map(|row| {
@@ -582,6 +654,13 @@ fn verbose_log(msg: &str) {
 fn verbose_log_timed(phase: &str, elapsed_secs: f64, extra: &str) {
     if env::var("PLEIADES_VERBOSE").is_ok() {
         eprintln!("[pleiades] {}: {:.3}s {}", phase, elapsed_secs, extra);
+    }
+}
+
+/// When PLEIADES_PROFILE=1, log a profiling line (phase + elapsed seconds + extra).
+fn profile_log(phase: &str, elapsed_secs: f64, extra: &str) {
+    if env::var("PLEIADES_PROFILE").is_ok() {
+        eprintln!("[pleiades] profile {}: {:.3}s {}", phase, elapsed_secs, extra);
     }
 }
 
@@ -1243,13 +1322,19 @@ pub fn cross_match_impl(
         let (ra_deg_a, dec_deg_a) = ra_dec_degrees(&batch_a, ra_idx, dec_idx, from_radians)?;
 
         let t_pixels_index = std::time::Instant::now();
-        let (index, pixels_wanted) = if let Some(reuse) = next_pixels_wanted.take() {
+        let (index, pixels_wanted, used_index_only) = if let Some(reuse) = next_pixels_wanted.take() {
             // Chunk 1+: reuse pixels from previous B-prefetch; only build index.
             let index = index_only(&ra_deg_a, &dec_deg_a, depth);
-            (index, reuse)
+            (index, reuse, true)
         } else {
             // Chunk 0: single pass for both index and pixel set.
-            pixels_and_index(&ra_deg_a, &dec_deg_a, depth)
+            let (idx, px) = pixels_and_index(&ra_deg_a, &dec_deg_a, depth);
+            (idx, px, false)
+        };
+        let pixels_index_label = if used_index_only {
+            " (index_only)"
+        } else {
+            " (pixels_and_index)"
         };
 
         // Send B load requests so prefetch runs in parallel: current chunk (when first), and next chunk.
@@ -1270,7 +1355,7 @@ pub fn cross_match_impl(
             verbose_log_timed(
                 "  pixels+index",
                 t_pixels_index.elapsed().as_secs_f64(),
-                &format!("({} pixels)", pixels_wanted.len()),
+                &format!("({} pixels){}", pixels_wanted.len(), pixels_index_label),
             );
         }
 
