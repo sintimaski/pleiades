@@ -75,6 +75,40 @@ pub enum IdVal {
     Str(String),
 }
 
+/// Columnar B catalog slice: join hot path touches only ra_b/dec_b; id_b fetched when emitting a match.
+#[derive(Clone)]
+pub struct BColumns {
+    pub id_b: Vec<IdVal>,
+    pub ra_b: Vec<f64>,
+    pub dec_b: Vec<f64>,
+}
+
+impl BColumns {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.id_b.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.id_b.is_empty()
+    }
+}
+
+impl From<Vec<(IdVal, f64, f64)>> for BColumns {
+    fn from(rows: Vec<(IdVal, f64, f64)>) -> Self {
+        let n = rows.len();
+        let mut id_b = Vec::with_capacity(n);
+        let mut ra_b = Vec::with_capacity(n);
+        let mut dec_b = Vec::with_capacity(n);
+        for (id, ra, dec) in rows {
+            id_b.push(id);
+            ra_b.push(ra);
+            dec_b.push(dec);
+        }
+        BColumns { id_b, ra_b, dec_b }
+    }
+}
+
 /// Haversine angular distance in radians (inputs in radians).
 /// Standard formula: a = sin²(Δφ/2) + cos(φ₁)cos(φ₂)sin²(Δλ/2); θ = 2 asin(√a).
 #[inline(always)]
@@ -123,6 +157,44 @@ fn haversine_arcsec_4(
         );
         out[i] = 2.0 * (a.sqrt().min(1.0).asin()) * RAD_TO_ARCSEC;
     }
+}
+
+/// Compute 8 haversine distances (arcsec) in one batch. Same (ra2_deg, dec2_deg) for all eight.
+#[inline(always)]
+fn haversine_arcsec_8(
+    ra1_deg: &[f64; 8],
+    dec1_deg: &[f64; 8],
+    ra2_deg: f64,
+    dec2_deg: f64,
+    out: &mut [f64; 8],
+) {
+    let lon2 = ra2_deg * DEG_TO_RAD;
+    let lat2 = dec2_deg * DEG_TO_RAD;
+    let cos_lat2 = lat2.cos();
+    for i in 0..8 {
+        let lon1 = ra1_deg[i] * DEG_TO_RAD;
+        let lat1 = dec1_deg[i] * DEG_TO_RAD;
+        let dlat = lat2 - lat1;
+        let dlon = lon2 - lon1;
+        let a = (dlat * 0.5).sin().mul_add(
+            (dlat * 0.5).sin(),
+            lat1.cos() * cos_lat2 * (dlon * 0.5).sin() * (dlon * 0.5).sin(),
+        );
+        out[i] = 2.0 * (a.sqrt().min(1.0).asin()) * RAD_TO_ARCSEC;
+    }
+}
+
+/// Cheap reject: true if (ra_a, dec_a) vs (ra_b, dec_b) is definitely outside radius_deg.
+#[inline(always)]
+fn cheap_reject_deg(ra_a_deg: f64, dec_a_deg: f64, ra_b_deg: f64, dec_b_deg: f64, radius_deg: f64) -> bool {
+    if (dec_a_deg - dec_b_deg).abs() > radius_deg {
+        return true;
+    }
+    let cos_dec = (dec_a_deg * DEG_TO_RAD).cos().abs().max((dec_b_deg * DEG_TO_RAD).cos().abs());
+    if cos_dec < 1e-10 {
+        return false;
+    }
+    (ra_a_deg - ra_b_deg).abs() * cos_dec > radius_deg
 }
 
 /// Resolve ID column name: use provided or first non-ra/dec column.
@@ -518,9 +590,39 @@ fn verbose_log_timed(phase: &str, elapsed_secs: f64, extra: &str) {
     }
 }
 
+/// Process one B batch into (shard_ix, pixel_id, id_val, ra, dec) for parallel partition.
+fn partition_batch_to_row_results(
+    batch: &RecordBatch,
+    depth: u8,
+    n_shards: usize,
+    id_b_name: &str,
+    ra_col: &str,
+    dec_col: &str,
+    from_radians: bool,
+) -> Result<Vec<(usize, u64, IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+    let layer = get(depth);
+    let ra_idx = column_index(batch, ra_col);
+    let dec_idx = column_index(batch, dec_col);
+    let id_b_idx = column_index(batch, id_b_name);
+    let (ra_deg, dec_deg) = ra_dec_degrees(batch, ra_idx, dec_idx, from_radians)?;
+    let n = batch.num_rows();
+    let row_results: Vec<(usize, u64, IdVal, f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|row| {
+            let lon = ra_deg[row] * DEG_TO_RAD;
+            let lat = dec_deg[row] * DEG_TO_RAD;
+            let pixel_id = layer.hash(lon, lat);
+            let shard_ix = (pixel_id % n_shards as u64) as usize;
+            let id_val = get_id_value(batch, id_b_name, id_b_idx, row);
+            (shard_ix, pixel_id, id_val, ra_deg[row], dec_deg[row])
+        })
+        .collect();
+    Ok(row_results)
+}
+
 /// Partition catalog B (single file) into HEALPix shards in a temp directory.
 /// Returns (temp_dir_guard, shard_dir_path, rows_written, original_id_b_column_name).
-/// Caller must keep the guard alive.
+/// Caller must keep the guard alive. Batches are processed in parallel (pixel assignment).
 fn partition_b_to_temp(
     catalog_b: &Path,
     depth: u8,
@@ -531,7 +633,6 @@ fn partition_b_to_temp(
     id_col_b: Option<&str>,
     from_radians: bool,
 ) -> Result<(TempDir, PathBuf, u64, String), Box<dyn std::error::Error + Send + Sync>> {
-    let layer = get(depth);
     let temp_dir = tempfile::tempdir().map_err(|e| format!("temp dir: {}", e))?;
     let shard_dir = temp_dir.path().to_path_buf();
 
@@ -621,23 +722,20 @@ fn partition_b_to_temp(
     /// Larger flush reduces Parquet write() calls and RecordBatch builds during partition.
     const FLUSH_AT: usize = 131_072;
 
-    let mut process_batch = |batch: &RecordBatch| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let ra_idx = column_index(batch, ra_col);
-        let dec_idx = column_index(batch, dec_col);
-        let id_b_idx = column_index(batch, &id_b_name);
-        let (ra_deg, dec_deg) = ra_dec_degrees(batch, ra_idx, dec_idx, from_radians)?;
-        let n = batch.num_rows();
-        let row_results: Vec<(usize, u64, IdVal, f64, f64)> = (0..n)
-            .into_par_iter()
-            .map(|row| {
-                let lon = ra_deg[row] * DEG_TO_RAD;
-                let lat = dec_deg[row] * DEG_TO_RAD;
-                let pixel_id = layer.hash(lon, lat);
-                let shard_ix = (pixel_id % n_shards as u64) as usize;
-                let id_val = get_id_value(batch, &id_b_name, id_b_idx, row);
-                (shard_ix, pixel_id, id_val, ra_deg[row], dec_deg[row])
-            })
-            .collect();
+    // Collect all batches then process in parallel (pixel assignment per batch).
+    let mut batches: Vec<RecordBatch> = vec![first_batch];
+    for batch in reader {
+        let batch = batch?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+    let batch_results: Vec<Vec<(usize, u64, IdVal, f64, f64)>> = batches
+        .par_iter()
+        .map(|b| partition_batch_to_row_results(b, depth, n_shards, &id_b_name, ra_col, dec_col, from_radians))
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
+
+    for row_results in batch_results {
         for (shard_ix, pixel_id, id_val, ra, dec) in row_results {
             buffers[shard_ix].push((pixel_id, id_val, ra, dec));
         }
@@ -665,18 +763,6 @@ fn partition_b_to_temp(
                 rows_written += FLUSH_AT as u64;
             }
         }
-        Ok(())
-    };
-
-    // Process first batch (we already have it)
-    process_batch(&first_batch)?;
-
-    for batch in reader {
-        let batch = batch?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        process_batch(&batch)?;
     }
 
     // Flush remaining buffers
@@ -822,31 +908,71 @@ fn build_id_column_single(ids: &[IdVal]) -> Arc<dyn Array> {
     }
 }
 
-/// CPU join: for each B row, find A candidates in same/neighbor HEALPix pixels and compute
-/// haversine distance; return per-row matches (candidate_ix, b_row_ix, sep_arcsec).
+/// Group B row indices by HEALPix pixel (one hash per row).
+fn group_b_by_pixel(
+    ra_b: &[f64],
+    dec_b: &[f64],
+    depth: u8,
+) -> HashMap<u64, Vec<usize>> {
+    let layer = get(depth);
+    let mut by_pixel: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (b_row_ix, (&ra, &dec)) in ra_b.iter().zip(dec_b.iter()).enumerate() {
+        let pix = layer.hash(ra * DEG_TO_RAD, dec * DEG_TO_RAD);
+        by_pixel.entry(pix).or_default().push(b_row_ix);
+    }
+    by_pixel
+}
+
+/// CPU join: columnar B, group by pixel (reuse pixels_to_look per pixel), cheap reject, haversine in batches of 8.
+/// Returns per-row matches (candidate_ix, b_row_ix, sep_arcsec).
 fn run_cpu_join(
-    b_rows: &[(IdVal, f64, f64)],
+    b_cols: &BColumns,
     index_ref: &HashMap<u64, Vec<usize>>,
     ra_flat_ref: &[f64],
     dec_flat_ref: &[f64],
-    radius: f64,
+    radius_arcsec: f64,
+    radius_deg: f64,
     depth_local: u8,
 ) -> Vec<Vec<(usize, usize, f64)>> {
-    let layer = get(depth_local);
-    b_rows
+    let ra_b = &b_cols.ra_b[..];
+    let dec_b = &b_cols.dec_b[..];
+    let by_pixel = group_b_by_pixel(ra_b, dec_b, depth_local);
+
+    let per_pixel: Vec<Vec<(usize, Vec<(usize, usize, f64)>)>> = by_pixel
         .par_iter()
-        .enumerate()
-        .map(|(b_row_ix, (_id_b, ra_b_deg, dec_b_deg))| {
-            let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
+        .map(|(pixel, b_indices)| {
             let mut pixels_to_look = Vec::with_capacity(9);
-            pixels_to_look.push(center_pix);
-            nested::append_bulk_neighbours(depth_local, center_pix, &mut pixels_to_look);
-            let mut row_matches = Vec::new();
-            for pix in &pixels_to_look {
-                if let Some(candidate_ixs) = index_ref.get(pix) {
-                    let chunks = candidate_ixs.chunks_exact(4);
-                    let remainder = chunks.remainder();
-                    for chunk in chunks {
+            pixels_to_look.push(*pixel);
+            nested::append_bulk_neighbours(depth_local, *pixel, &mut pixels_to_look);
+
+            let mut out: Vec<(usize, Vec<(usize, usize, f64)>)> = Vec::with_capacity(b_indices.len());
+            for &b_row_ix in b_indices {
+                let ra_b_deg = ra_b[b_row_ix];
+                let dec_b_deg = dec_b[b_row_ix];
+                let mut row_matches = Vec::new();
+                for pix in &pixels_to_look {
+                    let Some(candidate_ixs) = index_ref.get(pix) else { continue };
+                    // Batches of 8 (then 4, then remainder)
+                    let chunks8 = candidate_ixs.chunks_exact(8);
+                    let remainder8 = chunks8.remainder();
+                    for chunk in chunks8 {
+                        let mut ra1 = [0.0_f64; 8];
+                        let mut dec1 = [0.0_f64; 8];
+                        for (i, &ix) in chunk.iter().enumerate() {
+                            ra1[i] = ra_flat_ref[ix];
+                            dec1[i] = dec_flat_ref[ix];
+                        }
+                        let mut seps = [0.0_f64; 8];
+                        haversine_arcsec_8(&ra1, &dec1, ra_b_deg, dec_b_deg, &mut seps);
+                        for (i, &candidate_ix) in chunk.iter().enumerate() {
+                            if seps[i] <= radius_arcsec {
+                                row_matches.push((candidate_ix, b_row_ix, seps[i]));
+                            }
+                        }
+                    }
+                    let chunks4 = remainder8.chunks_exact(4);
+                    let remainder = chunks4.remainder();
+                    for chunk in chunks4 {
                         let mut ra1 = [0.0_f64; 4];
                         let mut dec1 = [0.0_f64; 4];
                         for (i, &ix) in chunk.iter().enumerate() {
@@ -854,27 +980,38 @@ fn run_cpu_join(
                             dec1[i] = dec_flat_ref[ix];
                         }
                         let mut seps = [0.0_f64; 4];
-                        haversine_arcsec_4(&ra1, &dec1, *ra_b_deg, *dec_b_deg, &mut seps);
+                        haversine_arcsec_4(&ra1, &dec1, ra_b_deg, dec_b_deg, &mut seps);
                         for (i, &candidate_ix) in chunk.iter().enumerate() {
-                            let sep = seps[i];
-                            if sep <= radius {
-                                row_matches.push((candidate_ix, b_row_ix, sep));
+                            if seps[i] <= radius_arcsec {
+                                row_matches.push((candidate_ix, b_row_ix, seps[i]));
                             }
                         }
                     }
                     for &candidate_ix in remainder {
                         let ra_a = ra_flat_ref[candidate_ix];
                         let dec_a = dec_flat_ref[candidate_ix];
-                        let sep = haversine_arcsec(ra_a, dec_a, *ra_b_deg, *dec_b_deg);
-                        if sep <= radius {
+                        if cheap_reject_deg(ra_a, dec_a, ra_b_deg, dec_b_deg, radius_deg) {
+                            continue;
+                        }
+                        let sep = haversine_arcsec(ra_a, dec_a, ra_b_deg, dec_b_deg);
+                        if sep <= radius_arcsec {
                             row_matches.push((candidate_ix, b_row_ix, sep));
                         }
                     }
                 }
+                out.push((b_row_ix, row_matches));
             }
-            row_matches
+            out
         })
-        .collect()
+        .collect();
+
+    let mut row_matches: Vec<Vec<(usize, usize, f64)>> = (0..b_cols.len()).map(|_| Vec::new()).collect();
+    for chunk in per_pixel {
+        for (b_row_ix, m) in chunk {
+            row_matches[b_row_ix].extend(m);
+        }
+    }
+    row_matches
 }
 
 /// Cross-match two Parquet catalogs: stream A in chunks, build HEALPix index per chunk,
@@ -904,6 +1041,7 @@ pub fn cross_match_impl(
     let from_radians = is_radians(ra_dec_units);
     #[allow(unused_variables)]
     let layer = get(depth);
+    let radius_deg = radius_arcsec / 3600.0;
     let t0 = std::time::Instant::now();
     let verbose = env::var("PLEIADES_VERBOSE").is_ok();
 
@@ -1151,7 +1289,7 @@ pub fn cross_match_impl(
             );
         }
         let t_load = std::time::Instant::now();
-        let b_rows = if use_b_prefetch {
+        let b_rows_vec = if use_b_prefetch {
             prefetched_b.take().unwrap_or_else(|| {
                 rx_b_response
                     .recv()
@@ -1168,7 +1306,8 @@ pub fn cross_match_impl(
                 from_radians,
             )?
         };
-        let n_b_loaded = b_rows.len();
+        let b_cols = BColumns::from(b_rows_vec);
+        let n_b_loaded = b_cols.len();
         if verbose {
             verbose_log_timed("  load B", t_load.elapsed().as_secs_f64(), &format!("({} rows)", n_b_loaded));
         }
@@ -1185,7 +1324,7 @@ pub fn cross_match_impl(
             if use_gpu {
                 // Collect (a_ix, b_ix) candidate pairs from HEALPix index (no distance yet).
                 let mut pairs: Vec<(usize, usize)> = Vec::new();
-                for (b_row_ix, (_id_b, ra_b_deg, dec_b_deg)) in b_rows.iter().enumerate() {
+                for (b_row_ix, (&ra_b_deg, &dec_b_deg)) in b_cols.ra_b.iter().zip(b_cols.dec_b.iter()).enumerate() {
                     let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
                     let mut pixels_to_look = Vec::with_capacity(9);
                     pixels_to_look.push(center_pix);
@@ -1216,17 +1355,11 @@ pub fn cross_match_impl(
                         .collect();
                     let ra_b_f32: Vec<f32> = pairs
                         .iter()
-                        .map(|&(_, b_ix)| {
-                            let (_, ra, _) = b_rows[b_ix];
-                            ra as f32
-                        })
+                        .map(|&(_, b_ix)| b_cols.ra_b[b_ix] as f32)
                         .collect();
                     let dec_b_f32: Vec<f32> = pairs
                         .iter()
-                        .map(|&(_, b_ix)| {
-                            let (_, _, dec) = b_rows[b_ix];
-                            dec as f32
-                        })
+                        .map(|&(_, b_ix)| b_cols.dec_b[b_ix] as f32)
                         .collect();
                     let a_ix_u32: Vec<u32> = pairs.iter().map(|&(a, _)| a as u32).collect();
                     let b_ix_u32: Vec<u32> = pairs.iter().map(|&(_, b)| b as u32).collect();
@@ -1242,7 +1375,7 @@ pub fn cross_match_impl(
                         Ok(gpu_matches) => {
                             for (a_ix, b_ix, sep) in gpu_matches {
                                 matches_id_a.push(id_a_flat[a_ix as usize].clone());
-                                matches_id_b.push(b_rows[b_ix as usize].0.clone());
+                                matches_id_b.push(b_cols.id_b[b_ix as usize].clone());
                                 matches_sep.push(sep as f64);
                             }
                             if verbose {
@@ -1254,17 +1387,18 @@ pub fn cross_match_impl(
                                 verbose_log("  join (GPU failed, CPU fallback)");
                             }
                             let per_row = run_cpu_join(
-                                &b_rows,
+                                &b_cols,
                                 index_ref,
                                 ra_flat_ref,
                                 dec_flat_ref,
                                 radius,
+                                radius_deg,
                                 depth_local,
                             );
                             for row_matches in per_row {
                                 for (candidate_ix, b_row_ix, sep) in row_matches {
                                     matches_id_a.push(id_a_flat[candidate_ix].clone());
-                                    matches_id_b.push(b_rows[b_row_ix].0.clone());
+                                    matches_id_b.push(b_cols.id_b[b_row_ix].clone());
                                     matches_sep.push(sep);
                                 }
                             }
@@ -1278,11 +1412,12 @@ pub fn cross_match_impl(
                 } else {
                     // pairs below PLEIADES_GPU_MIN_PAIRS: use CPU (faster due to GPU chunk/sync overhead).
                     let per_row = run_cpu_join(
-                        &b_rows,
+                        &b_cols,
                         index_ref,
                         ra_flat_ref,
                         dec_flat_ref,
                         radius,
+                        radius_deg,
                         depth_local,
                     );
                     matches_id_a.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
@@ -1291,7 +1426,7 @@ pub fn cross_match_impl(
                     for row_matches in per_row {
                         for (candidate_ix, b_row_ix, sep) in row_matches {
                             matches_id_a.push(id_a_flat[candidate_ix].clone());
-                            matches_id_b.push(b_rows[b_row_ix].0.clone());
+                            matches_id_b.push(b_cols.id_b[b_row_ix].clone());
                             matches_sep.push(sep);
                         }
                     }
@@ -1305,11 +1440,12 @@ pub fn cross_match_impl(
                 }
             } else {
                 let per_row = run_cpu_join(
-                    &b_rows,
+                    &b_cols,
                     index_ref,
                     ra_flat_ref,
                     dec_flat_ref,
                     radius,
+                    radius_deg,
                     depth_local,
                 );
                 matches_id_a.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
@@ -1318,7 +1454,7 @@ pub fn cross_match_impl(
                 for row_matches in per_row {
                     for (candidate_ix, b_row_ix, sep) in row_matches {
                         matches_id_a.push(id_a_flat[candidate_ix].clone());
-                        matches_id_b.push(b_rows[b_row_ix].0.clone());
+                        matches_id_b.push(b_cols.id_b[b_row_ix].clone());
                         matches_sep.push(sep);
                     }
                 }
@@ -1330,11 +1466,12 @@ pub fn cross_match_impl(
         #[cfg(not(feature = "wgpu"))]
         {
             let per_row = run_cpu_join(
-                &b_rows,
+                &b_cols,
                 index_ref,
                 ra_flat_ref,
                 dec_flat_ref,
                 radius,
+                radius_deg,
                 depth_local,
             );
             matches_id_a.reserve(per_row.iter().map(|v| v.len()).sum::<usize>());
@@ -1343,7 +1480,7 @@ pub fn cross_match_impl(
             for row_matches in per_row {
                 for (candidate_ix, b_row_ix, sep) in row_matches {
                     matches_id_a.push(id_a_flat[candidate_ix].clone());
-                    matches_id_b.push(b_rows[b_row_ix].0.clone());
+                    matches_id_b.push(b_cols.id_b[b_row_ix].clone());
                     matches_sep.push(sep);
                 }
             }
@@ -1351,6 +1488,18 @@ pub fn cross_match_impl(
         #[cfg(not(feature = "wgpu"))]
         if verbose {
             verbose_log_timed("  join", t_join.elapsed().as_secs_f64(), &format!("({} matches)", matches_id_a.len()));
+        }
+        // Per-chunk n_nearest: keep only best n per id_a before write (apply_n_nearest still merges across chunks).
+        if let Some(n) = n_nearest {
+            let (a, b, s) = merge_to_n_nearest(
+                std::mem::take(&mut matches_id_a),
+                std::mem::take(&mut matches_id_b),
+                std::mem::take(&mut matches_sep),
+                n,
+            );
+            matches_id_a = a;
+            matches_id_b = b;
+            matches_sep = s;
         }
         if !matches_id_a.is_empty() && out_schema.is_none() {
             let (col_a, col_b) = build_id_columns(&matches_id_a, &matches_id_b);
@@ -1529,6 +1678,32 @@ impl Ord for NearestEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.sep.total_cmp(&other.sep)
     }
+}
+
+/// Per-chunk: keep only n smallest-separation matches per id_a. Reduces match list before write.
+fn merge_to_n_nearest(
+    id_a: Vec<IdVal>,
+    id_b: Vec<IdVal>,
+    sep: Vec<f64>,
+    n: u32,
+) -> (Vec<IdVal>, Vec<IdVal>, Vec<f64>) {
+    let n = n as usize;
+    let mut by_a: HashMap<IdVal, Vec<(f64, IdVal)>> = HashMap::new();
+    for ((a, b), s) in id_a.into_iter().zip(id_b).zip(sep) {
+        by_a.entry(a).or_default().push((s, b));
+    }
+    let mut out_a = Vec::new();
+    let mut out_b = Vec::new();
+    let mut out_sep = Vec::new();
+    for (a, mut list) in by_a {
+        list.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (s, b) in list.into_iter().take(n) {
+            out_a.push(a.clone());
+            out_b.push(b);
+            out_sep.push(s);
+        }
+    }
+    (out_a, out_b, out_sep)
 }
 
 /// Keep only n_nearest smallest-separation matches per id_a; overwrite output file.

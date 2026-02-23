@@ -176,7 +176,10 @@ def main() -> int:
     p_pc.add_argument("output_dir", type=_path, help="Output directory for shards")
     p_pc.add_argument("--depth", type=int, default=8, help="HEALPix depth (default: 8)")
     p_pc.add_argument(
-        "--n-shards", type=int, default=16, help="Number of shards (default: 16, benchmark-style)"
+        "--n-shards",
+        type=int,
+        default=16,
+        help="Number of shards (default: 16, benchmark-style)",
     )
     p_pc.add_argument("--ra-col", default=None, help="RA column name")
     p_pc.add_argument("--dec-col", default=None, help="Dec column name")

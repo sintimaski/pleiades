@@ -24,6 +24,8 @@
 - Parquet 52 compatibility in Rust; ruff/mypy and test cleanups
 - Crate: `#![forbid(unsafe_code)]` relaxed only when `macos_readahead` is enabled (single fcntl FFI)
 - **Perf — pixels and index:** Single pass `pixels_and_index()` builds both the HEALPix index and the pixel set (one hash per row). Chunk 1+ reuses the pixel set from the previous B-prefetch and only builds the index via `index_only()`. Pixel-set construction uses parallel `fold_with`/`reduce_with` for HashSet merge.
+- **Perf — join:** Columnar B (`BColumns`: `id_b`, `ra_b`, `dec_b`); hot path touches only ra/dec. B grouped by HEALPix pixel so `pixels_to_look` is computed once per pixel. Haversine in batches of 8 then 4; cheap reject (radius_deg) before haversine in remainder path. n_nearest applied per chunk before write (`merge_to_n_nearest`); `apply_n_nearest` still merges across chunks.
+- **Perf — partition B:** Batches processed in parallel (`partition_batch_to_row_results` via Rayon); merge and flush remain single-threaded.
 
 ---
 
@@ -50,5 +52,5 @@
 
 ---
 
-[Unreleased]: https://github.com/your-org/pleiades/compare/v0.1.0...HEAD  
+[Unreleased]: https://github.com/your-org/pleiades/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/your-org/pleiades/releases/tag/v0.1.0
