@@ -121,7 +121,7 @@ fn cross_match(
         .unbind())
 }
 
-/// Returns true if the extension was built with the `wgpu` feature (GPU join available when PLEIADES_GPU=wgpu).
+/// Returns true if the extension was built with the `wgpu` feature (GPU join used by default when available; set PLEIADES_GPU=0 to force CPU).
 #[cfg(feature = "python")]
 #[pyfunction]
 fn has_wgpu_feature() -> bool {

@@ -133,19 +133,16 @@ fn haversine_arcsec(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) ->
     haversine_rad(lon1, lat1, lon2, lat2) * RAD_TO_ARCSEC
 }
 
-/// Compute 4 haversine distances (arcsec) in one batch. Same (ra2_deg, dec2_deg) for all four.
-/// Writes to `out[0..4]`. Enables compiler autovectorization and better cache use.
+/// Compute 4 haversine distances (arcsec). (lon2, lat2, cos_lat2) in radians for reuse per B row.
 #[inline(always)]
-fn haversine_arcsec_4(
+fn haversine_arcsec_4_rad(
     ra1_deg: &[f64; 4],
     dec1_deg: &[f64; 4],
-    ra2_deg: f64,
-    dec2_deg: f64,
+    lon2: f64,
+    lat2: f64,
+    cos_lat2: f64,
     out: &mut [f64; 4],
 ) {
-    let lon2 = ra2_deg * DEG_TO_RAD;
-    let lat2 = dec2_deg * DEG_TO_RAD;
-    let cos_lat2 = lat2.cos();
     for i in 0..4 {
         let lon1 = ra1_deg[i] * DEG_TO_RAD;
         let lat1 = dec1_deg[i] * DEG_TO_RAD;
@@ -157,6 +154,21 @@ fn haversine_arcsec_4(
         );
         out[i] = 2.0 * (a.sqrt().min(1.0).asin()) * RAD_TO_ARCSEC;
     }
+}
+
+/// Compute 4 haversine distances (arcsec) in one batch. Same (ra2_deg, dec2_deg) for all four.
+#[inline(always)]
+fn haversine_arcsec_4(
+    ra1_deg: &[f64; 4],
+    dec1_deg: &[f64; 4],
+    ra2_deg: f64,
+    dec2_deg: f64,
+    out: &mut [f64; 4],
+) {
+    let lon2 = ra2_deg * DEG_TO_RAD;
+    let lat2 = dec2_deg * DEG_TO_RAD;
+    let cos_lat2 = lat2.cos();
+    haversine_arcsec_4_rad(ra1_deg, dec1_deg, lon2, lat2, cos_lat2, out);
 }
 
 /// Compute 8 haversine distances (arcsec) in one batch. Same (ra2_deg, dec2_deg) for all eight.
@@ -171,6 +183,19 @@ fn haversine_arcsec_8(
     let lon2 = ra2_deg * DEG_TO_RAD;
     let lat2 = dec2_deg * DEG_TO_RAD;
     let cos_lat2 = lat2.cos();
+    haversine_arcsec_8_rad(ra1_deg, dec1_deg, lon2, lat2, cos_lat2, out);
+}
+
+/// Same as haversine_arcsec_8 but (lon2, lat2, cos_lat2) already in radians. Saves repeated conversion per B row.
+#[inline(always)]
+fn haversine_arcsec_8_rad(
+    ra1_deg: &[f64; 8],
+    dec1_deg: &[f64; 8],
+    lon2: f64,
+    lat2: f64,
+    cos_lat2: f64,
+    out: &mut [f64; 8],
+) {
     for i in 0..8 {
         let lon1 = ra1_deg[i] * DEG_TO_RAD;
         let lat1 = dec1_deg[i] * DEG_TO_RAD;
@@ -945,58 +970,68 @@ fn run_cpu_join(
             pixels_to_look.push(*pixel);
             nested::append_bulk_neighbours(depth_local, *pixel, &mut pixels_to_look);
 
+            // Merge and sort candidate indices from all neighbor pixels for cache-friendly access to ra_flat/dec_flat.
+            let mut candidates: Vec<usize> = Vec::new();
+            for pix in &pixels_to_look {
+                if let Some(ixs) = index_ref.get(pix) {
+                    candidates.extend(ixs.iter().copied());
+                }
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+
             let mut out: Vec<(usize, Vec<(usize, usize, f64)>)> = Vec::with_capacity(b_indices.len());
             for &b_row_ix in b_indices {
                 let ra_b_deg = ra_b[b_row_ix];
                 let dec_b_deg = dec_b[b_row_ix];
+                let lon2 = ra_b_deg * DEG_TO_RAD;
+                let lat2 = dec_b_deg * DEG_TO_RAD;
+                let cos_lat2 = lat2.cos();
+
                 let mut row_matches = Vec::new();
-                for pix in &pixels_to_look {
-                    let Some(candidate_ixs) = index_ref.get(pix) else { continue };
-                    // Batches of 8 (then 4, then remainder)
-                    let chunks8 = candidate_ixs.chunks_exact(8);
-                    let remainder8 = chunks8.remainder();
-                    for chunk in chunks8 {
-                        let mut ra1 = [0.0_f64; 8];
-                        let mut dec1 = [0.0_f64; 8];
-                        for (i, &ix) in chunk.iter().enumerate() {
-                            ra1[i] = ra_flat_ref[ix];
-                            dec1[i] = dec_flat_ref[ix];
-                        }
-                        let mut seps = [0.0_f64; 8];
-                        haversine_arcsec_8(&ra1, &dec1, ra_b_deg, dec_b_deg, &mut seps);
-                        for (i, &candidate_ix) in chunk.iter().enumerate() {
-                            if seps[i] <= radius_arcsec {
-                                row_matches.push((candidate_ix, b_row_ix, seps[i]));
-                            }
+                let chunks8 = candidates.chunks_exact(8);
+                let remainder8 = chunks8.remainder();
+                for chunk in chunks8 {
+                    let mut ra1 = [0.0_f64; 8];
+                    let mut dec1 = [0.0_f64; 8];
+                    for (i, &ix) in chunk.iter().enumerate() {
+                        ra1[i] = ra_flat_ref[ix];
+                        dec1[i] = dec_flat_ref[ix];
+                    }
+                    let mut seps = [0.0_f64; 8];
+                    haversine_arcsec_8_rad(&ra1, &dec1, lon2, lat2, cos_lat2, &mut seps);
+                    for (i, &candidate_ix) in chunk.iter().enumerate() {
+                        if seps[i] <= radius_arcsec {
+                            row_matches.push((candidate_ix, b_row_ix, seps[i]));
                         }
                     }
-                    let chunks4 = remainder8.chunks_exact(4);
-                    let remainder = chunks4.remainder();
-                    for chunk in chunks4 {
-                        let mut ra1 = [0.0_f64; 4];
-                        let mut dec1 = [0.0_f64; 4];
-                        for (i, &ix) in chunk.iter().enumerate() {
-                            ra1[i] = ra_flat_ref[ix];
-                            dec1[i] = dec_flat_ref[ix];
-                        }
-                        let mut seps = [0.0_f64; 4];
-                        haversine_arcsec_4(&ra1, &dec1, ra_b_deg, dec_b_deg, &mut seps);
-                        for (i, &candidate_ix) in chunk.iter().enumerate() {
-                            if seps[i] <= radius_arcsec {
-                                row_matches.push((candidate_ix, b_row_ix, seps[i]));
-                            }
+                }
+                let chunks4 = remainder8.chunks_exact(4);
+                let remainder = chunks4.remainder();
+                for chunk in chunks4 {
+                    let mut ra1 = [0.0_f64; 4];
+                    let mut dec1 = [0.0_f64; 4];
+                    for (i, &ix) in chunk.iter().enumerate() {
+                        ra1[i] = ra_flat_ref[ix];
+                        dec1[i] = dec_flat_ref[ix];
+                    }
+                    let mut seps = [0.0_f64; 4];
+                    haversine_arcsec_4_rad(&ra1, &dec1, lon2, lat2, cos_lat2, &mut seps);
+                    for (i, &candidate_ix) in chunk.iter().enumerate() {
+                        if seps[i] <= radius_arcsec {
+                            row_matches.push((candidate_ix, b_row_ix, seps[i]));
                         }
                     }
-                    for &candidate_ix in remainder {
-                        let ra_a = ra_flat_ref[candidate_ix];
-                        let dec_a = dec_flat_ref[candidate_ix];
-                        if cheap_reject_deg(ra_a, dec_a, ra_b_deg, dec_b_deg, radius_deg) {
-                            continue;
-                        }
-                        let sep = haversine_arcsec(ra_a, dec_a, ra_b_deg, dec_b_deg);
-                        if sep <= radius_arcsec {
-                            row_matches.push((candidate_ix, b_row_ix, sep));
-                        }
+                }
+                for &candidate_ix in remainder {
+                    let ra_a = ra_flat_ref[candidate_ix];
+                    let dec_a = dec_flat_ref[candidate_ix];
+                    if cheap_reject_deg(ra_a, dec_a, ra_b_deg, dec_b_deg, radius_deg) {
+                        continue;
+                    }
+                    let sep = haversine_arcsec(ra_a, dec_a, ra_b_deg, dec_b_deg);
+                    if sep <= radius_arcsec {
+                        row_matches.push((candidate_ix, b_row_ix, sep));
                     }
                 }
                 out.push((b_row_ix, row_matches));
@@ -1320,7 +1355,11 @@ pub fn cross_match_impl(
 
         #[cfg(feature = "wgpu")]
         {
-            let use_gpu = env::var("PLEIADES_GPU").as_deref() == Ok("wgpu") && crate::gpu::gpu_available();
+            // Use GPU by default when wgpu feature is built and a GPU is available.
+            // Set PLEIADES_GPU=0, cpu, or off to force CPU.
+            let gpu_env = env::var("PLEIADES_GPU").as_deref().unwrap_or("");
+            let use_gpu = !matches!(gpu_env.to_lowercase().as_str(), "0" | "off" | "cpu" | "false")
+                && crate::gpu::gpu_available();
             if use_gpu {
                 // Collect (a_ix, b_ix) candidate pairs from HEALPix index (no distance yet).
                 let mut pairs: Vec<(usize, usize)> = Vec::new();

@@ -1,5 +1,6 @@
 //! Optional wgpu-based GPU haversine kernel for cross-match distance computation.
-//! Enabled with the `wgpu` feature and activated by setting PLEIADES_GPU=wgpu.
+//! Enabled with the `wgpu` feature; used by default when a GPU is available.
+//! Set PLEIADES_GPU=0, cpu, or off to force CPU.
 //!
 //! Computes angular separation in arcsec for N (ra_a, dec_a, ra_b, dec_b) pairs in a single
 //! compute dispatch. Used when the engine has collected candidate pairs from the HEALPix index.

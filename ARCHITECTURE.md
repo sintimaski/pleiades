@@ -91,10 +91,6 @@ So: **yes, multiple threads already read input** (A in a prefetch thread; B shar
 
 ## Further speedups (matching)
 
-Implemented: columnar B (`BColumns`), reuse of `pixels_to_look` per pixel, cheap reject before haversine (remainder path), haversine batches of 8 (then 4), n_nearest per chunk before write, parallel partition of B (batches processed in parallel). See “Join” and “Partitioning B” above.
+Implemented: columnar B (`BColumns`), reuse of `pixels_to_look` per pixel, cheap reject before haversine (remainder path), haversine batches of 8 (then 4), n_nearest per chunk before write, parallel partition of B (batches processed in parallel), and **GPU join by default when available**. See “Join” and “Partitioning B” above.
 
-**Could add later:**
-
-| Idea | Benefit | Notes |
-|------|---------|--------|
-| **GPU join by default when available** | Large speedup for huge pair counts | Today GPU is opt-in (`PLEIADES_GPU=wgpu`) and only used when pair count > threshold. Could default on when the wgpu feature is built and a GPU is available. |
+When the `wgpu` feature is built, the GPU is used by default when a GPU is available and pair count ≥ `PLEIADES_GPU_MIN_PAIRS` (default 80M). Set `PLEIADES_GPU=0`, `cpu`, or `off` to force CPU.
