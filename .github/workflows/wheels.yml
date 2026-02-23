@@ -73,7 +73,7 @@ jobs:
       - name: Install maturin
         run: pip install maturin
       - name: Build sdist
-        run: maturin build --release --sdist-only
+        run: maturin build --release --sdist
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:

@@ -156,36 +156,6 @@ fn haversine_arcsec_4_rad(
     }
 }
 
-/// Compute 4 haversine distances (arcsec) in one batch. Same (ra2_deg, dec2_deg) for all four.
-#[inline(always)]
-fn haversine_arcsec_4(
-    ra1_deg: &[f64; 4],
-    dec1_deg: &[f64; 4],
-    ra2_deg: f64,
-    dec2_deg: f64,
-    out: &mut [f64; 4],
-) {
-    let lon2 = ra2_deg * DEG_TO_RAD;
-    let lat2 = dec2_deg * DEG_TO_RAD;
-    let cos_lat2 = lat2.cos();
-    haversine_arcsec_4_rad(ra1_deg, dec1_deg, lon2, lat2, cos_lat2, out);
-}
-
-/// Compute 8 haversine distances (arcsec) in one batch. Same (ra2_deg, dec2_deg) for all eight.
-#[inline(always)]
-fn haversine_arcsec_8(
-    ra1_deg: &[f64; 8],
-    dec1_deg: &[f64; 8],
-    ra2_deg: f64,
-    dec2_deg: f64,
-    out: &mut [f64; 8],
-) {
-    let lon2 = ra2_deg * DEG_TO_RAD;
-    let lat2 = dec2_deg * DEG_TO_RAD;
-    let cos_lat2 = lat2.cos();
-    haversine_arcsec_8_rad(ra1_deg, dec1_deg, lon2, lat2, cos_lat2, out);
-}
-
 /// Same as haversine_arcsec_8 but (lon2, lat2, cos_lat2) already in radians. Saves repeated conversion per B row.
 #[inline(always)]
 fn haversine_arcsec_8_rad(
