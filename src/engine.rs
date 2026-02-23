@@ -423,6 +423,45 @@ fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) ->
         .collect()
 }
 
+/// One pass over chunk A: build HEALPix index (pixel -> row indices) and pixel set (centers + neighbors).
+/// Hashes each (ra, dec) once instead of separate pixels then index passes.
+fn pixels_and_index(
+    ra_deg: &[f64],
+    dec_deg: &[f64],
+    depth: u8,
+) -> (HashMap<u64, Vec<usize>>, HashSet<u64>) {
+    let layer = get(depth);
+    (0..ra_deg.len())
+        .into_par_iter()
+        .map(|row| {
+            let lon = ra_deg[row] * DEG_TO_RAD;
+            let lat = dec_deg[row] * DEG_TO_RAD;
+            let center = layer.hash(lon, lat);
+            let mut neighbours = Vec::with_capacity(9);
+            neighbours.push(center);
+            nested::append_bulk_neighbours(depth, center, &mut neighbours);
+            (center, row, neighbours)
+        })
+        .fold_with(
+            (HashMap::<u64, Vec<usize>>::new(), HashSet::<u64>::new()),
+            |(mut idx, mut pixels), (center, row, neighbours)| {
+                idx.entry(center).or_default().push(row);
+                for p in neighbours {
+                    pixels.insert(p);
+                }
+                (idx, pixels)
+            },
+        )
+        .reduce_with(|(mut a_idx, mut a_pix), (b_idx, b_pix)| {
+            for (p, rows) in b_idx {
+                a_idx.entry(p).or_default().extend(rows);
+            }
+            a_pix.extend(b_pix);
+            (a_idx, a_pix)
+        })
+        .unwrap_or_else(|| (HashMap::new(), HashSet::new()))
+}
+
 /// Progress callback type: (chunk_ix, total_or_none, rows_a_read, matches_count).
 /// Return true to continue, false to cancel (e.g. on Ctrl+C); engine stops at chunk boundary.
 pub type ProgressCallback = Option<Box<dyn Fn(usize, Option<usize>, u64, u64) -> bool + Send>>;
@@ -1018,7 +1057,8 @@ pub fn cross_match_impl(
 
         let (ra_deg_a, dec_deg_a) = ra_dec_degrees(&batch_a, ra_idx, dec_idx, from_radians)?;
 
-        let pixels_wanted = pixels_in_chunk_with_neighbors(&ra_deg_a, &dec_deg_a, depth);
+        let t_pixels_index = std::time::Instant::now();
+        let (index, pixels_wanted) = pixels_and_index(&ra_deg_a, &dec_deg_a, depth);
         // Send B load requests so prefetch runs in parallel: current chunk (when first), and next chunk.
         if use_b_prefetch {
             if prefetched_b.is_none() {
@@ -1032,39 +1072,21 @@ pub fn cross_match_impl(
                 let _ = tx_b_request.send(Some(pixels_next));
             }
         }
+        if verbose {
+            verbose_log_timed(
+                "  pixels+index",
+                t_pixels_index.elapsed().as_secs_f64(),
+                &format!("({} pixels)", pixels_wanted.len()),
+            );
+        }
 
-        let t_index = std::time::Instant::now();
-        // Build id_a_flat and HEALPix index in parallel (was sequential hot path).
+        // Build id_a_flat and ra/dec flat arrays for join (index already built above).
         let id_a_flat: Vec<IdVal> = (0..n_a)
             .into_par_iter()
             .map(|row| get_id_value(&batch_a, &id_a_col, id_a_idx, row))
             .collect();
         let ra_flat: Vec<f64> = ra_deg_a.to_vec();
         let dec_flat: Vec<f64> = dec_deg_a.to_vec();
-        let index: HashMap<u64, Vec<usize>> = (0..n_a)
-            .into_par_iter()
-            .map(|row| {
-                let lon = ra_deg_a[row] * DEG_TO_RAD;
-                let lat = dec_deg_a[row] * DEG_TO_RAD;
-                (layer.hash(lon, lat), row)
-            })
-            .fold_with(
-                HashMap::<u64, Vec<usize>>::new(),
-                |mut m, (pix, row)| {
-                    m.entry(pix).or_default().push(row);
-                    m
-                },
-            )
-            .reduce_with(|mut a: HashMap<u64, Vec<usize>>, b| {
-                for (pix, v) in b {
-                    a.entry(pix).or_default().extend(v);
-                }
-                a
-            })
-            .unwrap_or_else(HashMap::new);
-        if verbose {
-            verbose_log_timed("  index", t_index.elapsed().as_secs_f64(), "");
-        }
 
         let mut matches_id_a: Vec<IdVal> = Vec::new();
         let mut matches_id_b: Vec<IdVal> = Vec::new();

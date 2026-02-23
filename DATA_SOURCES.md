@@ -19,6 +19,19 @@ References for **real** Parquet catalogs (RA/Dec, large-scale) for cross-matchin
 
 ---
 
+## Out-of-core: streaming, not loading
+
+The catalogs in this document (Gaia DR3 ~1.8B rows, AllWISE ~340 GB, NEOWISE 200B+ rows, SDSS >125 TB) do **not** need to fit in memory. Pleiades is designed for that.
+
+- **Opening a file** only creates a handle; it does **not** read the file into RAM. The engine opens Parquet files and then **reads in chunks** (record batches).
+- **Catalog A** is streamed: read in batches of `batch_size_a` (default 250k rows). At most one or two batches are in memory at a time; the rest stays on disk until the reader advances.
+- **Catalog B** is either (1) read once in batches when partitioning to shards, or (2) supplied as pre-partitioned shards; then for each A chunk we only **read the B shard files** needed for that chunk’s pixels, again in batches (128k rows per read). We never load a full B catalog into RAM.
+- **Matches** are written incrementally per chunk, not buffered in full.
+
+Memory use is bounded by: `batch_size_a`, the B rows for the current chunk’s pixels, and join buffers. Tune `batch_size_a`, `batch_size_b`, and `n_shards` for your machine (smaller = less RAM, more I/O). For billion-row or multi-TB inputs, use **pre-partitioned B** so B is never read as one huge file.
+
+---
+
 ## Catalog schemas (typical)
 
 | Source | RA | Dec | ID | Units |
