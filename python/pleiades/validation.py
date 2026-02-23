@@ -56,7 +56,7 @@ def validate_cross_match_args(
 
 
 def validate_catalog_schema(
-    path: Path,
+    path: str | Path,
     *,
     ra_col: str = "ra",
     dec_col: str = "dec",
@@ -70,13 +70,21 @@ def validate_catalog_schema(
     If id_col is provided, checks it exists. If must_have_id is True,
     ensures at least one non-ra/dec column exists.
 
+    Args:
+        path: Path to the Parquet file (file must exist and be a regular file).
+        ra_col: Name of the RA column (default "ra").
+        dec_col: Name of the Dec column (default "dec").
+        id_col: If set, this column must exist in the schema.
+        must_have_id: If True, at least one non-ra/dec column must exist.
+
     Returns:
         The Parquet schema if valid.
 
     Raises:
-        FileNotFoundError: If path does not exist.
+        FileNotFoundError: If path does not exist or is not a regular file.
         CatalogValidationError: If schema is invalid.
     """
+    path = Path(path)
     if not path.is_file():
         raise FileNotFoundError(f"Catalog not found: {path}")
 
@@ -123,9 +131,12 @@ def validate_catalog_schema(
     return schema
 
 
-def validate_prepartitioned_dir(path: Path) -> tuple[int, pa.Schema]:
+def validate_prepartitioned_dir(path: str | Path) -> tuple[int, pa.Schema]:
     """
     Validate a directory of HEALPix shard Parquet files (shard_0000.parquet, ...).
+
+    Args:
+        path: Path to the directory containing shard_*.parquet files.
 
     Returns:
         (n_shards, schema) where schema is from the first shard.
@@ -133,6 +144,7 @@ def validate_prepartitioned_dir(path: Path) -> tuple[int, pa.Schema]:
     Raises:
         CatalogValidationError: If directory is invalid or empty.
     """
+    path = Path(path)
     if not path.is_dir():
         raise CatalogValidationError(
             f"Pre-partitioned B path is not a directory: {path}"

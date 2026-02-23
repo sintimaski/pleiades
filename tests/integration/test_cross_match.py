@@ -23,6 +23,9 @@ from tests.integration.cross_match_helpers import (
     write_catalogs,
 )
 
+# Avoid hangs on slow or large runs; applies to all tests in this module.
+pytestmark = [pytest.mark.timeout(60)]
+
 
 def _run_cross_match(
     path_a: Path,

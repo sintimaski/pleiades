@@ -89,3 +89,51 @@ class TestCLI:
         assert result.returncode == 0
         assert out.is_file()
         assert "matches" in result.stdout.lower() or "Wrote" in result.stdout
+
+    def test_cli_exit_1_and_stderr_on_missing_catalog(self, tmp_path: Path) -> None:
+        """CLI exits with 1 and prints to stderr when a catalog file is missing."""
+        fixtures = Path(__file__).resolve().parent.parent / "fixtures"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pleiades.cli",
+                "cross-match",
+                "/nonexistent/catalog_a.parquet",
+                str(fixtures / "catalog_b_small.parquet"),
+                "-r",
+                "2.0",
+                "-o",
+                str(tmp_path / "out.parquet"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 1
+        assert "pleiades:" in result.stderr
+        assert "not found" in result.stderr.lower() or "nonexistent" in result.stderr
+
+    def test_cli_exit_1_and_stderr_on_invalid_radius(self, tmp_path: Path) -> None:
+        """CLI exits with 1 and prints to stderr when radius is invalid (e.g. zero)."""
+        fixtures = Path(__file__).resolve().parent.parent / "fixtures"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pleiades.cli",
+                "cross-match",
+                str(fixtures / "catalog_a_small.parquet"),
+                str(fixtures / "catalog_b_small.parquet"),
+                "-r",
+                "0",
+                "-o",
+                str(tmp_path / "out.parquet"),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 1
+        assert "pleiades:" in result.stderr
+        assert "positive" in result.stderr.lower() or "radius" in result.stderr.lower()

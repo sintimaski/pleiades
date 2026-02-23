@@ -580,7 +580,16 @@ def cross_match(
                 chunks_processed=int(result["chunks_processed"]),
                 time_seconds=float(result["time_seconds"]),
             )
-        # Older Rust extension returns None
+        # Older Rust extension returns None; fallback infers stats from Parquet
+        import warnings
+
+        warnings.warn(
+            "The Rust engine returned no result dict; stats were inferred from output "
+            "Parquet. This fallback is deprecated and will be removed when all builds "
+            "return the result dict. Upgrade with: pip install -U pleiades",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         elapsed = time.perf_counter() - t0
         pf_out = pq.ParquetFile(output_path)
         n_match = pf_out.metadata.num_rows if pf_out.metadata else 0

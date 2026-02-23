@@ -323,6 +323,27 @@ class TestMergeMatchToCatalog:
                 matches, "/nonexistent/c.parquet", tmp_path / "out.parquet"
             )
 
+    def test_merge_match_to_catalog_how_non_left_warns(self, tmp_path: Path) -> None:
+        """Passing how other than 'left' emits UserWarning and still performs left merge."""
+        matches = tmp_path / "m.parquet"
+        catalog = tmp_path / "cat.parquet"
+        out = tmp_path / "out.parquet"
+        pq.write_table(
+            pa.table(
+                {"source_id": [1], "object_id": ["B1"], "separation_arcsec": [0.5]}
+            ),
+            matches,
+        )
+        pq.write_table(
+            pa.table({"source_id": [1], "ra": [0.0], "dec": [0.0]}),
+            catalog,
+        )
+        with pytest.warns(UserWarning, match="only supports how='left'"):
+            pleiades.merge_match_to_catalog(matches, catalog, out, how="inner")
+        t = pq.read_table(out)
+        assert t.num_rows == 1
+        assert "separation_arcsec" in t.column_names
+
 
 @pytest.mark.unit
 class TestFilterMatchesByRadius:
@@ -348,11 +369,11 @@ class TestFilterMatchesByRadius:
         assert t.num_rows == 2
         assert max(t.column("separation_arcsec")[i].as_py() for i in range(2)) <= 2.0
 
-    def test_filter_matches_by_radius_file_not_found(self) -> None:
+    def test_filter_matches_by_radius_file_not_found(self, tmp_path: Path) -> None:
         """Raises FileNotFoundError when matches file missing."""
         with pytest.raises(FileNotFoundError, match="Matches file not found"):
             pleiades.filter_matches_by_radius(
-                "/nonexistent/m.parquet", 1.0, "/tmp/out.parquet"
+                "/nonexistent/m.parquet", 1.0, tmp_path / "out.parquet"
             )
 
 

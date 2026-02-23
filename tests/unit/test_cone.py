@@ -60,7 +60,7 @@ class TestConeSearch:
         assert t.num_rows == 0
         assert "separation_arcsec" in t.column_names
 
-    def test_cone_search_file_not_found(self) -> None:
+    def test_cone_search_file_not_found(self, tmp_path: Path) -> None:
         """cone_search raises FileNotFoundError for missing catalog."""
         with pytest.raises(FileNotFoundError, match="Catalog not found"):
             pleiades.cone_search(
@@ -68,7 +68,7 @@ class TestConeSearch:
                 ra_deg=0.0,
                 dec_deg=0.0,
                 radius_arcsec=10.0,
-                output_path="/tmp/out.parquet",
+                output_path=tmp_path / "out.parquet",
             )
 
     def test_cone_search_invalid_schema_raises(self, tmp_path: Path) -> None:

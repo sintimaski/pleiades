@@ -168,14 +168,27 @@ def merge_match_to_catalog(
     catalog_side="a" means catalog rows are identified by id_a (merge on
     catalog.id == matches.id_a); catalog_side="b" uses id_b.
 
+    Only a left-join style is implemented: one row per catalog row, with the
+    first match (by match key) attached. The ``how`` parameter is accepted
+    for API compatibility but only "left" is supported; "inner" and "right"
+    are ignored.
+
     Args:
         matches_path: Path to matches Parquet (id_a, id_b, separation_arcsec).
         catalog_path: Path to catalog Parquet (must have an ID column).
         output_path: Where to write the merged Parquet.
-        how: Join type: "left", "inner", or "right".
+        how: Join type; only "left" is supported (other values are ignored).
         catalog_side: "a" or "b" — which match column corresponds to catalog IDs.
         id_col_catalog: Catalog ID column name; inferred if None.
     """
+    if how != "left":
+        import warnings
+
+        warnings.warn(
+            f"merge_match_to_catalog only supports how='left'; how={how!r} is ignored.",
+            UserWarning,
+            stacklevel=2,
+        )
     path_m = Path(matches_path)
     path_c = Path(catalog_path)
     path_out = Path(output_path)

@@ -75,7 +75,7 @@ fn cross_match(
         None
     };
 
-    let stats = engine::cross_match_impl(
+    let stats = match engine::cross_match_impl(
         path_a,
         path_b,
         path_out,
@@ -92,8 +92,20 @@ fn cross_match(
         n_nearest,
         keep_b_in_memory,
         progress,
-    )
-    .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = e.to_string();
+            if let Ok(io_err) = e.downcast::<std::io::Error>() {
+                if io_err.kind() == std::io::ErrorKind::NotFound {
+                    return Err(pyo3::exceptions::PyFileNotFoundError::new_err(
+                        io_err.to_string(),
+                    ));
+                }
+            }
+            return Err(pyo3::exceptions::PyOSError::new_err(msg));
+        }
+    };
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("output_path", stats.output_path)?;

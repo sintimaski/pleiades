@@ -184,8 +184,14 @@ def main() -> int:
     p_pc.set_defaults(func=cmd_partition)
 
     args = parser.parse_args()
-    exit_code = args.func(parser, args)
-    return int(exit_code)
+    try:
+        exit_code = args.func(parser, args)
+        return int(exit_code)
+    except (FileNotFoundError, OSError, ValueError) as e:
+        print(f"pleiades: {e}", file=sys.stderr)
+        return 1
+    except Exception:
+        raise
 
 
 if __name__ == "__main__":
