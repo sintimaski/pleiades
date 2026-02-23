@@ -139,7 +139,7 @@ $ uv run python scripts/benchmark_cross_match.py --rows 100000
 $ ./scripts/run_benchmarks.sh   # 1M-row run, logs to logs/
 ```
 
-Tuning: see script options and [ARCHITECTURE.md](ARCHITECTURE.md#bottlenecks-and-knobs).
+Set `PLEIADES_VERBOSE=1` to log per-chunk timing (pixels+index, load B, join, write). Tuning: see script options and [ARCHITECTURE.md](ARCHITECTURE.md#bottlenecks-and-knobs).
 
 ## Documentation
 

@@ -16,7 +16,8 @@ catalog_a.parquet     catalog_b.parquet (or shard dir)
         |
         v
   For each A chunk:
-  · Assign pixels (ra, dec → HEALPix)
+  · Pixels + index: one pass over (ra, dec) → HEALPix index (pixel → rows) and pixel set (centers + neighbors); chunk 1+ reuses pixel set from previous B-prefetch and only builds index
+  · Load B rows for those pixels (from shards or memory)
   · For each B row in same/neighbor pixels: haversine → (id_a, id_b, sep)
   · Write matches to Parquet
         |
@@ -72,7 +73,7 @@ Possible later improvements: columnar B representation (`ra_b: &[f64], dec_b: &[
 - **B reads (shards):** When `catalog_b` is a directory of shards, **multiple shard files are read in parallel** (Rayon `par_iter` over the shard indices needed for the chunk). So many threads read different `shard_*.parquet` files at once.
 - **Join:** The inner B-loop (haversine, candidate search) is parallelized with Rayon over B rows. Thread count follows `RAYON_NUM_THREADS` or `std::thread::available_parallelism()`.
 - **B prefetch:** When using shards, a background thread loads B for the current and next chunk (two requests in flight). The main thread sends both at chunk start, builds the index (while current B loads), then runs the join (while next B loads). So index and load B overlap for the first chunk, and join and load-next-B overlap for every chunk.
-- **Index build (A chunk):** Building the HEALPix index (pixel → row indices) and `id_a_flat` for each A chunk is done in parallel with Rayon (`par_iter` + `fold_with`/`reduce_with`), so this hot path is no longer sequential.
+- **Pixels + index (A chunk):** A single parallel pass builds both the HEALPix index (pixel → row indices) and the pixel set (centers + 8 neighbors) with one hash per row (`pixels_and_index`). For chunk 1+, the pixel set is reused from the previous chunk’s B-prefetch request and only the index is built (`index_only`). The “next” chunk’s pixel set is computed for B prefetch and stored for the next iteration. Pixel-set construction uses parallel `fold_with`/`reduce_with` for HashSet merge. With `PLEIADES_VERBOSE=1`, the engine logs `pixels+index` time and pixel count per chunk.
 
 **Still single-threaded:**
 

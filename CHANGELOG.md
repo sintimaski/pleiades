@@ -9,6 +9,7 @@
 ### Added
 
 - **B prefetch overlap:** Send current and next chunk’s B load requests at chunk start; index runs in parallel with load B for the first chunk, join with load B for the next (two requests in flight).
+- **Verbose timing:** With `PLEIADES_VERBOSE=1`, the engine logs per-chunk phases: `pixels+index` (time and pixel count), `load B`, `join`, `write`, and `chunk total`.
 - **load_one_shard fast path:** Downcast columns once per batch, slice access for ra/dec, reserve capacity, Int64 id_b specialization; 128k-row batch size for shard Parquet reads.
 - **macOS:** Optional feature `macos_readahead` (build with `--features macos_readahead`) enables kernel read-ahead on shard files via `fcntl(F_RDAHEAD)`.
 - **I/O profiling:** `scripts/profile_io.sh` runs the benchmark under `time -l` and optionally `fs_usage` (macOS) for disk I/O and resource stats.
@@ -22,6 +23,7 @@
 - Docs and benchmarks updated (README, scripts)
 - Parquet 52 compatibility in Rust; ruff/mypy and test cleanups
 - Crate: `#![forbid(unsafe_code)]` relaxed only when `macos_readahead` is enabled (single fcntl FFI)
+- **Perf — pixels and index:** Single pass `pixels_and_index()` builds both the HEALPix index and the pixel set (one hash per row). Chunk 1+ reuses the pixel set from the previous B-prefetch and only builds the index via `index_only()`. Pixel-set construction uses parallel `fold_with`/`reduce_with` for HashSet merge.
 
 ---
 
