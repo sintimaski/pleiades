@@ -406,12 +406,13 @@ fn load_b_from_shards(
     Ok(out)
 }
 
-/// Compute pixels in chunk A plus all 8 neighbors (halo). Parallel over rows.
+/// Compute pixels in chunk A plus all 8 neighbors (halo). Parallel over rows; merge with
+/// fold/reduce for better parallelism than single-threaded collect into HashSet.
 fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) -> HashSet<u64> {
     let layer = get(depth);
     (0..ra_deg.len())
         .into_par_iter()
-        .flat_map(|i| {
+        .map(|i| {
             let lon = ra_deg[i] * DEG_TO_RAD;
             let lat = dec_deg[i] * DEG_TO_RAD;
             let center = layer.hash(lon, lat);
@@ -420,7 +421,15 @@ fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) ->
             nested::append_bulk_neighbours(depth, center, &mut neighbours);
             neighbours
         })
-        .collect()
+        .fold_with(HashSet::new(), |mut s, neighbours| {
+            s.extend(neighbours);
+            s
+        })
+        .reduce_with(|mut a, b| {
+            a.extend(b);
+            a
+        })
+        .unwrap_or_else(HashSet::new)
 }
 
 /// One pass over chunk A: build HEALPix index (pixel -> row indices) and pixel set (centers + neighbors).
@@ -460,6 +469,36 @@ fn pixels_and_index(
             (a_idx, a_pix)
         })
         .unwrap_or_else(|| (HashMap::new(), HashSet::new()))
+}
+
+/// Build HEALPix index only (pixel -> row indices). One hash per row, no neighbor set.
+fn index_only(
+    ra_deg: &[f64],
+    dec_deg: &[f64],
+    depth: u8,
+) -> HashMap<u64, Vec<usize>> {
+    let layer = get(depth);
+    (0..ra_deg.len())
+        .into_par_iter()
+        .map(|row| {
+            let lon = ra_deg[row] * DEG_TO_RAD;
+            let lat = dec_deg[row] * DEG_TO_RAD;
+            (layer.hash(lon, lat), row)
+        })
+        .fold_with(
+            HashMap::<u64, Vec<usize>>::new(),
+            |mut m, (pix, row)| {
+                m.entry(pix).or_default().push(row);
+                m
+            },
+        )
+        .reduce_with(|mut a, b| {
+            for (pix, v) in b {
+                a.entry(pix).or_default().extend(v);
+            }
+            a
+        })
+        .unwrap_or_else(HashMap::new)
 }
 
 /// Progress callback type: (chunk_ix, total_or_none, rows_a_read, matches_count).
@@ -863,6 +902,7 @@ pub fn cross_match_impl(
     progress_callback: ProgressCallback,
 ) -> Result<CrossMatchStats, Box<dyn std::error::Error + Send + Sync>> {
     let from_radians = is_radians(ra_dec_units);
+    #[allow(unused_variables)]
     let layer = get(depth);
     let t0 = std::time::Instant::now();
     let verbose = env::var("PLEIADES_VERBOSE").is_ok();
@@ -1035,6 +1075,8 @@ pub fn cross_match_impl(
     let mut current_batch = recv_a(&rx_a)?;
     let mut next_batch = if use_b_prefetch { recv_a(&rx_a)? } else { None };
     let mut prefetched_b: Option<Vec<(IdVal, f64, f64)>> = None;
+    // Reuse pixels computed for B prefetch as pixels_wanted next iteration (avoids re-computing).
+    let mut next_pixels_wanted: Option<HashSet<u64>> = None;
 
     while let Some(batch_a) = current_batch.take() {
         chunks_processed += 1;
@@ -1058,7 +1100,15 @@ pub fn cross_match_impl(
         let (ra_deg_a, dec_deg_a) = ra_dec_degrees(&batch_a, ra_idx, dec_idx, from_radians)?;
 
         let t_pixels_index = std::time::Instant::now();
-        let (index, pixels_wanted) = pixels_and_index(&ra_deg_a, &dec_deg_a, depth);
+        let (index, pixels_wanted) = if let Some(reuse) = next_pixels_wanted.take() {
+            // Chunk 1+: reuse pixels from previous B-prefetch; only build index.
+            let index = index_only(&ra_deg_a, &dec_deg_a, depth);
+            (index, reuse)
+        } else {
+            // Chunk 0: single pass for both index and pixel set.
+            pixels_and_index(&ra_deg_a, &dec_deg_a, depth)
+        };
+
         // Send B load requests so prefetch runs in parallel: current chunk (when first), and next chunk.
         if use_b_prefetch {
             if prefetched_b.is_none() {
@@ -1069,7 +1119,8 @@ pub fn cross_match_impl(
                 let dec_idx_n = column_index(next, dec_col);
                 let (ra_n, dec_n) = ra_dec_degrees(next, ra_idx_n, dec_idx_n, from_radians)?;
                 let pixels_next = pixels_in_chunk_with_neighbors(&ra_n, &dec_n, depth);
-                let _ = tx_b_request.send(Some(pixels_next));
+                let _ = tx_b_request.send(Some(pixels_next.clone()));
+                next_pixels_wanted = Some(pixels_next);
             }
         }
         if verbose {
