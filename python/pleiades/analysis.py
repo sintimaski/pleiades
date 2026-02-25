@@ -316,6 +316,25 @@ def attach_match_coords(
         raise FileNotFoundError(f"Catalog A not found: {path_a}")
     if not path_b.is_file():
         raise FileNotFoundError(f"Catalog B not found: {path_b}")
+
+    try:
+        import pleiades_core
+
+        if hasattr(pleiades_core, "attach_match_coords"):
+            pleiades_core.attach_match_coords(
+                str(path_m),
+                str(path_a),
+                str(path_b),
+                str(path_out),
+                id_col_a=id_col_a,
+                id_col_b=id_col_b,
+                ra_col=ra_col,
+                dec_col=dec_col,
+            )
+            return
+    except ImportError:
+        pass
+
     matches = pq.read_table(path_m)
     catalog_a = pq.read_table(path_a)
     catalog_b = pq.read_table(path_b)

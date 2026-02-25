@@ -29,7 +29,7 @@ use pyo3::prelude::*;
 /// matches_count, chunks_processed, time_seconds).
 #[cfg(feature = "python")]
 #[pyfunction]
-#[pyo3(signature = (catalog_a, catalog_b, radius_arcsec, output_path, depth=8, batch_size_a=100_000, batch_size_b=100_000, n_shards=512, ra_col="ra", dec_col="dec", id_col_a=None, id_col_b=None, ra_dec_units="deg", n_nearest=None, keep_b_in_memory=false, progress_callback=None))]
+#[pyo3(signature = (catalog_a, catalog_b, radius_arcsec, output_path, depth=8, batch_size_a=100_000, batch_size_b=100_000, n_shards=512, ra_col="ra", dec_col="dec", id_col_a=None, id_col_b=None, ra_dec_units="deg", n_nearest=None, keep_b_in_memory=false, include_coords=false, progress_callback=None))]
 fn cross_match(
     py: Python<'_>,
     catalog_a: &str,
@@ -47,6 +47,7 @@ fn cross_match(
     ra_dec_units: &str,
     n_nearest: Option<u32>,
     keep_b_in_memory: bool,
+    include_coords: bool,
     progress_callback: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let path_a = Path::new(catalog_a);
@@ -97,6 +98,7 @@ fn cross_match(
         ra_dec_units,
         n_nearest,
         keep_b_in_memory,
+        include_coords,
         progress,
         None,
     ) {
@@ -242,6 +244,7 @@ fn cross_match_iter(
             &ra_dec_units,
             n_nearest,
             keep_b_in_memory,
+            false, /* include_coords: not supported for streaming */
             None,
             callback,
         );
@@ -256,6 +259,104 @@ fn cross_match_iter(
         };
         Ok(iter.into_py(py).into_any())
     })
+}
+
+/// Cone search: find all catalog rows within radius_arcsec of (ra_deg, dec_deg).
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (catalog_path, ra_deg, dec_deg, radius_arcsec, output_path, ra_col="ra", dec_col="dec", id_col=None, ra_dec_units="deg", batch_size=100_000))]
+fn cone_search(
+    catalog_path: &str,
+    ra_deg: f64,
+    dec_deg: f64,
+    radius_arcsec: f64,
+    output_path: &str,
+    ra_col: &str,
+    dec_col: &str,
+    id_col: Option<&str>,
+    ra_dec_units: &str,
+    batch_size: usize,
+) -> PyResult<i64> {
+    let path = Path::new(catalog_path);
+    let out = Path::new(output_path);
+    let from_radians = ra_dec_units.to_lowercase() == "rad";
+    match engine::cone_search_impl(path, ra_deg, dec_deg, radius_arcsec, out, ra_col, dec_col, id_col, from_radians, batch_size) {
+        Ok(n) => Ok(n as i64),
+        Err(e) => {
+            let msg = e.to_string();
+            if let Ok(io_err) = e.downcast::<std::io::Error>() {
+                if io_err.kind() == std::io::ErrorKind::NotFound {
+                    return Err(pyo3::exceptions::PyFileNotFoundError::new_err(msg));
+                }
+            }
+            Err(pyo3::exceptions::PyOSError::new_err(msg))
+        }
+    }
+}
+
+/// Batch cone search: find catalog rows within at least one of the given cones.
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (catalog_path, queries, output_path, ra_col="ra", dec_col="dec", id_col=None, ra_dec_units="deg", batch_size=100_000))]
+fn batch_cone_search(
+    py: Python<'_>,
+    catalog_path: &str,
+    queries: Bound<'_, PyAny>,
+    output_path: &str,
+    ra_col: &str,
+    dec_col: &str,
+    id_col: Option<&str>,
+    ra_dec_units: &str,
+    batch_size: usize,
+) -> PyResult<i64> {
+    let queries_rust: Vec<(f64, f64, f64)> = queries
+        .extract::<Vec<(f64, f64, f64)>>()
+        .map_err(|e| pyo3::exceptions::PyTypeError::new_err(format!("queries must be list of (ra, dec, radius): {}", e)))?;
+    let path = Path::new(catalog_path);
+    let out = Path::new(output_path);
+    let from_radians = ra_dec_units.to_lowercase() == "rad";
+    match engine::batch_cone_search_impl(path, &queries_rust, out, ra_col, dec_col, id_col, from_radians, batch_size) {
+        Ok(n) => Ok(n as i64),
+        Err(e) => {
+            let msg = e.to_string();
+            if let Ok(io_err) = e.downcast::<std::io::Error>() {
+                if io_err.kind() == std::io::ErrorKind::NotFound {
+                    return Err(pyo3::exceptions::PyFileNotFoundError::new_err(msg));
+                }
+            }
+            Err(pyo3::exceptions::PyOSError::new_err(msg))
+        }
+    }
+}
+
+/// Attach ra_a, dec_a, ra_b, dec_b to matches from catalogs.
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (matches_path, catalog_a_path, catalog_b_path, output_path, id_col_a=None, id_col_b=None, ra_col="ra", dec_col="dec"))]
+fn attach_match_coords(
+    matches_path: &str,
+    catalog_a_path: &str,
+    catalog_b_path: &str,
+    output_path: &str,
+    id_col_a: Option<&str>,
+    id_col_b: Option<&str>,
+    ra_col: &str,
+    dec_col: &str,
+) -> PyResult<()> {
+    let m = Path::new(matches_path);
+    let a = Path::new(catalog_a_path);
+    let b = Path::new(catalog_b_path);
+    let out = Path::new(output_path);
+    engine::attach_match_coords_impl(m, a, b, out, id_col_a, id_col_b, ra_col, dec_col)
+        .map_err(|e| {
+            let msg = e.to_string();
+            if let Ok(io_err) = e.downcast::<std::io::Error>() {
+                if io_err.kind() == std::io::ErrorKind::NotFound {
+                    return pyo3::exceptions::PyFileNotFoundError::new_err(msg);
+                }
+            }
+            pyo3::exceptions::PyOSError::new_err(msg)
+        })
 }
 
 /// Partition a catalog by HEALPix pixel into shard Parquet files.
@@ -299,6 +400,9 @@ fn pleiades_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cross_match_iter, m)?)?;
     m.add_class::<CrossMatchIter>()?;
     m.add_function(wrap_pyfunction!(partition_catalog, m)?)?;
+    m.add_function(wrap_pyfunction!(cone_search, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_cone_search, m)?)?;
+    m.add_function(wrap_pyfunction!(attach_match_coords, m)?)?;
     m.add_function(wrap_pyfunction!(has_wgpu_feature, m)?)?;
     Ok(())
 }

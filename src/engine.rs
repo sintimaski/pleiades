@@ -23,10 +23,10 @@ use std::os::unix::io::AsRawFd;
 use tempfile::TempDir;
 
 use arrow::array::{
-    Array, ArrayAccessor, DictionaryArray, Float32Array, Float64Array, Int64Array, StringArray,
-    UInt64Array,
+    Array, ArrayAccessor, BooleanArray, DictionaryArray, Float32Array, Float64Array, Int32Array,
+    Int64Array, StringArray, UInt64Array,
 };
-use arrow::compute::cast;
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchReader};
 use cdshealpix::nested::{self, get};
@@ -35,6 +35,9 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
+
+#[cfg(feature = "rtree")]
+use rstar::{primitives::GeomWithData, AABB, RTree};
 
 /// Larger write buffer for temp shard files (fewer syscalls).
 const SHARD_WRITE_BUFFER_BYTES: usize = 256 * 1024; // 256 KiB
@@ -990,6 +993,437 @@ pub fn partition_catalog_impl(
     )
 }
 
+/// Cone search: find all catalog rows within radius_arcsec of (ra_deg, dec_deg).
+/// Streams catalog in batches, filters by haversine distance, writes output with
+/// separation_arcsec column added. Returns number of rows written.
+pub fn cone_search_impl(
+    catalog_path: &Path,
+    ra_deg: f64,
+    dec_deg: f64,
+    radius_arcsec: f64,
+    output_path: &Path,
+    ra_col: &str,
+    dec_col: &str,
+    id_col: Option<&str>,
+    from_radians: bool,
+    batch_size: usize,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let file = File::open(catalog_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let input_schema = builder.schema().clone();
+    let mut reader = builder.with_batch_size(batch_size).build()?;
+
+    let mut writer: Option<ArrowWriter<BufWriter<File>>> = None;
+    let mut total_written: u64 = 0;
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let ra_idx = column_index(&batch, ra_col);
+        let dec_idx = column_index(&batch, dec_col);
+        let (ra_deg_vec, dec_deg_vec) =
+            ra_dec_degrees(&batch, ra_idx, dec_idx, from_radians)?;
+        let n = batch.num_rows();
+        let mut sep_vec: Vec<f64> = Vec::with_capacity(n);
+        let mut mask_vec: Vec<bool> = Vec::with_capacity(n);
+        for i in 0..n {
+            let sep = haversine_arcsec(
+                ra_deg_vec[i],
+                dec_deg_vec[i],
+                ra_deg,
+                dec_deg,
+            );
+            sep_vec.push(sep);
+            mask_vec.push(sep <= radius_arcsec);
+        }
+        let any_match = mask_vec.iter().any(|&b| b);
+        if !any_match {
+            continue;
+        }
+        let mask = BooleanArray::from(mask_vec.clone());
+        let filtered = filter_record_batch(&batch, &mask)?;
+        let n_filtered = filtered.num_rows();
+        let mut sep_filtered: Vec<f64> = Vec::with_capacity(n_filtered);
+        for (i, &m) in mask_vec.iter().enumerate() {
+            if m {
+                sep_filtered.push(sep_vec[i]);
+            }
+        }
+        let sep_arr = Arc::new(Float64Array::from(sep_filtered));
+        let mut new_columns = filtered.columns().to_vec();
+        let mut new_fields = filtered.schema().fields().to_vec();
+        new_columns.push(sep_arr);
+        new_fields.push(Arc::new(Field::new(
+            "separation_arcsec",
+            DataType::Float64,
+            false,
+        )));
+        let extended_schema = Arc::new(Schema::new(new_fields));
+        let extended_batch =
+            RecordBatch::try_new(extended_schema.clone(), new_columns)?;
+
+        if writer.is_none() {
+            std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new(".")))
+                .map_err(|e| format!("create output dir: {}", e))?;
+            let out_file = File::create(output_path)?;
+            writer = Some(ArrowWriter::try_new(
+                BufWriter::new(out_file),
+                extended_schema,
+                Some(WriterProperties::builder().build()),
+            )?);
+        }
+        writer.as_mut().unwrap().write(&extended_batch)?;
+        total_written += n_filtered as u64;
+    }
+
+    if let Some(mut w) = writer {
+        w.close()?;
+    } else {
+        let schema = input_schema.as_ref();
+        let empty_schema = Arc::new(Schema::new(
+            schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain([Arc::new(Field::new(
+                    "separation_arcsec",
+                    DataType::Float64,
+                    false,
+                ))])
+                .collect::<Vec<_>>(),
+        ));
+        std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new(".")))
+            .map_err(|e| format!("create output dir: {}", e))?;
+        let out_file = File::create(output_path)?;
+        let mut w = ArrowWriter::try_new(
+            BufWriter::new(out_file),
+            empty_schema.clone(),
+            Some(WriterProperties::builder().build()),
+        )?;
+        w.write(&RecordBatch::new_empty(empty_schema))?;
+        w.close()?;
+    }
+
+    Ok(total_written)
+}
+
+/// Batch cone search: find catalog rows within at least one of the given cones.
+/// Each query is (ra_deg, dec_deg, radius_arcsec). Output includes query_index (0-based).
+pub fn batch_cone_search_impl(
+    catalog_path: &Path,
+    queries: &[(f64, f64, f64)],
+    output_path: &Path,
+    ra_col: &str,
+    dec_col: &str,
+    id_col: Option<&str>,
+    from_radians: bool,
+    batch_size: usize,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    if queries.is_empty() {
+        let schema = ParquetRecordBatchReaderBuilder::try_new(File::open(catalog_path)?)?
+            .schema()
+            .clone();
+        let empty_schema = Arc::new(Schema::new(
+            schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain([
+                    Arc::new(Field::new(
+                        "separation_arcsec",
+                        DataType::Float64,
+                        false,
+                    )),
+                    Arc::new(Field::new("query_index", DataType::Int32, false)),
+                ])
+                .collect::<Vec<_>>(),
+        ));
+        std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new(".")))
+            .map_err(|e| format!("create output dir: {}", e))?;
+        let out_file = File::create(output_path)?;
+        let mut w = ArrowWriter::try_new(
+            BufWriter::new(out_file),
+            empty_schema.clone(),
+            Some(WriterProperties::builder().build()),
+        )?;
+        w.write(&RecordBatch::new_empty(empty_schema))?;
+        w.close()?;
+        return Ok(0);
+    }
+
+    let file = File::open(catalog_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let input_schema = builder.schema().clone();
+    let mut reader = builder.with_batch_size(batch_size).build()?;
+
+    let mut writer: Option<ArrowWriter<BufWriter<File>>> = None;
+    let mut total_written: u64 = 0;
+
+    for batch_result in reader {
+        let batch = batch_result?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let ra_idx = column_index(&batch, ra_col);
+        let dec_idx = column_index(&batch, dec_col);
+        let (ra_deg_vec, dec_deg_vec) =
+            ra_dec_degrees(&batch, ra_idx, dec_idx, from_radians)?;
+        let n = batch.num_rows();
+
+        let mut best_sep: Vec<f64> = vec![f64::INFINITY; n];
+        let mut best_idx: Vec<i32> = vec![-1; n];
+
+        for (qi, &(qra, qdec, qrad)) in queries.iter().enumerate() {
+            for i in 0..n {
+                let sep = haversine_arcsec(
+                    ra_deg_vec[i],
+                    dec_deg_vec[i],
+                    qra,
+                    qdec,
+                );
+                if sep <= qrad && sep < best_sep[i] {
+                    best_sep[i] = sep;
+                    best_idx[i] = qi as i32;
+                }
+            }
+        }
+
+        let mask_vec: Vec<bool> = best_idx.iter().map(|&x| x >= 0).collect();
+        let any_match = mask_vec.iter().any(|&b| b);
+        if !any_match {
+            continue;
+        }
+        let mask = BooleanArray::from(mask_vec.clone());
+        let filtered = filter_record_batch(&batch, &mask)?;
+        let n_filtered = filtered.num_rows();
+        let mut sep_filtered: Vec<f64> = Vec::with_capacity(n_filtered);
+        let mut idx_filtered: Vec<i32> = Vec::with_capacity(n_filtered);
+        for (i, &m) in mask_vec.iter().enumerate() {
+            if m {
+                sep_filtered.push(best_sep[i]);
+                idx_filtered.push(best_idx[i]);
+            }
+        }
+        let sep_arr = Arc::new(Float64Array::from(sep_filtered));
+        let idx_arr = Arc::new(Int32Array::from(idx_filtered));
+        let mut new_columns = filtered.columns().to_vec();
+        let mut new_fields = filtered.schema().fields().to_vec();
+        new_columns.push(sep_arr);
+        new_columns.push(idx_arr);
+        new_fields.push(Arc::new(Field::new(
+            "separation_arcsec",
+            DataType::Float64,
+            false,
+        )));
+        new_fields.push(Arc::new(Field::new("query_index", DataType::Int32, false)));
+        let extended_schema = Arc::new(Schema::new(new_fields));
+        let extended_batch =
+            RecordBatch::try_new(extended_schema.clone(), new_columns)?;
+
+        if writer.is_none() {
+            std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new(".")))
+                .map_err(|e| format!("create output dir: {}", e))?;
+            let out_file = File::create(output_path)?;
+            writer = Some(ArrowWriter::try_new(
+                BufWriter::new(out_file),
+                extended_schema,
+                Some(WriterProperties::builder().build()),
+            )?);
+        }
+        writer.as_mut().unwrap().write(&extended_batch)?;
+        total_written += n_filtered as u64;
+    }
+
+    if let Some(mut w) = writer {
+        w.close()?;
+    } else {
+        let schema = input_schema.as_ref();
+        let empty_schema = Arc::new(Schema::new(
+            schema
+                .fields()
+                .iter()
+                .cloned()
+                .chain([
+                    Arc::new(Field::new(
+                        "separation_arcsec",
+                        DataType::Float64,
+                        false,
+                    )),
+                    Arc::new(Field::new("query_index", DataType::Int32, false)),
+                ])
+                .collect::<Vec<_>>(),
+        ));
+        std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new(".")))
+            .map_err(|e| format!("create output dir: {}", e))?;
+        let out_file = File::create(output_path)?;
+        let mut w = ArrowWriter::try_new(
+            BufWriter::new(out_file),
+            empty_schema.clone(),
+            Some(WriterProperties::builder().build()),
+        )?;
+        w.write(&RecordBatch::new_empty(empty_schema))?;
+        w.close()?;
+    }
+
+    Ok(total_written)
+}
+
+/// Attach ra_a, dec_a, ra_b, dec_b to matches by looking up coordinates from catalogs.
+/// Reads matches, catalog_a, catalog_b; joins on id_a/id_b; writes extended matches.
+/// id_col_a/id_col_b are the ID column names in the catalogs; matches columns are inferred
+/// (first non-separation_arcsec = id_a, second = id_b).
+pub fn attach_match_coords_impl(
+    matches_path: &Path,
+    catalog_a_path: &Path,
+    catalog_b_path: &Path,
+    output_path: &Path,
+    id_col_a: Option<&str>,
+    id_col_b: Option<&str>,
+    ra_col: &str,
+    dec_col: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let build_id_to_ra_dec = |path: &Path,
+                              id_col_name: &str,
+                              ra_col: &str,
+                              dec_col: &str|
+     -> Result<HashMap<IdVal, (f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+        let file = File::open(path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let mut map = HashMap::new();
+        for batch in reader {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let id_idx = column_index(&batch, id_col_name);
+            let ra_idx = column_index(&batch, ra_col);
+            let dec_idx = column_index(&batch, dec_col);
+            let (ra_vec, dec_vec) = ra_dec_degrees(&batch, ra_idx, dec_idx, false)?;
+            for i in 0..batch.num_rows() {
+                let id_val = get_id_value(&batch, id_col_name, id_idx, i);
+                map.insert(id_val, (ra_vec[i], dec_vec[i]));
+            }
+        }
+        Ok(map)
+    };
+
+    let infer_id = |path: &Path, ra_col: &str, dec_col: &str| -> String {
+        if let Ok(f) = File::open(path) {
+            if let Ok(b) = ParquetRecordBatchReaderBuilder::try_new(f) {
+                let schema = b.schema();
+                return id_column_from_schema(schema.as_ref(), ra_col, dec_col, None);
+            }
+        }
+        "id".to_string()
+    };
+    let id_a_cat = id_col_a
+        .map(str::to_string)
+        .unwrap_or_else(|| infer_id(catalog_a_path, ra_col, dec_col));
+    let id_b_cat = id_col_b
+        .map(str::to_string)
+        .unwrap_or_else(|| infer_id(catalog_b_path, ra_col, dec_col));
+    let a_map = build_id_to_ra_dec(catalog_a_path, &id_a_cat, ra_col, dec_col)?;
+    let b_map = build_id_to_ra_dec(catalog_b_path, &id_b_cat, ra_col, dec_col)?;
+
+    let file_m = File::open(matches_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file_m)?.build()?;
+    let schema = reader.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let id_a_name = names
+        .iter()
+        .find(|&&n| n != "separation_arcsec")
+        .copied()
+        .unwrap_or("id_a");
+    let id_b_name = names
+        .iter()
+        .find(|&&n| n != "separation_arcsec" && n != id_a_name)
+        .copied()
+        .unwrap_or("id_b");
+
+    let mut batches_out: Vec<RecordBatch> = Vec::new();
+
+    for batch in reader {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let id_a_idx = column_index(&batch, id_a_name);
+        let id_b_idx = column_index(&batch, id_b_name);
+        let n = batch.num_rows();
+        let mut ra_a: Vec<Option<f64>> = Vec::with_capacity(n);
+        let mut dec_a: Vec<Option<f64>> = Vec::with_capacity(n);
+        let mut ra_b: Vec<Option<f64>> = Vec::with_capacity(n);
+        let mut dec_b: Vec<Option<f64>> = Vec::with_capacity(n);
+        let mut ra_a_vals: Vec<f64> = Vec::with_capacity(n);
+        let mut dec_a_vals: Vec<f64> = Vec::with_capacity(n);
+        let mut ra_b_vals: Vec<f64> = Vec::with_capacity(n);
+        let mut dec_b_vals: Vec<f64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let id_a_val = get_id_value(&batch, id_a_name, id_a_idx, i);
+            let id_b_val = get_id_value(&batch, id_b_name, id_b_idx, i);
+            let (r_a, d_a) = a_map.get(&id_a_val).copied().unwrap_or((f64::NAN, f64::NAN));
+            let (r_b, d_b) = b_map.get(&id_b_val).copied().unwrap_or((f64::NAN, f64::NAN));
+            ra_a_vals.push(r_a);
+            dec_a_vals.push(d_a);
+            ra_b_vals.push(r_b);
+            dec_b_vals.push(d_b);
+        }
+        let ra_a_arr = Arc::new(Float64Array::from(ra_a_vals));
+        let dec_a_arr = Arc::new(Float64Array::from(dec_a_vals));
+        let ra_b_arr = Arc::new(Float64Array::from(ra_b_vals));
+        let dec_b_arr = Arc::new(Float64Array::from(dec_b_vals));
+        let mut new_cols = batch.columns().to_vec();
+        let mut new_fields = batch.schema().fields().to_vec();
+        new_cols.push(ra_a_arr);
+        new_cols.push(dec_a_arr);
+        new_cols.push(ra_b_arr);
+        new_cols.push(dec_b_arr);
+        new_fields.push(Arc::new(Field::new("ra_a", DataType::Float64, false)));
+        new_fields.push(Arc::new(Field::new("dec_a", DataType::Float64, false)));
+        new_fields.push(Arc::new(Field::new("ra_b", DataType::Float64, false)));
+        new_fields.push(Arc::new(Field::new("dec_b", DataType::Float64, false)));
+        let out_batch = RecordBatch::try_new(Arc::new(Schema::new(new_fields)), new_cols)?;
+        batches_out.push(out_batch);
+    }
+
+    if batches_out.is_empty() {
+        let mut empty_fields = schema.fields().to_vec();
+        empty_fields.push(Arc::new(Field::new("ra_a", DataType::Float64, false)));
+        empty_fields.push(Arc::new(Field::new("dec_a", DataType::Float64, false)));
+        empty_fields.push(Arc::new(Field::new("ra_b", DataType::Float64, false)));
+        empty_fields.push(Arc::new(Field::new("dec_b", DataType::Float64, false)));
+        let empty_schema = Arc::new(Schema::new(empty_fields));
+        std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new(".")))
+            .map_err(|e| format!("create output dir: {}", e))?;
+        let out_file = File::create(output_path)?;
+        let mut w = ArrowWriter::try_new(
+            BufWriter::new(out_file),
+            empty_schema.clone(),
+            Some(WriterProperties::builder().build()),
+        )?;
+        w.write(&RecordBatch::new_empty(empty_schema))?;
+        w.close()?;
+        return Ok(());
+    }
+
+    let out_schema = batches_out[0].schema();
+    std::fs::create_dir_all(output_path.parent().unwrap_or(Path::new(".")))
+        .map_err(|e| format!("create output dir: {}", e))?;
+    let out_file = File::create(output_path)?;
+    let mut w = ArrowWriter::try_new(
+        BufWriter::new(out_file),
+        out_schema.clone(),
+        Some(WriterProperties::builder().build()),
+    )?;
+    for b in batches_out {
+        w.write(&b)?;
+    }
+    w.close()?;
+    Ok(())
+}
+
 /// Partition catalog B (single file) into in-memory shard buffers (no disk writes).
 /// Returns (shard_buffers, original_id_b_column_name, rows_read). Use with load_b_from_memory.
 fn partition_b_to_memory(
@@ -1118,6 +1552,15 @@ fn group_b_by_pixel(
 /// Block size for dec-based bounding-box coarse filter.
 const DEC_BLOCK_SIZE: usize = 64;
 
+/// Min candidates to consider R-tree (when rtree feature and strategy=rtree).
+const RTREE_CANDIDATE_THRESHOLD: usize = 2000;
+
+/// Join strategy: PLEIADES_JOIN_STRATEGY=bdynamic|adynamic|rtree (default bdynamic).
+/// rtree requires building with --features rtree.
+fn join_strategy() -> String {
+    env::var("PLEIADES_JOIN_STRATEGY").unwrap_or_else(|_| "bdynamic".to_string())
+}
+
 /// CPU join: columnar B, group by pixel (reuse pixels_to_look per pixel), cheap reject a≤a_max,
 /// optional dot-product path for small radius, dec pre-filter with binary search, block bbox filter.
 /// Returns per-row matches (candidate_ix, b_row_ix, sep_arcsec).
@@ -1171,7 +1614,128 @@ fn run_cpu_join(
                 return out;
             }
 
-            // Block bbox: (dec_min, dec_max, start_ix, end_ix) for each block.
+            let strategy = join_strategy();
+            let use_adynamic = strategy == "adynamic" && candidates_by_dec.len() < b_indices.len();
+            #[cfg_attr(not(feature = "rtree"), allow(unused_variables))]
+            let use_rtree = strategy == "rtree"
+                && candidates_by_dec.len() >= RTREE_CANDIDATE_THRESHOLD;
+
+            #[cfg(feature = "rtree")]
+            if use_rtree {
+                // R-tree: build spatial index on A candidates, range-query per B row.
+                let points: Vec<GeomWithData<[f64; 2], usize>> = candidates_by_dec
+                    .iter()
+                    .map(|&(dec, ix)| {
+                        let ra = ra_flat_ref[ix];
+                        GeomWithData::new([ra, dec], ix)
+                    })
+                    .collect();
+                let tree: RTree<GeomWithData<[f64; 2], usize>> = RTree::bulk_load(points);
+
+                for &b_row_ix in b_indices {
+                    let ra_b_deg = ra_b[b_row_ix];
+                    let dec_b_deg = dec_b[b_row_ix];
+                    let delta_ra = radius_deg / (dec_b_deg * DEG_TO_RAD).cos().max(0.01);
+                    let lower = [ra_b_deg - delta_ra, dec_b_deg - radius_deg];
+                    let upper = [ra_b_deg + delta_ra, dec_b_deg + radius_deg];
+                    let envelope = AABB::from_corners(lower, upper);
+                    let mut row_matches = Vec::new();
+                    for geom in tree.locate_in_envelope_intersecting(&envelope) {
+                        let candidate_ix = geom.data;
+                        let ra_a = ra_flat_ref[candidate_ix];
+                        let dec_a = dec_flat_ref[candidate_ix];
+                        if cheap_reject_deg(ra_a, dec_a, ra_b_deg, dec_b_deg, radius_deg) {
+                            continue;
+                        }
+                        let sep = if use_dot_product {
+                            let (x1, y1, z1) = ra_dec_to_xyz_deg(ra_a, dec_a);
+                            let (x2, y2, z2) = ra_dec_to_xyz_deg(ra_b_deg, dec_b_deg);
+                            let dot = (x1 * x2 + y1 * y2 + z1 * z2).min(1.0).max(-1.0);
+                            if dot >= cos_radius_rad {
+                                dot.acos() * RAD_TO_ARCSEC
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            let lon1 = ra_a * DEG_TO_RAD;
+                            let lat1 = dec_a * DEG_TO_RAD;
+                            let lon2 = ra_b_deg * DEG_TO_RAD;
+                            let lat2 = dec_b_deg * DEG_TO_RAD;
+                            let a = haversine_a_rad(lon1, lat1, lon2, lat2);
+                            if a <= a_max {
+                                haversine_a_to_arcsec(a)
+                            } else {
+                                continue;
+                            }
+                        };
+                        row_matches.push((candidate_ix, b_row_ix, sep));
+                    }
+                    out.push((b_row_ix, row_matches));
+                }
+                return out;
+            }
+
+            if use_adynamic {
+                // A-driven: iterate A candidates (outer), for each find B rows in dec window.
+                let mut b_by_dec: Vec<(f64, usize)> = b_indices
+                    .iter()
+                    .map(|&bi| (dec_b[bi], bi))
+                    .collect();
+                b_by_dec.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+                let mut row_matches: Vec<Vec<(usize, usize, f64)>> =
+                    (0..b_cols.len()).map(|_| Vec::new()).collect();
+
+                for &(dec_a, candidate_ix) in &candidates_by_dec {
+                    let ra_a = ra_flat_ref[candidate_ix];
+                    let dec_lo = dec_a - radius_deg;
+                    let dec_hi = dec_a + radius_deg;
+                    let first_b = b_by_dec.partition_point(|(d, _)| *d < dec_lo);
+                    let last_b = b_by_dec.partition_point(|(d, _)| *d <= dec_hi).saturating_sub(1);
+                    if first_b > last_b {
+                        continue;
+                    }
+                    let (x1, y1, z1) = if use_dot_product {
+                        ra_dec_to_xyz_deg(ra_a, dec_a)
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    };
+                    for (_, b_row_ix) in b_by_dec[first_b..=last_b].iter() {
+                        let ra_b_deg = ra_b[*b_row_ix];
+                        let dec_b_deg = dec_b[*b_row_ix];
+                        if cheap_reject_deg(ra_a, dec_a, ra_b_deg, dec_b_deg, radius_deg) {
+                            continue;
+                        }
+                        let sep = if use_dot_product {
+                            let (x2, y2, z2) = ra_dec_to_xyz_deg(ra_b_deg, dec_b_deg);
+                            let dot = (x1 * x2 + y1 * y2 + z1 * z2).min(1.0).max(-1.0);
+                            if dot >= cos_radius_rad {
+                                dot.acos() * RAD_TO_ARCSEC
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            let lon1 = ra_a * DEG_TO_RAD;
+                            let lat1 = dec_a * DEG_TO_RAD;
+                            let lon2 = ra_b_deg * DEG_TO_RAD;
+                            let lat2 = dec_b_deg * DEG_TO_RAD;
+                            let a = haversine_a_rad(lon1, lat1, lon2, lat2);
+                            if a <= a_max {
+                                haversine_a_to_arcsec(a)
+                            } else {
+                                continue;
+                            }
+                        };
+                        row_matches[*b_row_ix].push((candidate_ix, *b_row_ix, sep));
+                    }
+                }
+                for &b_row_ix in b_indices {
+                    let m = std::mem::take(&mut row_matches[b_row_ix]);
+                    out.push((b_row_ix, m));
+                }
+                return out;
+            }
+
+            // B-driven (default): Block bbox (dec_min, dec_max, start_ix, end_ix) for each block.
             let n_blocks = (candidates_by_dec.len() + DEC_BLOCK_SIZE - 1) / DEC_BLOCK_SIZE;
             let block_bounds: Vec<(f64, f64, usize, usize)> = (0..n_blocks)
                 .map(|bi| {
@@ -1355,6 +1919,7 @@ pub fn cross_match_impl(
     ra_dec_units: &str,
     n_nearest: Option<u32>,
     keep_b_in_memory: bool,
+    include_coords: bool,
     progress_callback: ProgressCallback,
     mut match_callback: MatchCallback,
 ) -> Result<CrossMatchStats, Box<dyn std::error::Error + Send + Sync>> {
@@ -1606,6 +2171,10 @@ pub fn cross_match_impl(
         let mut matches_id_a: Vec<IdVal> = Vec::new();
         let mut matches_id_b: Vec<IdVal> = Vec::new();
         let mut matches_sep: Vec<f64> = Vec::new();
+        let mut matches_ra_a: Vec<f64> = Vec::new();
+        let mut matches_dec_a: Vec<f64> = Vec::new();
+        let mut matches_ra_b: Vec<f64> = Vec::new();
+        let mut matches_dec_b: Vec<f64> = Vec::new();
 
         if id_b_name.is_none() {
             id_b_name = Some(
@@ -1704,9 +2273,17 @@ pub fn cross_match_impl(
                     ) {
                         Ok(gpu_matches) => {
                             for (a_ix, b_ix, sep) in gpu_matches {
-                                matches_id_a.push(id_a_flat[a_ix as usize].clone());
-                                matches_id_b.push(b_cols.id_b[b_ix as usize].clone());
+                                let a_ix = a_ix as usize;
+                                let b_ix = b_ix as usize;
+                                matches_id_a.push(id_a_flat[a_ix].clone());
+                                matches_id_b.push(b_cols.id_b[b_ix].clone());
                                 matches_sep.push(sep as f64);
+                                if include_coords {
+                                    matches_ra_a.push(ra_flat_ref[a_ix]);
+                                    matches_dec_a.push(dec_flat_ref[a_ix]);
+                                    matches_ra_b.push(b_cols.ra_b[b_ix]);
+                                    matches_dec_b.push(b_cols.dec_b[b_ix]);
+                                }
                             }
                             if verbose {
                                 verbose_log_timed("  join (GPU)", t_join.elapsed().as_secs_f64(), &format!("({} matches)", matches_id_a.len()));
@@ -1730,6 +2307,12 @@ pub fn cross_match_impl(
                                     matches_id_a.push(id_a_flat[candidate_ix].clone());
                                     matches_id_b.push(b_cols.id_b[b_row_ix].clone());
                                     matches_sep.push(sep);
+                                    if include_coords {
+                                        matches_ra_a.push(ra_flat_ref[candidate_ix]);
+                                        matches_dec_a.push(dec_flat_ref[candidate_ix]);
+                                        matches_ra_b.push(b_cols.ra_b[b_row_ix]);
+                                        matches_dec_b.push(b_cols.dec_b[b_row_ix]);
+                                    }
                                 }
                             }
                             if verbose {
@@ -1758,6 +2341,12 @@ pub fn cross_match_impl(
                             matches_id_a.push(id_a_flat[candidate_ix].clone());
                             matches_id_b.push(b_cols.id_b[b_row_ix].clone());
                             matches_sep.push(sep);
+                            if include_coords {
+                                matches_ra_a.push(ra_flat_ref[candidate_ix]);
+                                matches_dec_a.push(dec_flat_ref[candidate_ix]);
+                                matches_ra_b.push(b_cols.ra_b[b_row_ix]);
+                                matches_dec_b.push(b_cols.dec_b[b_row_ix]);
+                            }
                         }
                     }
                     if verbose {
@@ -1812,6 +2401,12 @@ pub fn cross_match_impl(
                     matches_id_a.push(id_a_flat[candidate_ix].clone());
                     matches_id_b.push(b_cols.id_b[b_row_ix].clone());
                     matches_sep.push(sep);
+                    if include_coords {
+                        matches_ra_a.push(ra_flat_ref[candidate_ix]);
+                        matches_dec_a.push(dec_flat_ref[candidate_ix]);
+                        matches_ra_b.push(b_cols.ra_b[b_row_ix]);
+                        matches_dec_b.push(b_cols.dec_b[b_row_ix]);
+                    }
                 }
             }
         }
@@ -1821,26 +2416,53 @@ pub fn cross_match_impl(
         }
         // Per-chunk n_nearest: keep only best n per id_a before write (apply_n_nearest still merges across chunks).
         if let Some(n) = n_nearest {
-            let (a, b, s) = merge_to_n_nearest(
-                std::mem::take(&mut matches_id_a),
-                std::mem::take(&mut matches_id_b),
-                std::mem::take(&mut matches_sep),
-                n,
-            );
-            matches_id_a = a;
-            matches_id_b = b;
-            matches_sep = s;
+            if include_coords {
+                let (a, b, s, ra_a, dec_a, ra_b, dec_b) = merge_to_n_nearest_with_coords(
+                    std::mem::take(&mut matches_id_a),
+                    std::mem::take(&mut matches_id_b),
+                    std::mem::take(&mut matches_sep),
+                    std::mem::take(&mut matches_ra_a),
+                    std::mem::take(&mut matches_dec_a),
+                    std::mem::take(&mut matches_ra_b),
+                    std::mem::take(&mut matches_dec_b),
+                    n,
+                );
+                matches_id_a = a;
+                matches_id_b = b;
+                matches_sep = s;
+                matches_ra_a = ra_a;
+                matches_dec_a = dec_a;
+                matches_ra_b = ra_b;
+                matches_dec_b = dec_b;
+            } else {
+                let (a, b, s) = merge_to_n_nearest(
+                    std::mem::take(&mut matches_id_a),
+                    std::mem::take(&mut matches_id_b),
+                    std::mem::take(&mut matches_sep),
+                    n,
+                );
+                matches_id_a = a;
+                matches_id_b = b;
+                matches_sep = s;
+            }
         }
         if !matches_id_a.is_empty() && match_callback.is_none() && out_schema.is_none() {
             let (col_a, col_b) = build_id_columns(&matches_id_a, &matches_id_b);
             let dt_a = col_a.data_type().clone();
             let dt_b = col_b.data_type().clone();
             let id_b_col_name = id_b_name.as_deref().unwrap_or("id_b");
-            out_schema = Some(Arc::new(Schema::new(vec![
+            let mut fields = vec![
                 Field::new(id_a_col.as_str(), dt_a, false),
                 Field::new(id_b_col_name, dt_b, false),
                 Field::new("separation_arcsec", DataType::Float64, false),
-            ])));
+            ];
+            if include_coords {
+                fields.push(Field::new("ra_a", DataType::Float64, false));
+                fields.push(Field::new("dec_a", DataType::Float64, false));
+                fields.push(Field::new("ra_b", DataType::Float64, false));
+                fields.push(Field::new("dec_b", DataType::Float64, false));
+            }
+            out_schema = Some(Arc::new(Schema::new(fields)));
             let out_file = File::create(output_path)?;
             writer = Some(ArrowWriter::try_new(
                 BufWriter::new(out_file),
@@ -1877,14 +2499,23 @@ pub fn cross_match_impl(
             let col_b = coerce_id_column_to_type(col_b, schema.field(1).data_type())?;
             let sep_arr = Arc::new(Float64Array::from(matches_sep));
             let id_b_col = id_b_name.as_deref().unwrap_or("id_b");
-            let batch = RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new(id_a_col.as_str(), schema.field(0).data_type().clone(), false),
-                    Field::new(id_b_col, schema.field(1).data_type().clone(), false),
-                    Field::new("separation_arcsec", DataType::Float64, false),
-                ])),
-                vec![col_a, col_b, sep_arr],
-            )?;
+            let mut batch_fields = vec![
+                Field::new(id_a_col.as_str(), schema.field(0).data_type().clone(), false),
+                Field::new(id_b_col, schema.field(1).data_type().clone(), false),
+                Field::new("separation_arcsec", DataType::Float64, false),
+            ];
+            let mut batch_cols: Vec<Arc<dyn Array>> = vec![col_a, col_b, sep_arr];
+            if include_coords {
+                batch_fields.push(Field::new("ra_a", DataType::Float64, false));
+                batch_fields.push(Field::new("dec_a", DataType::Float64, false));
+                batch_fields.push(Field::new("ra_b", DataType::Float64, false));
+                batch_fields.push(Field::new("dec_b", DataType::Float64, false));
+                batch_cols.push(Arc::new(Float64Array::from(std::mem::take(&mut matches_ra_a))));
+                batch_cols.push(Arc::new(Float64Array::from(std::mem::take(&mut matches_dec_a))));
+                batch_cols.push(Arc::new(Float64Array::from(std::mem::take(&mut matches_ra_b))));
+                batch_cols.push(Arc::new(Float64Array::from(std::mem::take(&mut matches_dec_b))));
+            }
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(batch_fields)), batch_cols)?;
             w.write(&batch)?;
             if verbose {
                 verbose_log_timed("  write", t_write.elapsed().as_secs_f64(), "");
@@ -1951,11 +2582,18 @@ pub fn cross_match_impl(
         let id_b_col = id_b_name.as_deref().unwrap_or("id_b");
         let dt_a = first_dt_a.clone().unwrap_or(DataType::Int64);
         let dt_b = first_dt_b.clone().unwrap_or(DataType::Utf8);
-        let empty_schema = Arc::new(Schema::new(vec![
-            Field::new(id_a_col, dt_a, false),
-            Field::new(id_b_col, dt_b, false),
-            Field::new("separation_arcsec", DataType::Float64, false),
-        ]));
+        let mut empty_fields: Vec<Arc<arrow::datatypes::Field>> = vec![
+            Arc::new(Field::new(id_a_col, dt_a, false)),
+            Arc::new(Field::new(id_b_col, dt_b, false)),
+            Arc::new(Field::new("separation_arcsec", DataType::Float64, false)),
+        ];
+        if include_coords {
+            empty_fields.push(Arc::new(Field::new("ra_a", DataType::Float64, false)));
+            empty_fields.push(Arc::new(Field::new("dec_a", DataType::Float64, false)));
+            empty_fields.push(Arc::new(Field::new("ra_b", DataType::Float64, false)));
+            empty_fields.push(Arc::new(Field::new("dec_b", DataType::Float64, false)));
+        }
+        let empty_schema = Arc::new(Schema::new(empty_fields));
         let empty_batch = RecordBatch::new_empty(empty_schema.clone());
         let out_file = File::create(output_path)?;
         let mut w = ArrowWriter::try_new(
@@ -1999,6 +2637,34 @@ pub fn cross_match_impl(
 struct NearestEntry {
     sep: f64,
     id_b: IdVal,
+}
+
+/// Entry with coordinates for apply_n_nearest when schema has ra_a, dec_a, ra_b, dec_b.
+#[derive(Clone)]
+struct NearestEntryWithCoords {
+    sep: f64,
+    id_b: IdVal,
+    ra_a: f64,
+    dec_a: f64,
+    ra_b: f64,
+    dec_b: f64,
+}
+
+impl PartialEq for NearestEntryWithCoords {
+    fn eq(&self, other: &Self) -> bool {
+        self.sep.total_cmp(&other.sep) == Ordering::Equal
+    }
+}
+impl Eq for NearestEntryWithCoords {}
+impl PartialOrd for NearestEntryWithCoords {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for NearestEntryWithCoords {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.sep.total_cmp(&other.sep)
+    }
 }
 
 impl PartialEq for NearestEntry {
@@ -2047,8 +2713,54 @@ fn merge_to_n_nearest(
     (out_a, out_b, out_sep)
 }
 
+/// Like merge_to_n_nearest but also keeps ra_a, dec_a, ra_b, dec_b in sync.
+fn merge_to_n_nearest_with_coords(
+    id_a: Vec<IdVal>,
+    id_b: Vec<IdVal>,
+    sep: Vec<f64>,
+    ra_a: Vec<f64>,
+    dec_a: Vec<f64>,
+    ra_b: Vec<f64>,
+    dec_b: Vec<f64>,
+    n: u32,
+) -> (Vec<IdVal>, Vec<IdVal>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let n = n as usize;
+    let mut by_a: HashMap<IdVal, Vec<(f64, IdVal, f64, f64, f64, f64)>> = HashMap::new();
+    for (((((a, b), s), ra), dec), (rb, db)) in id_a
+        .into_iter()
+        .zip(id_b)
+        .zip(sep)
+        .zip(ra_a)
+        .zip(dec_a)
+        .zip(ra_b.into_iter().zip(dec_b))
+    {
+        by_a.entry(a).or_default().push((s, b, ra, dec, rb, db));
+    }
+    let mut out_a = Vec::new();
+    let mut out_b = Vec::new();
+    let mut out_sep = Vec::new();
+    let mut out_ra_a = Vec::new();
+    let mut out_dec_a = Vec::new();
+    let mut out_ra_b = Vec::new();
+    let mut out_dec_b = Vec::new();
+    for (a, mut list) in by_a {
+        list.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (s, b, ra, dec, rb, db) in list.into_iter().take(n) {
+            out_a.push(a.clone());
+            out_b.push(b);
+            out_sep.push(s);
+            out_ra_a.push(ra);
+            out_dec_a.push(dec);
+            out_ra_b.push(rb);
+            out_dec_b.push(db);
+        }
+    }
+    (out_a, out_b, out_sep, out_ra_a, out_dec_a, out_ra_b, out_dec_b)
+}
+
 /// Keep only n_nearest smallest-separation matches per id_a; overwrite output file.
 /// Streams batches so memory is O(distinct id_a × n_nearest), not O(total rows).
+/// When schema has ra_a, dec_a, ra_b, dec_b, preserves those columns.
 fn apply_n_nearest(
     output_path: &Path,
     id_a_col: &str,
@@ -2062,11 +2774,95 @@ fn apply_n_nearest(
     let id_a_idx = schema.index_of(id_a_col)?;
     let id_b_idx = schema.index_of(id_b_col)?;
     let sep_idx = schema.index_of("separation_arcsec")?;
+    let has_coords = schema.index_of("ra_a").is_ok()
+        && schema.index_of("dec_a").is_ok()
+        && schema.index_of("ra_b").is_ok()
+        && schema.index_of("dec_b").is_ok();
     let n_nearest_usize = n_nearest as usize;
 
-    // Per id_a: max-heap of (sep, id_b); we keep at most n_nearest smallest.
-    let mut by_a: HashMap<IdVal, BinaryHeap<NearestEntry>> = HashMap::new();
+    if has_coords {
+        let ra_a_idx = schema.index_of("ra_a")?;
+        let dec_a_idx = schema.index_of("dec_a")?;
+        let ra_b_idx = schema.index_of("ra_b")?;
+        let dec_b_idx = schema.index_of("dec_b")?;
+        let mut by_a: HashMap<IdVal, BinaryHeap<NearestEntryWithCoords>> = HashMap::new();
+        for batch in reader {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let sep_arr = batch.column(sep_idx).as_any().downcast_ref::<Float64Array>()
+                .ok_or("separation_arcsec not Float64")?;
+            let ra_a_arr = batch.column(ra_a_idx).as_any().downcast_ref::<Float64Array>()
+                .ok_or("ra_a not Float64")?;
+            let dec_a_arr = batch.column(dec_a_idx).as_any().downcast_ref::<Float64Array>()
+                .ok_or("dec_a not Float64")?;
+            let ra_b_arr = batch.column(ra_b_idx).as_any().downcast_ref::<Float64Array>()
+                .ok_or("ra_b not Float64")?;
+            let dec_b_arr = batch.column(dec_b_idx).as_any().downcast_ref::<Float64Array>()
+                .ok_or("dec_b not Float64")?;
+            for i in 0..batch.num_rows() {
+                let id_a = get_id_value(&batch, id_a_col, id_a_idx, i);
+                let id_b = get_id_value(&batch, id_b_col, id_b_idx, i);
+                let sep = sep_arr.value(i);
+                let entry = NearestEntryWithCoords {
+                    sep,
+                    id_b,
+                    ra_a: ra_a_arr.value(i),
+                    dec_a: dec_a_arr.value(i),
+                    ra_b: ra_b_arr.value(i),
+                    dec_b: dec_b_arr.value(i),
+                };
+                let heap = by_a.entry(id_a).or_default();
+                if heap.len() < n_nearest_usize {
+                    heap.push(entry);
+                } else if sep < heap.peek().map(|e| e.sep).unwrap_or(f64::MAX) {
+                    heap.pop();
+                    heap.push(entry);
+                }
+            }
+        }
+        let mut out_id_a: Vec<IdVal> = Vec::new();
+        let mut out_id_b: Vec<IdVal> = Vec::new();
+        let mut out_sep: Vec<f64> = Vec::new();
+        let mut out_ra_a: Vec<f64> = Vec::new();
+        let mut out_dec_a: Vec<f64> = Vec::new();
+        let mut out_ra_b: Vec<f64> = Vec::new();
+        let mut out_dec_b: Vec<f64> = Vec::new();
+        for (id_a, heap) in by_a {
+            let mut list: Vec<_> = heap.into_iter().collect();
+            list.sort_by(|a, b| a.sep.total_cmp(&b.sep));
+            for e in list.into_iter().take(n_nearest_usize) {
+                out_id_a.push(id_a.clone());
+                out_id_b.push(e.id_b);
+                out_sep.push(e.sep);
+                out_ra_a.push(e.ra_a);
+                out_dec_a.push(e.dec_a);
+                out_ra_b.push(e.ra_b);
+                out_dec_b.push(e.dec_b);
+            }
+        }
+        let (col_a, col_b) = build_id_columns(&out_id_a, &out_id_b);
+        let batch_cols: Vec<Arc<dyn Array>> = vec![
+            col_a,
+            col_b,
+            Arc::new(Float64Array::from(out_sep)),
+            Arc::new(Float64Array::from(out_ra_a)),
+            Arc::new(Float64Array::from(out_dec_a)),
+            Arc::new(Float64Array::from(out_ra_b)),
+            Arc::new(Float64Array::from(out_dec_b)),
+        ];
+        let out_batch = RecordBatch::try_new(schema.clone(), batch_cols)?;
+        let out_file = File::create(output_path)?;
+        let buf = BufWriter::new(out_file);
+        let mut w = ArrowWriter::try_new(buf, schema, Some(WriterProperties::builder().build()))?;
+        w.write(&out_batch)?;
+        w.close()?;
+        return Ok(());
+    }
 
+    // No coord columns
+    let mut by_a: HashMap<IdVal, BinaryHeap<NearestEntry>> = HashMap::new();
     for batch in reader {
         let batch = batch?;
         if batch.num_rows() == 0 {
@@ -2083,10 +2879,7 @@ fn apply_n_nearest(
             let id_b = get_id_value(&batch, id_b_col, id_b_idx, i);
             let sep = sep_arr.value(i);
             let heap = by_a.entry(id_a).or_default();
-            let entry = NearestEntry {
-                sep,
-                id_b,
-            };
+            let entry = NearestEntry { sep, id_b };
             if heap.len() < n_nearest_usize {
                 heap.push(entry);
             } else if sep < heap.peek().map(|e| e.sep).unwrap_or(f64::MAX) {

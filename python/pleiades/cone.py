@@ -58,6 +58,27 @@ def cone_search(
     )
     path_out.parent.mkdir(parents=True, exist_ok=True)
 
+    try:
+        import pleiades_core
+
+        if hasattr(pleiades_core, "cone_search"):
+            return int(
+                pleiades_core.cone_search(
+                    str(path),
+                    ra_deg,
+                    dec_deg,
+                    radius_arcsec,
+                    str(path_out),
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                    id_col=id_col,
+                    ra_dec_units=ra_dec_units,
+                    batch_size=batch_size,
+                )
+            )
+    except ImportError:
+        pass
+
     pf = pq.ParquetFile(path)
     writer: pq.ParquetWriter | None = None
     out_schema: pa.Schema | None = None
@@ -134,6 +155,26 @@ def batch_cone_search(
         path, ra_col=ra_col, dec_col=dec_col, id_col=id_col, must_have_id=True
     )
     path_out.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import pleiades_core
+
+        if hasattr(pleiades_core, "batch_cone_search"):
+            return int(
+                pleiades_core.batch_cone_search(
+                    str(path),
+                    queries,
+                    str(path_out),
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                    id_col=id_col,
+                    ra_dec_units=ra_dec_units,
+                    batch_size=batch_size,
+                )
+            )
+    except ImportError:
+        pass
+
     to_deg = RAD_TO_DEG if ra_dec_units.lower() == "rad" else 1.0
     writer: pq.ParquetWriter | None = None
     out_schema: pa.Schema | None = None

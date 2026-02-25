@@ -528,11 +528,38 @@ def cross_match(
                 ra_dec_units=ra_dec_units,
                 n_nearest=n_nearest,
                 keep_b_in_memory=keep_b_in_memory,
+                include_coords=include_coords,
                 progress_callback=progress_callback,
             )
         except TypeError as e:
             err_str = str(e)
-            if "keep_b_in_memory" in err_str and keep_b_in_memory:
+            if "include_coords" in err_str and include_coords:
+                import warnings
+
+                warnings.warn(
+                    "Rust extension does not support include_coords; using Python fallback.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                result = pleiades_core.cross_match(
+                    str(catalog_a),
+                    str(catalog_b),
+                    radius_arcsec,
+                    str(output_path),
+                    depth=depth_resolved,
+                    batch_size_a=batch_size_a,
+                    batch_size_b=batch_size_b,
+                    n_shards=n_shards,
+                    ra_col=ra_col,
+                    dec_col=dec_col,
+                    id_col_a=id_col_a,
+                    id_col_b=id_col_b,
+                    ra_dec_units=ra_dec_units,
+                    n_nearest=n_nearest,
+                    keep_b_in_memory=keep_b_in_memory,
+                    progress_callback=progress_callback,
+                )
+            elif "keep_b_in_memory" in err_str and keep_b_in_memory:
                 import warnings
 
                 warnings.warn(
@@ -556,6 +583,7 @@ def cross_match(
                     id_col_b=id_col_b,
                     ra_dec_units=ra_dec_units,
                     n_nearest=n_nearest,
+                    include_coords=include_coords,
                     progress_callback=progress_callback,
                 )
             elif "progress_callback" in err_str or "n_nearest" in err_str:
@@ -598,19 +626,22 @@ def cross_match(
                 )
         if result is not None and isinstance(result, dict):
             out_path = result["output_path"]
+            # Rust engine emits coords when include_coords=True; else fallback to Python attach_match_coords
             if include_coords and catalog_b.is_file():
-                from pleiades.analysis import attach_match_coords
+                t_check = pq.read_table(out_path)
+                if "ra_a" not in t_check.column_names:
+                    from pleiades.analysis import attach_match_coords
 
-                attach_match_coords(
-                    out_path,
-                    catalog_a,
-                    catalog_b,
-                    out_path,
-                    id_col_a=id_col_a,
-                    id_col_b=id_col_b,
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
+                    attach_match_coords(
+                        out_path,
+                        catalog_a,
+                        catalog_b,
+                        out_path,
+                        id_col_a=id_col_a,
+                        id_col_b=id_col_b,
+                        ra_col=ra_col,
+                        dec_col=dec_col,
+                    )
             return CrossMatchResult(
                 output_path=out_path,
                 rows_a_read=int(result["rows_a_read"]),
