@@ -125,6 +125,24 @@ fn haversine_rad(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     c
 }
 
+/// Haversine intermediate term `a` only (no sqrt/asin). Used for cheap-reject: if a > a_max, skip.
+/// a_max = sin²(radius_rad/2) for haversine threshold.
+#[inline(always)]
+fn haversine_a_rad(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    (dlat * 0.5).sin().mul_add(
+        (dlat * 0.5).sin(),
+        lat1.cos() * lat2.cos() * (dlon * 0.5).sin() * (dlon * 0.5).sin(),
+    )
+}
+
+/// Convert haversine `a` to angular distance in arcsec (call only when a <= a_max).
+#[inline(always)]
+fn haversine_a_to_arcsec(a: f64) -> f64 {
+    2.0 * (a.sqrt().min(1.0)).asin() * RAD_TO_ARCSEC
+}
+
 /// Haversine angular distance in arcsec (inputs in degrees).
 #[inline(always)]
 fn haversine_arcsec(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
@@ -133,6 +151,26 @@ fn haversine_arcsec(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) ->
     let lon2 = ra2_deg * DEG_TO_RAD;
     let lat2 = dec2_deg * DEG_TO_RAD;
     haversine_rad(lon1, lat1, lon2, lat2) * RAD_TO_ARCSEC
+}
+
+/// Unit vector (x,y,z) from ra/dec in degrees.
+#[inline(always)]
+fn ra_dec_to_xyz_deg(ra_deg: f64, dec_deg: f64) -> (f64, f64, f64) {
+    let lon = ra_deg * DEG_TO_RAD;
+    let lat = dec_deg * DEG_TO_RAD;
+    let cos_lat = lat.cos();
+    (lon.cos() * cos_lat, lon.sin() * cos_lat, lat.sin())
+}
+
+/// Angular separation in arcsec via dot product of unit vectors. Fast for small angles.
+/// dot = cos(θ); θ = acos(dot); sep_arcsec = θ * RAD_TO_ARCSEC.
+#[inline(always)]
+fn dot_product_arcsec(
+    x1: f64, y1: f64, z1: f64,
+    x2: f64, y2: f64, z2: f64,
+) -> f64 {
+    let dot = (x1 * x2 + y1 * y2 + z1 * z2).min(1.0).max(-1.0);
+    dot.acos() * RAD_TO_ARCSEC
 }
 
 /// SIMD-friendly haversine for 4 lanes: branchless loop for autovectorization (sin/cos/asin stay scalar per lane).
@@ -163,6 +201,32 @@ fn haversine_arcsec_4_rad(
     }
 }
 
+/// Haversine `a` term only for 4 lanes (cheap-reject: skip sqrt/asin when a > a_max).
+#[inline(always)]
+fn haversine_a_4_rad(
+    ra1_deg: &[f64; 4],
+    dec1_deg: &[f64; 4],
+    lon2: f64,
+    lat2: f64,
+    cos_lat2: f64,
+    out: &mut [f64; 4],
+) {
+    for i in 0..4 {
+        let lon1 = ra1_deg[i] * DEG_TO_RAD;
+        let lat1 = dec1_deg[i] * DEG_TO_RAD;
+        let dlat = lat2 - lat1;
+        let dlon = lon2 - lon1;
+        let half_dlat = dlat * 0.5;
+        let half_dlon = dlon * 0.5;
+        let sin_half_dlat = half_dlat.sin();
+        let sin_half_dlon = half_dlon.sin();
+        out[i] = sin_half_dlat.mul_add(
+            sin_half_dlat,
+            lat1.cos() * cos_lat2 * sin_half_dlon * sin_half_dlon,
+        );
+    }
+}
+
 /// SIMD-friendly haversine for 8 lanes: two 4-lane batches for cache and autovectorization.
 #[inline(always)]
 fn haversine_arcsec_8_rad(
@@ -185,6 +249,32 @@ fn haversine_arcsec_8_rad(
     let mut out_b = [0.0_f64; 4];
     haversine_arcsec_4_rad(&ra1_4a, &dec1_4a, lon2, lat2, cos_lat2, &mut out_a);
     haversine_arcsec_4_rad(&ra1_4b, &dec1_4b, lon2, lat2, cos_lat2, &mut out_b);
+    out[0..4].copy_from_slice(&out_a);
+    out[4..8].copy_from_slice(&out_b);
+}
+
+/// Haversine `a` term only for 8 lanes (cheap-reject: skip sqrt/asin when a > a_max).
+#[inline(always)]
+fn haversine_a_8_rad(
+    ra1_deg: &[f64; 8],
+    dec1_deg: &[f64; 8],
+    lon2: f64,
+    lat2: f64,
+    cos_lat2: f64,
+    out: &mut [f64; 8],
+) {
+    let (ra1_4a, ra1_4b) = (
+        [ra1_deg[0], ra1_deg[1], ra1_deg[2], ra1_deg[3]],
+        [ra1_deg[4], ra1_deg[5], ra1_deg[6], ra1_deg[7]],
+    );
+    let (dec1_4a, dec1_4b) = (
+        [dec1_deg[0], dec1_deg[1], dec1_deg[2], dec1_deg[3]],
+        [dec1_deg[4], dec1_deg[5], dec1_deg[6], dec1_deg[7]],
+    );
+    let mut out_a = [0.0_f64; 4];
+    let mut out_b = [0.0_f64; 4];
+    haversine_a_4_rad(&ra1_4a, &dec1_4a, lon2, lat2, cos_lat2, &mut out_a);
+    haversine_a_4_rad(&ra1_4b, &dec1_4b, lon2, lat2, cos_lat2, &mut out_b);
     out[0..4].copy_from_slice(&out_a);
     out[4..8].copy_from_slice(&out_b);
 }
@@ -1021,7 +1111,11 @@ fn group_b_by_pixel(
     by_pixel
 }
 
-/// CPU join: columnar B, group by pixel (reuse pixels_to_look per pixel), cheap reject, haversine in batches of 8.
+/// Block size for dec-based bounding-box coarse filter.
+const DEC_BLOCK_SIZE: usize = 64;
+
+/// CPU join: columnar B, group by pixel (reuse pixels_to_look per pixel), cheap reject a≤a_max,
+/// optional dot-product path for small radius, dec pre-filter with binary search, block bbox filter.
 /// Returns per-row matches (candidate_ix, b_row_ix, sep_arcsec).
 fn run_cpu_join(
     b_cols: &BColumns,
@@ -1036,6 +1130,11 @@ fn run_cpu_join(
     let dec_b = &b_cols.dec_b[..];
     let by_pixel = group_b_by_pixel(ra_b, dec_b, depth_local);
 
+    let radius_rad = radius_arcsec / RAD_TO_ARCSEC;
+    let a_max = (radius_rad * 0.5).sin().powi(2);
+    let use_dot_product = radius_arcsec < 600.0; // 10 arcmin: dot product is faster for small angles
+    let cos_radius_rad = radius_rad.cos();
+
     let per_pixel: Vec<Vec<(usize, Vec<(usize, usize, f64)>)>> = by_pixel
         .par_iter()
         .map(|(pixel, b_indices)| {
@@ -1043,7 +1142,7 @@ fn run_cpu_join(
             pixels_to_look.push(*pixel);
             nested::append_bulk_neighbours(depth_local, *pixel, &mut pixels_to_look);
 
-            // Merge and sort candidate indices from all neighbor pixels for cache-friendly access to ra_flat/dec_flat.
+            // Merge and dedup candidate indices.
             let mut candidates: Vec<usize> = Vec::new();
             for pix in &pixels_to_look {
                 if let Some(ixs) = index_ref.get(pix) {
@@ -1053,7 +1152,36 @@ fn run_cpu_join(
             candidates.sort_unstable();
             candidates.dedup();
 
+            // Pre-filter: sort candidates by dec for binary-search dec window.
+            let mut candidates_by_dec: Vec<(f64, usize)> = candidates
+                .iter()
+                .map(|&ix| (dec_flat_ref[ix], ix))
+                .collect();
+            candidates_by_dec.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+
             let mut out: Vec<(usize, Vec<(usize, usize, f64)>)> = Vec::with_capacity(b_indices.len());
+            if candidates_by_dec.is_empty() {
+                for &b_row_ix in b_indices {
+                    out.push((b_row_ix, vec![]));
+                }
+                return out;
+            }
+
+            // Block bbox: (dec_min, dec_max, start_ix, end_ix) for each block.
+            let n_blocks = (candidates_by_dec.len() + DEC_BLOCK_SIZE - 1) / DEC_BLOCK_SIZE;
+            let block_bounds: Vec<(f64, f64, usize, usize)> = (0..n_blocks)
+                .map(|bi| {
+                    let start = bi * DEC_BLOCK_SIZE;
+                    let end = (start + DEC_BLOCK_SIZE).min(candidates_by_dec.len());
+                    let dec_min = candidates_by_dec[start].0;
+                    let dec_max = candidates_by_dec[end - 1].0;
+                    (dec_min, dec_max, start, end)
+                })
+                .collect();
+
+            let dec_min_global = candidates_by_dec.first().map(|x| x.0).unwrap_or(0.0);
+            let dec_max_global = candidates_by_dec.last().map(|x| x.0).unwrap_or(0.0);
+
             for &b_row_ix in b_indices {
                 let ra_b_deg = ra_b[b_row_ix];
                 let dec_b_deg = dec_b[b_row_ix];
@@ -1061,50 +1189,128 @@ fn run_cpu_join(
                 let lat2 = dec_b_deg * DEG_TO_RAD;
                 let cos_lat2 = lat2.cos();
 
+                let (x2, y2, z2) = if use_dot_product {
+                    ra_dec_to_xyz_deg(ra_b_deg, dec_b_deg)
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+
+                // Dec window: [dec_b - radius_deg, dec_b + radius_deg]
+                let dec_lo = dec_b_deg - radius_deg;
+                let dec_hi = dec_b_deg + radius_deg;
+
+                // Skip entirely if no overlap with global dec range.
+                if dec_hi < dec_min_global || dec_lo > dec_max_global {
+                    out.push((b_row_ix, vec![]));
+                    continue;
+                }
+
+                // Find block range that overlaps dec window (block bbox coarse filter).
+                let first_block = block_bounds
+                    .partition_point(|(_, dec_max, _, _)| *dec_max < dec_lo)
+                    .min(n_blocks);
+                let last_block = block_bounds
+                    .partition_point(|(dec_min, _, _, _)| *dec_min <= dec_hi)
+                    .saturating_sub(1)
+                    .max(first_block);
+
                 let mut row_matches = Vec::new();
-                let chunks8 = candidates.chunks_exact(8);
-                let remainder8 = chunks8.remainder();
-                for chunk in chunks8 {
-                    let mut ra1 = [0.0_f64; 8];
-                    let mut dec1 = [0.0_f64; 8];
-                    for (i, &ix) in chunk.iter().enumerate() {
-                        ra1[i] = ra_flat_ref[ix];
-                        dec1[i] = dec_flat_ref[ix];
-                    }
-                    let mut seps = [0.0_f64; 8];
-                    haversine_arcsec_8_rad(&ra1, &dec1, lon2, lat2, cos_lat2, &mut seps);
-                    for (i, &candidate_ix) in chunk.iter().enumerate() {
-                        if seps[i] <= radius_arcsec {
-                            row_matches.push((candidate_ix, b_row_ix, seps[i]));
-                        }
-                    }
-                }
-                let chunks4 = remainder8.chunks_exact(4);
-                let remainder = chunks4.remainder();
-                for chunk in chunks4 {
-                    let mut ra1 = [0.0_f64; 4];
-                    let mut dec1 = [0.0_f64; 4];
-                    for (i, &ix) in chunk.iter().enumerate() {
-                        ra1[i] = ra_flat_ref[ix];
-                        dec1[i] = dec_flat_ref[ix];
-                    }
-                    let mut seps = [0.0_f64; 4];
-                    haversine_arcsec_4_rad(&ra1, &dec1, lon2, lat2, cos_lat2, &mut seps);
-                    for (i, &candidate_ix) in chunk.iter().enumerate() {
-                        if seps[i] <= radius_arcsec {
-                            row_matches.push((candidate_ix, b_row_ix, seps[i]));
-                        }
-                    }
-                }
-                for &candidate_ix in remainder {
-                    let ra_a = ra_flat_ref[candidate_ix];
-                    let dec_a = dec_flat_ref[candidate_ix];
-                    if cheap_reject_deg(ra_a, dec_a, ra_b_deg, dec_b_deg, radius_deg) {
+
+                for bi in first_block..=last_block {
+                    let (_, _, start, end) = block_bounds[bi];
+                    let block_dec_min = block_bounds[bi].0;
+                    let block_dec_max = block_bounds[bi].1;
+                    if dec_hi < block_dec_min || dec_lo > block_dec_max {
                         continue;
                     }
-                    let sep = haversine_arcsec(ra_a, dec_a, ra_b_deg, dec_b_deg);
-                    if sep <= radius_arcsec {
-                        row_matches.push((candidate_ix, b_row_ix, sep));
+
+                    let block_candidates = &candidates_by_dec[start..end];
+                    let iter_candidates = block_candidates.iter().filter(|(dec, _)| {
+                        *dec >= dec_lo && *dec <= dec_hi
+                    }).map(|(_, ix)| *ix);
+
+                    let cand_vec: Vec<usize> = iter_candidates.collect();
+                    let chunks8 = cand_vec.chunks_exact(8);
+                    let remainder8 = chunks8.remainder();
+                    let remainder4 = remainder8.chunks_exact(4);
+                    let remainder = remainder4.remainder();
+
+                    for chunk in chunks8 {
+                        let mut ra1 = [0.0_f64; 8];
+                        let mut dec1 = [0.0_f64; 8];
+                        for (i, &ix) in chunk.iter().enumerate() {
+                            ra1[i] = ra_flat_ref[ix];
+                            dec1[i] = dec_flat_ref[ix];
+                        }
+                        if use_dot_product {
+                            for (i, &candidate_ix) in chunk.iter().enumerate() {
+                                let (x1, y1, z1) = ra_dec_to_xyz_deg(ra1[i], dec1[i]);
+                                let dot = (x1 * x2 + y1 * y2 + z1 * z2).min(1.0).max(-1.0);
+                                if dot >= cos_radius_rad {
+                                    let sep = dot.acos() * RAD_TO_ARCSEC;
+                                    row_matches.push((candidate_ix, b_row_ix, sep));
+                                }
+                            }
+                        } else {
+                            let mut a_vals = [0.0_f64; 8];
+                            haversine_a_8_rad(&ra1, &dec1, lon2, lat2, cos_lat2, &mut a_vals);
+                            for (i, &candidate_ix) in chunk.iter().enumerate() {
+                                if a_vals[i] <= a_max {
+                                    let sep = haversine_a_to_arcsec(a_vals[i]);
+                                    row_matches.push((candidate_ix, b_row_ix, sep));
+                                }
+                            }
+                        }
+                    }
+                    for chunk in remainder4 {
+                        let mut ra1 = [0.0_f64; 4];
+                        let mut dec1 = [0.0_f64; 4];
+                        for (i, &ix) in chunk.iter().enumerate() {
+                            ra1[i] = ra_flat_ref[ix];
+                            dec1[i] = dec_flat_ref[ix];
+                        }
+                        if use_dot_product {
+                            for (i, &candidate_ix) in chunk.iter().enumerate() {
+                                let (x1, y1, z1) = ra_dec_to_xyz_deg(ra1[i], dec1[i]);
+                                let dot = (x1 * x2 + y1 * y2 + z1 * z2).min(1.0).max(-1.0);
+                                if dot >= cos_radius_rad {
+                                    let sep = dot.acos() * RAD_TO_ARCSEC;
+                                    row_matches.push((candidate_ix, b_row_ix, sep));
+                                }
+                            }
+                        } else {
+                            let mut a_vals = [0.0_f64; 4];
+                            haversine_a_4_rad(&ra1, &dec1, lon2, lat2, cos_lat2, &mut a_vals);
+                            for (i, &candidate_ix) in chunk.iter().enumerate() {
+                                if a_vals[i] <= a_max {
+                                    let sep = haversine_a_to_arcsec(a_vals[i]);
+                                    row_matches.push((candidate_ix, b_row_ix, sep));
+                                }
+                            }
+                        }
+                    }
+                    for &candidate_ix in remainder {
+                        let ra_a = ra_flat_ref[candidate_ix];
+                        let dec_a = dec_flat_ref[candidate_ix];
+                        if cheap_reject_deg(ra_a, dec_a, ra_b_deg, dec_b_deg, radius_deg) {
+                            continue;
+                        }
+                        if use_dot_product {
+                            let (x1, y1, z1) = ra_dec_to_xyz_deg(ra_a, dec_a);
+                            let dot = (x1 * x2 + y1 * y2 + z1 * z2).min(1.0).max(-1.0);
+                            if dot >= cos_radius_rad {
+                                let sep = dot.acos() * RAD_TO_ARCSEC;
+                                row_matches.push((candidate_ix, b_row_ix, sep));
+                            }
+                        } else {
+                            let lon1 = ra_a * DEG_TO_RAD;
+                            let lat1 = dec_a * DEG_TO_RAD;
+                            let a = haversine_a_rad(lon1, lat1, lon2, lat2);
+                            if a <= a_max {
+                                let sep = haversine_a_to_arcsec(a);
+                                row_matches.push((candidate_ix, b_row_ix, sep));
+                            }
+                        }
                     }
                 }
                 out.push((b_row_ix, row_matches));

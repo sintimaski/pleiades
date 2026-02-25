@@ -29,6 +29,18 @@ DEC_COL = "dec"
 RA_DEC_UNITS_DEFAULT = "deg"  # "deg" or "rad" for input catalog columns
 # cdshealpix nested: nside = 2^depth, so depth 8 -> nside 256
 DEPTH_DEFAULT = 8
+
+
+def suggest_healpix_depth(radius_arcsec: float) -> int:
+    """Suggest HEALPix depth based on search radius.
+
+    Smaller radius → higher depth (finer pixels, fewer candidates per pixel).
+    Larger radius → lower depth (coarser pixels, less index overhead).
+    """
+    if radius_arcsec <= 0:
+        return DEPTH_DEFAULT
+    depth = round(8 + math.log2(1.0 / radius_arcsec))
+    return max(5, min(13, depth))
 # Benchmark-style defaults (1M rows: batch = rows/4, n_shards = 16)
 BATCH_SIZE_A = 250_000
 BATCH_SIZE_B = 250_000
@@ -393,7 +405,7 @@ def cross_match(
     ra_col: str = RA_COL,
     dec_col: str = DEC_COL,
     ra_dec_units: str = RA_DEC_UNITS_DEFAULT,
-    depth: int = DEPTH_DEFAULT,
+    depth: int | None = None,
     batch_size_a: int = BATCH_SIZE_A,
     batch_size_b: int = BATCH_SIZE_B,
     use_matrix: bool = True,
@@ -429,6 +441,8 @@ def cross_match(
 
     ra_dec_units: "deg" (default) or "rad" — units of ra/dec columns in the catalogs.
 
+    depth: HEALPix nested depth (0–15). Default None → auto via suggest_healpix_depth().
+
     batch_size_a, batch_size_b: rows per Parquet read chunk (default 250k each, benchmark-style).
     Smaller values use less RAM and are better on memory-constrained machines
     (e.g. laptops); larger values reduce I/O overhead.
@@ -448,8 +462,14 @@ def cross_match(
     catalog_a = Path(catalog_a)
     catalog_b = Path(catalog_b)
     output_path = Path(output_path)
+    # depth=None: auto for file B; prepartitioned dir must use DEPTH_DEFAULT (unknown partition depth)
+    depth_resolved = (
+        depth
+        if depth is not None
+        else (DEPTH_DEFAULT if catalog_b.is_dir() else suggest_healpix_depth(radius_arcsec))
+    )
     validate_cross_match_args(
-        radius_arcsec, n_nearest=n_nearest, depth=depth, n_shards=n_shards
+        radius_arcsec, n_nearest=n_nearest, depth=depth_resolved, n_shards=n_shards
     )
     if not catalog_a.is_file():
         raise FileNotFoundError(f"Catalog A not found: {catalog_a}")
@@ -497,7 +517,7 @@ def cross_match(
                 str(catalog_b),
                 radius_arcsec,
                 str(output_path),
-                depth=depth,
+                depth=depth_resolved,
                 batch_size_a=batch_size_a,
                 batch_size_b=batch_size_b,
                 n_shards=n_shards,
@@ -526,7 +546,7 @@ def cross_match(
                     str(catalog_b),
                     radius_arcsec,
                     str(output_path),
-                    depth=depth,
+                    depth=depth_resolved,
                     batch_size_a=batch_size_a,
                     batch_size_b=batch_size_b,
                     n_shards=n_shards,
@@ -544,7 +564,7 @@ def cross_match(
                     str(catalog_b),
                     radius_arcsec,
                     str(output_path),
-                    depth=depth,
+                    depth=depth_resolved,
                     batch_size_a=batch_size_a,
                     batch_size_b=batch_size_b,
                     n_shards=n_shards,
@@ -567,7 +587,7 @@ def cross_match(
                     str(catalog_b),
                     radius_arcsec,
                     str(output_path),
-                    depth=depth,
+                    depth=depth_resolved,
                     batch_size_a=batch_size_a,
                     batch_size_b=batch_size_b,
                     n_shards=n_shards,

@@ -18,7 +18,12 @@ from pleiades.analysis import (
     summarize_matches,
 )
 from pleiades.cone import batch_cone_search, cone_search
-from pleiades.cross_match import cross_match, cross_match_iter, partition_catalog
+from pleiades.cross_match import (
+    cross_match,
+    cross_match_iter,
+    partition_catalog,
+    suggest_healpix_depth,
+)
 from pleiades.models import CrossMatchResult, MatchSummary
 from pleiades.validation import CatalogValidationError
 
@@ -38,5 +43,6 @@ __all__ = [
     "MatchSummary",
     "multi_radius_cross_match",
     "partition_catalog",
+    "suggest_healpix_depth",
     "summarize_matches",
 ]

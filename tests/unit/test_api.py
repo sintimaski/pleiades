@@ -12,6 +12,27 @@ from pleiades.validation import CatalogValidationError
 
 
 @pytest.mark.unit
+class TestSuggestHealpixDepth:
+    """Test suggest_healpix_depth() heuristic."""
+
+    def test_small_radius_suggests_high_depth(self) -> None:
+        """Small radius → higher depth (finer pixels)."""
+        assert pleiades.suggest_healpix_depth(0.1) >= 10
+        assert pleiades.suggest_healpix_depth(1.0) >= 8
+
+    def test_large_radius_suggests_lower_depth(self) -> None:
+        """Large radius → lower depth."""
+        assert pleiades.suggest_healpix_depth(3600.0) <= 8
+        assert pleiades.suggest_healpix_depth(36000.0) <= 6
+
+    def test_depth_clamped_to_valid_range(self) -> None:
+        """Depth stays in 5–13 for typical radii."""
+        for r in (0.001, 0.1, 1.0, 60.0, 3600.0):
+            d = pleiades.suggest_healpix_depth(r)
+            assert 5 <= d <= 13, f"radius={r} -> depth={d}"
+
+
+@pytest.mark.unit
 class TestCrossMatchAPI:
     """Test cross_match() API contract."""
 
