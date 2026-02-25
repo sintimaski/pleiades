@@ -710,6 +710,24 @@ def cross_match_iter(
     try:
         import pleiades_core
 
+        if hasattr(pleiades_core, "cross_match_iter"):
+            # Rust-backed streaming: yields as each chunk completes (no temp file)
+            yield from pleiades_core.cross_match_iter(
+                str(catalog_a),
+                str(catalog_b),
+                radius_arcsec,
+                depth=depth,
+                batch_size_a=batch_size_a,
+                batch_size_b=batch_size_b,
+                n_shards=n_shards,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                id_col_a=id_col_a,
+                id_col_b=id_col_b,
+                ra_dec_units="deg",
+            )
+            return
+        # Fallback: write to temp file, then stream from it
         with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
             matches_path = tmp.name
         try:

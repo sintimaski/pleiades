@@ -713,6 +713,10 @@ fn index_only(
 /// Return true to continue, false to cancel (e.g. on Ctrl+C); engine stops at chunk boundary.
 pub type ProgressCallback = Option<Box<dyn Fn(usize, Option<usize>, u64, u64) -> bool + Send>>;
 
+/// Match callback for streaming: receives (id_a, id_b, sep) batch per chunk.
+/// Return true to continue, false to cancel. When Some, no output file is written.
+pub type MatchCallback = Option<Box<dyn FnMut(Vec<IdVal>, Vec<IdVal>, Vec<f64>) -> bool + Send>>;
+
 #[inline]
 fn verbose_log(msg: &str) {
     if env::var("PLEIADES_VERBOSE").is_ok() {
@@ -1334,6 +1338,7 @@ fn run_cpu_join(
 /// When catalog_b is a file, B is partitioned in-Rust: to temp dir (one read + shard writes) or to memory (one read, no shard I/O).
 /// If keep_b_in_memory is true and B is a file, B is partitioned into RAM so no shard files are read per chunk (faster when B fits in RAM).
 /// Returns CrossMatchStats. If n_nearest is Some(n), keeps only n smallest-separation matches per id_a.
+/// If match_callback is Some, matches are streamed to the callback and no output file is written.
 pub fn cross_match_impl(
     catalog_a: &Path,
     catalog_b: &Path,
@@ -1351,6 +1356,7 @@ pub fn cross_match_impl(
     n_nearest: Option<u32>,
     keep_b_in_memory: bool,
     progress_callback: ProgressCallback,
+    mut match_callback: MatchCallback,
 ) -> Result<CrossMatchStats, Box<dyn std::error::Error + Send + Sync>> {
     let from_radians = is_radians(ra_dec_units);
     #[allow(unused_variables)]
@@ -1825,7 +1831,7 @@ pub fn cross_match_impl(
             matches_id_b = b;
             matches_sep = s;
         }
-        if !matches_id_a.is_empty() && out_schema.is_none() {
+        if !matches_id_a.is_empty() && match_callback.is_none() && out_schema.is_none() {
             let (col_a, col_b) = build_id_columns(&matches_id_a, &matches_id_b);
             let dt_a = col_a.data_type().clone();
             let dt_b = col_b.data_type().clone();
@@ -1852,7 +1858,18 @@ pub fn cross_match_impl(
             }
         }
 
-        if let Some(ref mut w) = writer {
+        if let Some(ref mut cb) = match_callback {
+            if !matches_id_a.is_empty() {
+                let (mut a, mut b, mut s) = (Vec::new(), Vec::new(), Vec::new());
+                std::mem::swap(&mut matches_id_a, &mut a);
+                std::mem::swap(&mut matches_id_b, &mut b);
+                std::mem::swap(&mut matches_sep, &mut s);
+                if !cb(a, b, s) {
+                    cancelled = true;
+                    break;
+                }
+            }
+        } else if let Some(ref mut w) = writer {
             let t_write = std::time::Instant::now();
             let (col_a, col_b) = build_id_columns(&matches_id_a, &matches_id_b);
             let schema = out_schema.as_ref().unwrap();

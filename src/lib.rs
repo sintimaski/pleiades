@@ -15,6 +15,12 @@ pub mod gpu;
 use std::path::Path;
 
 #[cfg(feature = "python")]
+use std::sync::mpsc;
+
+#[cfg(feature = "python")]
+use std::thread;
+
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 /// Cross-match two Parquet catalogs by angular distance (Rust engine).
@@ -92,6 +98,7 @@ fn cross_match(
         n_nearest,
         keep_b_in_memory,
         progress,
+        None,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -126,6 +133,129 @@ fn cross_match(
 #[pyfunction]
 fn has_wgpu_feature() -> bool {
     cfg!(feature = "wgpu")
+}
+
+/// Batch type sent over the channel: (id_a, id_b, separation_arcsec).
+type MatchBatch = (Vec<engine::IdVal>, Vec<engine::IdVal>, Vec<f64>);
+
+/// Rust-backed streaming iterator for cross-match. Yields (id_a, id_b, separation_arcsec) as produced.
+#[cfg(feature = "python")]
+#[pyclass]
+struct CrossMatchIter {
+    receiver: std::sync::Mutex<mpsc::Receiver<Option<MatchBatch>>>,
+    current: std::sync::RwLock<Option<MatchBatch>>,
+    index: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl CrossMatchIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(slf: PyRef<'_, Self>, py: Python<'_>) -> PyResult<(PyObject, PyObject, f64)> {
+        loop {
+            let i = slf.index.load(std::sync::atomic::Ordering::Relaxed);
+            let has_more = slf.current.read().unwrap().as_ref().map_or(false, |(a, _b, _s)| i < a.len());
+            if has_more {
+                let (id_a, id_b, sep) = {
+                    let cur = slf.current.read().unwrap();
+                    let (a, b, s) = cur.as_ref().unwrap();
+                    let id_a: PyObject = match &a[i] {
+                        engine::IdVal::I64(x) => x.into_py(py),
+                        engine::IdVal::Str(st) => st.clone().into_py(py),
+                    };
+                    let id_b: PyObject = match &b[i] {
+                        engine::IdVal::I64(x) => x.into_py(py),
+                        engine::IdVal::Str(st) => st.clone().into_py(py),
+                    };
+                    (id_a, id_b, s[i])
+                };
+                slf.index.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+                return Ok((id_a, id_b, sep));
+            }
+            match slf.receiver.lock().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("iterator lock poisoned")
+            })?.recv() {
+                Ok(Some(b)) => {
+                    *slf.current.write().unwrap() = Some(b);
+                    slf.index.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(None) | Err(_) => {
+                    return Err(pyo3::exceptions::PyStopIteration::new_err(
+                        "cross-match iteration complete",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Stream cross-match results as (id_a, id_b, separation_arcsec). Uses Rust engine; yields as each chunk completes.
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (catalog_a, catalog_b, radius_arcsec, depth=8, batch_size_a=100_000, batch_size_b=100_000, n_shards=512, ra_col="ra", dec_col="dec", id_col_a=None, id_col_b=None, ra_dec_units="deg", n_nearest=None, keep_b_in_memory=false))]
+fn cross_match_iter(
+    catalog_a: &str,
+    catalog_b: &str,
+    radius_arcsec: f64,
+    depth: u8,
+    batch_size_a: usize,
+    batch_size_b: usize,
+    n_shards: usize,
+    ra_col: &str,
+    dec_col: &str,
+    id_col_a: Option<&str>,
+    id_col_b: Option<&str>,
+    ra_dec_units: &str,
+    n_nearest: Option<u32>,
+    keep_b_in_memory: bool,
+) -> PyResult<Py<PyAny>> {
+    let path_a = Path::new(catalog_a).to_path_buf();
+    let path_b = Path::new(catalog_b).to_path_buf();
+    let (tx, rx) = mpsc::sync_channel::<Option<MatchBatch>>(4);
+    let ra_col = ra_col.to_string();
+    let dec_col = dec_col.to_string();
+    let id_col_a = id_col_a.map(str::to_string);
+    let id_col_b = id_col_b.map(str::to_string);
+    let ra_dec_units = ra_dec_units.to_string();
+
+    thread::spawn(move || {
+        let out_dummy = Path::new(""); // Not used when match_callback is set
+        let callback: engine::MatchCallback = Some(Box::new(move |a, b, s| {
+            tx.send(Some((a, b, s))).is_ok()
+        }));
+        let _ = engine::cross_match_impl(
+            &path_a,
+            &path_b,
+            out_dummy,
+            radius_arcsec,
+            depth,
+            batch_size_a,
+            batch_size_b,
+            n_shards,
+            &ra_col,
+            &dec_col,
+            id_col_a.as_deref(),
+            id_col_b.as_deref(),
+            &ra_dec_units,
+            n_nearest,
+            keep_b_in_memory,
+            None,
+            callback,
+        );
+        // Dropping tx signals completion; receiver gets RecvError
+    });
+
+    Python::with_gil(|py| {
+        let iter = CrossMatchIter {
+            receiver: std::sync::Mutex::new(rx),
+            current: std::sync::RwLock::new(None),
+            index: std::sync::atomic::AtomicUsize::new(0),
+        };
+        Ok(iter.into_py(py).into_any())
+    })
 }
 
 /// Partition a catalog by HEALPix pixel into shard Parquet files.
@@ -166,6 +296,8 @@ fn partition_catalog(
 #[pymodule]
 fn pleiades_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cross_match, m)?)?;
+    m.add_function(wrap_pyfunction!(cross_match_iter, m)?)?;
+    m.add_class::<CrossMatchIter>()?;
     m.add_function(wrap_pyfunction!(partition_catalog, m)?)?;
     m.add_function(wrap_pyfunction!(has_wgpu_feature, m)?)?;
     Ok(())
