@@ -694,11 +694,11 @@ fn partition_batch_to_row_results(
     Ok(row_results)
 }
 
-/// Partition catalog B (single file) into HEALPix shards in a temp directory.
-/// Returns (temp_dir_guard, shard_dir_path, rows_written, original_id_b_column_name).
-/// Caller must keep the guard alive. Batches are processed in parallel (pixel assignment).
-fn partition_b_to_temp(
-    catalog_b: &Path,
+/// Partition a catalog file into HEALPix shards in the given directory.
+/// Writes shard_0000.parquet, ... to shard_dir. Returns (rows_written, id_column_name).
+fn partition_file_to_shard_dir(
+    catalog_path: &Path,
+    shard_dir: &Path,
     depth: u8,
     n_shards: usize,
     batch_size_b: usize,
@@ -706,11 +706,8 @@ fn partition_b_to_temp(
     dec_col: &str,
     id_col_b: Option<&str>,
     from_radians: bool,
-) -> Result<(TempDir, PathBuf, u64, String), Box<dyn std::error::Error + Send + Sync>> {
-    let temp_dir = tempfile::tempdir().map_err(|e| format!("temp dir: {}", e))?;
-    let shard_dir = temp_dir.path().to_path_buf();
-
-    let file_b = File::open(catalog_b)?;
+) -> Result<(u64, String), Box<dyn std::error::Error + Send + Sync>> {
+    let file_b = File::open(catalog_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
     let arrow_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size_b).build()?;
@@ -743,7 +740,7 @@ fn partition_b_to_temp(
                 w.write(&RecordBatch::new_empty(Arc::clone(&shard_schema)))?;
                 w.close()?;
             }
-            return Ok((temp_dir, shard_dir, 0, id_b_name_owned));
+            return Ok((0, id_b_name_owned));
         }
     };
 
@@ -769,7 +766,7 @@ fn partition_b_to_temp(
             w.write(&RecordBatch::new_empty(Arc::clone(&shard_schema)))?;
             w.close()?;
         }
-        return Ok((temp_dir, shard_dir, 0, id_b_name_owned));
+        return Ok((0, id_b_name_owned));
     }
     let id_b_type = id_type(&first_batch, &id_b_name);
     let shard_schema = Arc::new(Schema::new(vec![
@@ -869,7 +866,55 @@ fn partition_b_to_temp(
         w.take().unwrap().close()?;
     }
 
-    Ok((temp_dir, shard_dir, rows_written, id_b_name_owned))
+    Ok((rows_written, id_b_name_owned))
+}
+
+/// Partition catalog B (single file) into HEALPix shards in a temp directory.
+/// Returns (temp_dir_guard, shard_dir_path, rows_written, original_id_b_column_name).
+/// Caller must keep the guard alive.
+fn partition_b_to_temp(
+    catalog_b: &Path,
+    depth: u8,
+    n_shards: usize,
+    batch_size_b: usize,
+    ra_col: &str,
+    dec_col: &str,
+    id_col_b: Option<&str>,
+    from_radians: bool,
+) -> Result<(TempDir, PathBuf, u64, String), Box<dyn std::error::Error + Send + Sync>> {
+    let temp_dir = tempfile::tempdir().map_err(|e| format!("temp dir: {}", e))?;
+    let shard_dir = temp_dir.path().to_path_buf();
+    let (rows_written, id_b_name) =
+        partition_file_to_shard_dir(catalog_b, &shard_dir, depth, n_shards, batch_size_b, ra_col, dec_col, id_col_b, from_radians)?;
+    Ok((temp_dir, shard_dir, rows_written, id_b_name))
+}
+
+/// Partition a catalog file into HEALPix shards in the given output directory.
+/// Creates output_dir if needed. Writes shard_0000.parquet, ... (same layout as
+/// pre-partitioned B for cross_match). Returns (rows_written, id_column_name).
+pub fn partition_catalog_impl(
+    catalog_path: &Path,
+    output_dir: &Path,
+    depth: u8,
+    n_shards: usize,
+    batch_size: usize,
+    ra_col: &str,
+    dec_col: &str,
+    id_col: Option<&str>,
+    from_radians: bool,
+) -> Result<(u64, String), Box<dyn std::error::Error + Send + Sync>> {
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("create output dir: {}", e))?;
+    partition_file_to_shard_dir(
+        catalog_path,
+        output_dir,
+        depth,
+        n_shards,
+        batch_size,
+        ra_col,
+        dec_col,
+        id_col,
+        from_radians,
+    )
 }
 
 /// Partition catalog B (single file) into in-memory shard buffers (no disk writes).

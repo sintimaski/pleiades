@@ -225,6 +225,8 @@ def partition_catalog(
     (same layout as pre-partitioned B for cross_match). The catalog's ID column
     is written as id_b so the result can be used as catalog_b in cross_match.
 
+    Uses the Rust engine when available (faster); falls back to Python otherwise.
+
     Raises:
         FileNotFoundError: If catalog_path does not exist.
         CatalogValidationError: If schema validation fails.
@@ -240,6 +242,24 @@ def partition_catalog(
         id_col=id_col,
         must_have_id=True,
     )
+    try:
+        import pleiades_core
+
+        if pleiades_core.partition_catalog is not None:
+            pleiades_core.partition_catalog(
+                str(catalog_path),
+                str(output_dir),
+                depth=depth,
+                n_shards=n_shards,
+                batch_size=batch_size,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                id_col=id_col,
+                ra_dec_units="deg",
+            )
+            return
+    except ImportError:
+        pass
     _partition_b_to_shards(
         catalog_path,
         output_dir,
@@ -644,6 +664,8 @@ def cross_match_iter(
     to a file. Use for pipelines that process matches in a streaming fashion.
     Only the partition_b path is supported (catalog_b may be a file or a
     pre-partitioned directory).
+
+    Uses the Rust engine when available (faster); falls back to Python otherwise.
     """
     catalog_a = Path(catalog_a)
     catalog_b = Path(catalog_b)
@@ -652,16 +674,11 @@ def cross_match_iter(
     validate_catalog_schema(
         catalog_a, ra_col=ra_col, dec_col=dec_col, id_col=id_col_a, must_have_id=True
     )
-    b_is_prepartitioned = catalog_b.is_dir()
-    if b_is_prepartitioned:
-        n_shards, _ = validate_prepartitioned_dir(catalog_b)
-        shard_path = catalog_b
-        id_b_name = "id_b"
-        first_shard = next(shard_path.glob("shard_*.parquet"))
-        type_b = _infer_id_type(pq.read_table(first_shard).column("id_b"))
-    else:
-        if not catalog_b.is_file():
-            raise FileNotFoundError(f"Catalog B not found: {catalog_b}")
+    if not catalog_b.is_file() and not catalog_b.is_dir():
+        raise FileNotFoundError(f"Catalog B not found: {catalog_b}")
+    if catalog_b.is_dir():
+        validate_prepartitioned_dir(catalog_b)
+    elif catalog_b.is_file():
         validate_catalog_schema(
             catalog_b,
             ra_col=ra_col,
@@ -669,9 +686,78 @@ def cross_match_iter(
             id_col=id_col_b,
             must_have_id=True,
         )
+
+    try:
+        import pleiades_core
+
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            matches_path = tmp.name
+        try:
+            pleiades_core.cross_match(
+                str(catalog_a),
+                str(catalog_b),
+                radius_arcsec,
+                matches_path,
+                depth=depth,
+                batch_size_a=batch_size_a,
+                batch_size_b=batch_size_b,
+                n_shards=n_shards,
+                ra_col=ra_col,
+                dec_col=dec_col,
+                id_col_a=id_col_a,
+                id_col_b=id_col_b,
+                ra_dec_units="deg",
+            )
+            pf = pq.ParquetFile(matches_path)
+            schema = pf.schema_arrow
+            names = schema.names
+            id_a_name = next(
+                (n for n in names if n != "separation_arcsec"),
+                "id_a",
+            )
+            id_b_name = next(
+                (n for n in names if n != "separation_arcsec" and n != id_a_name),
+                "id_b",
+            )
+            for batch in pf.iter_batches():
+                tbl = pa.Table.from_batches([batch])
+                if tbl.num_rows == 0:
+                    continue
+                id_a_arr = tbl.column(id_a_name)
+                id_b_arr = tbl.column(id_b_name)
+                sep_arr = tbl.column("separation_arcsec")
+                for i in range(tbl.num_rows):
+                    id_a_val = (
+                        id_a_arr[i].as_py()
+                        if hasattr(id_a_arr[i], "as_py")
+                        else id_a_arr[i]
+                    )
+                    id_b_val = (
+                        id_b_arr[i].as_py()
+                        if hasattr(id_b_arr[i], "as_py")
+                        else id_b_arr[i]
+                    )
+                    sep_val = (
+                        sep_arr[i].as_py()
+                        if hasattr(sep_arr[i], "as_py")
+                        else float(sep_arr[i])
+                    )
+                    yield (id_a_val, id_b_val, float(sep_val))
+        finally:
+            Path(matches_path).unlink(missing_ok=True)
+        return
+    except ImportError:
+        pass
+
+    b_is_prepartitioned = catalog_b.is_dir()
+    if b_is_prepartitioned:
+        n_shards, _ = validate_prepartitioned_dir(catalog_b)
+        shard_path = catalog_b
+        id_b_name = "id_b"
+    else:
         with tempfile.TemporaryDirectory(prefix="pleiades_b_") as shard_dir:
             shard_path = Path(shard_dir)
-            id_b_name, type_b = _partition_b_to_shards(
+            id_b_name, _ = _partition_b_to_shards(
                 catalog_b,
                 shard_path,
                 depth,

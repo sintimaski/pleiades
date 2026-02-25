@@ -145,7 +145,24 @@ catalog_a.parquet          catalog_b.parquet (or shard dir)
 
 ---
 
-## 6. References
+## 6. Move more work to Rust
+
+These Python-side operations are good candidates to move (or delegate) to Rust for speed.
+
+| Feature | What Python does today | Impact | Approach |
+|--------|-------------------------|--------|----------|
+| **cross_match_iter** | Streams A in batches, partitions B (or uses shards), loads B subset per chunk, runs **NumPy haversine matrix** in blocks (`_cross_match_chunk_matrix`). **Does not call the Rust engine.** | **High** | Implement a Rust-backed streaming API: e.g. engine writes matches to a temp file or channel; Python yields from a reader. Or expose a Rust iterator/generator that yields `(id_a, id_b, sep)` batches. Then `cross_match_iter` becomes a thin wrapper. |
+| **partition_catalog** | Streams B with PyArrow, computes HEALPix per row in Python/cdshealpix, writes one row at a time to per-shard Parquet writers. | **Medium** | Rust already has `partition_b_to_temp` (same logic). Expose it as a PyO3 function `partition_catalog(catalog_path, output_dir, ...)` and call it from Python `partition_catalog()`. Single read, parallel pixel assignment, batched writes. |
+| **cone_search** | Reads catalog in batches, vectorized haversine to center, filter, write. | **Medium** | Add a Rust `cone_search_impl(path, ra_deg, dec_deg, radius_arcsec, output_path)` that streams, filters, and writes. Reduces Python/NumPy overhead and allows reuse of engine I/O and haversine. |
+| **batch_cone_search** | Multiple cones; for each batch, distance to each query, keep row if within any. | **Medium** | Same as cone_search but with multiple centers; Rust can loop over queries or vectorize. |
+| **attach_match_coords** | Reads matches + full catalogs A and B into memory, builds id→(ra,dec) dicts, joins, writes. | **Lower** (unless catalogs huge) | Rust could stream: read matches in chunks, lookup id_a/id_b from pre-indexed catalogs (or sorted merge), write extended rows. Helps when catalogs are large. |
+| **summarize_matches** | Reads match file, computes count/min/max/mean of separation. | **Lower** | Single pass in Rust over Parquet match file; expose as PyO3. Nice-to-have. |
+
+**Suggested order:** (1) **cross_match_iter** → Rust-backed stream (biggest win for iterator users). (2) **partition_catalog** → call existing Rust partition (easy, avoids duplicate logic). (3) **cone_search** / **batch_cone_search** if those paths are hot.
+
+---
+
+## 7. References
 
 - **ARCHITECTURE.md** (this repo): flow, bottlenecks, knobs.
 - **Arrow Rust async reader:** `parquet::arrow::async_reader`, `ParquetRecordBatchStream`, row-group concurrency.

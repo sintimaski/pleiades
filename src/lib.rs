@@ -128,11 +128,45 @@ fn has_wgpu_feature() -> bool {
     cfg!(feature = "wgpu")
 }
 
+/// Partition a catalog by HEALPix pixel into shard Parquet files.
+/// Writes shard_0000.parquet, ... to output_dir. Returns (rows_written, id_column_name).
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (catalog_path, output_dir, depth=8, n_shards=16, batch_size=250_000, ra_col="ra", dec_col="dec", id_col=None, ra_dec_units="deg"))]
+fn partition_catalog(
+    catalog_path: &str,
+    output_dir: &str,
+    depth: u8,
+    n_shards: usize,
+    batch_size: usize,
+    ra_col: &str,
+    dec_col: &str,
+    id_col: Option<&str>,
+    ra_dec_units: &str,
+) -> PyResult<(i64, String)> {
+    let path = Path::new(catalog_path);
+    let out = Path::new(output_dir);
+    let from_radians = ra_dec_units.to_lowercase() == "rad";
+    match engine::partition_catalog_impl(path, out, depth, n_shards, batch_size, ra_col, dec_col, id_col, from_radians) {
+        Ok((rows, id_name)) => Ok((rows as i64, id_name)),
+        Err(e) => {
+            let msg = e.to_string();
+            if let Ok(io_err) = e.downcast::<std::io::Error>() {
+                if io_err.kind() == std::io::ErrorKind::NotFound {
+                    return Err(pyo3::exceptions::PyFileNotFoundError::new_err(msg));
+                }
+            }
+            Err(pyo3::exceptions::PyOSError::new_err(msg))
+        }
+    }
+}
+
 /// Python module entry point.
 #[cfg(feature = "python")]
 #[pymodule]
 fn pleiades_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cross_match, m)?)?;
+    m.add_function(wrap_pyfunction!(partition_catalog, m)?)?;
     m.add_function(wrap_pyfunction!(has_wgpu_feature, m)?)?;
     Ok(())
 }
