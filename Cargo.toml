@@ -25,6 +25,7 @@ parquet = { version = "52", default-features = false, features = ["arrow", "snap
 chrono = "=0.4.39"  # pin: 0.4.40+ adds Datelike::quarter() conflicting with arrow-arith
 cdshealpix = "0.9"
 rayon = "1.10"
+dashmap = "6"
 tempfile = "3"
 pyo3 = { version = "0.23", optional = true, features = ["extension-module"] }
 wgpu = { version = "24", optional = true }

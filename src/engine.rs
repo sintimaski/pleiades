@@ -8,6 +8,8 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
+
+use dashmap::{DashMap, DashSet};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -561,35 +563,24 @@ fn pixels_and_index(
         profile_log("pixels_and_index merge (HashSet/HashMap)", t_merge.elapsed().as_secs_f64(), &format!("({} pixels)", result.1.len()));
         return result;
     }
-    (0..ra_deg.len())
-        .into_par_iter()
-        .map(|row| {
-            let lon = ra_deg[row] * DEG_TO_RAD;
-            let lat = dec_deg[row] * DEG_TO_RAD;
-            let center = layer.hash(lon, lat);
-            let mut neighbours = Vec::with_capacity(9);
-            neighbours.push(center);
-            nested::append_bulk_neighbours(depth, center, &mut neighbours);
-            (center, row, neighbours)
-        })
-        .fold_with(
-            (HashMap::<u64, Vec<usize>>::new(), HashSet::<u64>::new()),
-            |(mut idx, mut pixels), (center, row, neighbours)| {
-                idx.entry(center).or_default().push(row);
-                for p in neighbours {
-                    pixels.insert(p);
-                }
-                (idx, pixels)
-            },
-        )
-        .reduce_with(|(mut a_idx, mut a_pix), (b_idx, b_pix)| {
-            for (p, rows) in b_idx {
-                a_idx.entry(p).or_default().extend(rows);
-            }
-            a_pix.extend(b_pix);
-            (a_idx, a_pix)
-        })
-        .unwrap_or_else(|| (HashMap::new(), HashSet::new()))
+    // Concurrent insert: no merge phase. Each worker writes directly to DashMap/DashSet.
+    let index: DashMap<u64, Vec<usize>> = DashMap::new();
+    let pixels: DashSet<u64> = DashSet::new();
+    (0..ra_deg.len()).into_par_iter().for_each(|row| {
+        let lon = ra_deg[row] * DEG_TO_RAD;
+        let lat = dec_deg[row] * DEG_TO_RAD;
+        let center = layer.hash(lon, lat);
+        let mut neighbours = Vec::with_capacity(9);
+        neighbours.push(center);
+        nested::append_bulk_neighbours(depth, center, &mut neighbours);
+        index.entry(center).or_default().push(row);
+        for p in neighbours {
+            pixels.insert(p);
+        }
+    });
+    let index: HashMap<u64, Vec<usize>> = index.into_iter().collect();
+    let pixels: HashSet<u64> = pixels.into_iter().collect();
+    (index, pixels)
 }
 
 /// Build HEALPix index only (pixel -> row indices). One hash per row, no neighbor set.
@@ -617,27 +608,15 @@ fn index_only(
         profile_log("index_only merge (HashMap)", t_merge.elapsed().as_secs_f64(), &format!("({} pixels)", result.len()));
         return result;
     }
-    (0..ra_deg.len())
-        .into_par_iter()
-        .map(|row| {
-            let lon = ra_deg[row] * DEG_TO_RAD;
-            let lat = dec_deg[row] * DEG_TO_RAD;
-            (layer.hash(lon, lat), row)
-        })
-        .fold_with(
-            HashMap::<u64, Vec<usize>>::new(),
-            |mut m, (pix, row)| {
-                m.entry(pix).or_default().push(row);
-                m
-            },
-        )
-        .reduce_with(|mut a, b| {
-            for (pix, v) in b {
-                a.entry(pix).or_default().extend(v);
-            }
-            a
-        })
-        .unwrap_or_else(HashMap::new)
+    // Concurrent insert: no merge phase.
+    let index: DashMap<u64, Vec<usize>> = DashMap::new();
+    (0..ra_deg.len()).into_par_iter().for_each(|row| {
+        let lon = ra_deg[row] * DEG_TO_RAD;
+        let lat = dec_deg[row] * DEG_TO_RAD;
+        let pix = layer.hash(lon, lat);
+        index.entry(pix).or_default().push(row);
+    });
+    index.into_iter().collect()
 }
 
 /// Progress callback type: (chunk_ix, total_or_none, rows_a_read, matches_count).
