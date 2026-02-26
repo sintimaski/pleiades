@@ -6,20 +6,18 @@
 //! Python validation layer before the engine is invoked.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::env;
 
-use dashmap::{DashMap, DashSet};
-use std::fs::File;
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-#[cfg(all(target_os = "macos", feature = "macos_readahead"))]
-use std::os::unix::io::AsRawFd;
-
+use std::fs::File;
 use tempfile::TempDir;
 
 use arrow::array::{
@@ -39,24 +37,13 @@ use rayon::prelude::*;
 #[cfg(feature = "rtree")]
 use rstar::{primitives::GeomWithData, AABB, RTree};
 
+#[cfg(feature = "simd")]
+use crate::haversine_simd::{haversine_a_4_rad as haversine_a_4_rad_simd, haversine_a_8_rad as haversine_a_8_rad_simd};
+
 /// Larger write buffer for temp shard files (fewer syscalls).
 const SHARD_WRITE_BUFFER_BYTES: usize = 256 * 1024; // 256 KiB
 /// Batch size when reading shard Parquet (larger = fewer decode cycles and larger I/O chunks).
 const SHARD_READ_BATCH_ROWS: usize = 131_072; // 128k
-
-/// On macOS, enable read-ahead on the file descriptor so sequential Parquet reads can be faster.
-#[cfg(all(target_os = "macos", feature = "macos_readahead"))]
-fn set_readahead(file: &File) {
-    // F_RDAHEAD = 64 on Darwin (bsd/sys/fcntl.h)
-    const F_RDAHEAD: libc::c_int = 64;
-    let fd = file.as_raw_fd();
-    unsafe {
-        libc::fcntl(fd, F_RDAHEAD, 1);
-    }
-}
-
-#[cfg(not(all(target_os = "macos", feature = "macos_readahead")))]
-fn set_readahead(_file: &File) {}
 
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
@@ -205,6 +192,7 @@ fn haversine_arcsec_4_rad(
 }
 
 /// Haversine `a` term only for 4 lanes (cheap-reject: skip sqrt/asin when a > a_max).
+/// When simd feature is on, uses AVX2/NEON via haversine_simd.
 #[inline(always)]
 fn haversine_a_4_rad(
     ra1_deg: &[f64; 4],
@@ -214,6 +202,12 @@ fn haversine_a_4_rad(
     cos_lat2: f64,
     out: &mut [f64; 4],
 ) {
+    #[cfg(feature = "simd")]
+    {
+        haversine_a_4_rad_simd(ra1_deg, dec1_deg, lon2, lat2, cos_lat2, out);
+        return;
+    }
+    #[cfg(not(feature = "simd"))]
     for i in 0..4 {
         let lon1 = ra1_deg[i] * DEG_TO_RAD;
         let lat1 = dec1_deg[i] * DEG_TO_RAD;
@@ -257,6 +251,7 @@ fn haversine_arcsec_8_rad(
 }
 
 /// Haversine `a` term only for 8 lanes (cheap-reject: skip sqrt/asin when a > a_max).
+/// When simd feature is on, delegates to haversine_simd (two 4-lane SIMD batches).
 #[inline(always)]
 fn haversine_a_8_rad(
     ra1_deg: &[f64; 8],
@@ -266,20 +261,28 @@ fn haversine_a_8_rad(
     cos_lat2: f64,
     out: &mut [f64; 8],
 ) {
-    let (ra1_4a, ra1_4b) = (
-        [ra1_deg[0], ra1_deg[1], ra1_deg[2], ra1_deg[3]],
-        [ra1_deg[4], ra1_deg[5], ra1_deg[6], ra1_deg[7]],
-    );
-    let (dec1_4a, dec1_4b) = (
-        [dec1_deg[0], dec1_deg[1], dec1_deg[2], dec1_deg[3]],
-        [dec1_deg[4], dec1_deg[5], dec1_deg[6], dec1_deg[7]],
-    );
-    let mut out_a = [0.0_f64; 4];
-    let mut out_b = [0.0_f64; 4];
-    haversine_a_4_rad(&ra1_4a, &dec1_4a, lon2, lat2, cos_lat2, &mut out_a);
-    haversine_a_4_rad(&ra1_4b, &dec1_4b, lon2, lat2, cos_lat2, &mut out_b);
-    out[0..4].copy_from_slice(&out_a);
-    out[4..8].copy_from_slice(&out_b);
+    #[cfg(feature = "simd")]
+    {
+        haversine_a_8_rad_simd(ra1_deg, dec1_deg, lon2, lat2, cos_lat2, out);
+        return;
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        let (ra1_4a, ra1_4b) = (
+            [ra1_deg[0], ra1_deg[1], ra1_deg[2], ra1_deg[3]],
+            [ra1_deg[4], ra1_deg[5], ra1_deg[6], ra1_deg[7]],
+        );
+        let (dec1_4a, dec1_4b) = (
+            [dec1_deg[0], dec1_deg[1], dec1_deg[2], dec1_deg[3]],
+            [dec1_deg[4], dec1_deg[5], dec1_deg[6], dec1_deg[7]],
+        );
+        let mut out_a = [0.0_f64; 4];
+        let mut out_b = [0.0_f64; 4];
+        haversine_a_4_rad(&ra1_4a, &dec1_4a, lon2, lat2, cos_lat2, &mut out_a);
+        haversine_a_4_rad(&ra1_4b, &dec1_4b, lon2, lat2, cos_lat2, &mut out_b);
+        out[0..4].copy_from_slice(&out_a);
+        out[4..8].copy_from_slice(&out_b);
+    }
 }
 
 /// Cheap reject: true if (ra_a, dec_a) vs (ra_b, dec_b) is definitely outside radius_deg.
@@ -392,17 +395,60 @@ fn is_radians(units: &str) -> bool {
     units.eq_ignore_ascii_case("rad")
 }
 
-/// Extract ra/dec as f64 in degrees. Supports Float32 and Float64; converts from radians if needed.
-fn ra_dec_degrees(
-    batch: &RecordBatch,
+/// Zero-copy or copied ra/dec in degrees. Use `.ra()` and `.dec()` to get `&[f64]`.
+enum RaDecRef<'a> {
+    /// Slice into Arrow Float64Array buffer (no copy).
+    Slice(&'a [f64], &'a [f64]),
+    /// Owned Vec when conversion (Float32, radians, or nulls) is needed.
+    Owned(Vec<f64>, Vec<f64>),
+}
+
+impl<'a> RaDecRef<'a> {
+    #[inline]
+    fn ra(&self) -> &[f64] {
+        match self {
+            RaDecRef::Slice(ra, _) => ra,
+            RaDecRef::Owned(ra, _) => ra.as_slice(),
+        }
+    }
+    #[inline]
+    fn dec(&self) -> &[f64] {
+        match self {
+            RaDecRef::Slice(_, dec) => dec,
+            RaDecRef::Owned(_, dec) => dec.as_slice(),
+        }
+    }
+}
+
+/// Extract ra/dec as f64 in degrees. Zero-copy when Float64 + degrees + no nulls.
+fn ra_dec_degrees<'a>(
+    batch: &'a RecordBatch,
     ra_idx: usize,
     dec_idx: usize,
     from_radians: bool,
-) -> Result<(Vec<f64>, Vec<f64>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<RaDecRef<'a>, Box<dyn std::error::Error + Send + Sync>> {
     let n = batch.num_rows();
     let ra_col = batch.column(ra_idx);
     let dec_col = batch.column(dec_idx);
     let to_deg = if from_radians { RAD_TO_DEG } else { 1.0 };
+
+    // Zero-copy path: Float64, degrees (to_deg==1), no nulls.
+    if to_deg == 1.0 {
+        if let (Some(ra_arr), Some(dec_arr)) = (
+            ra_col.as_any().downcast_ref::<Float64Array>(),
+            dec_col.as_any().downcast_ref::<Float64Array>(),
+        ) {
+            if ra_arr.null_count() == 0 && dec_arr.null_count() == 0 {
+                let ra = ra_arr.values();
+                let dec = dec_arr.values();
+                let ra_slice = &ra[..n];
+                let dec_slice = &dec[..n];
+                return Ok(RaDecRef::Slice(ra_slice, dec_slice));
+            }
+        }
+    }
+
+    // Copy path: Float32, radians, or nulls.
     let ra: Vec<f64> = match ra_col.data_type() {
         DataType::Float64 => ra_col
             .as_any()
@@ -439,7 +485,7 @@ fn ra_dec_degrees(
     };
     debug_assert_eq!(ra.len(), n);
     debug_assert_eq!(dec.len(), n);
-    Ok((ra, dec))
+    Ok(RaDecRef::Owned(ra, dec))
 }
 
 /// List shard Parquet paths in directory (shard_0000.parquet, ...), sorted. Returns (paths, n_shards).
@@ -463,87 +509,85 @@ fn list_shard_paths(shard_dir: &Path) -> Result<(Vec<std::path::PathBuf>, usize)
     Ok((paths, n))
 }
 
-/// Load one shard file, return rows whose pixel_id is in pixels_wanted. Shard ra/dec are in degrees.
-/// Uses a large batch size to reduce decode overhead; fast path for common shard schema (UInt64/Float64/Int64).
-fn load_one_shard(
-    path: &Path,
-    pixels_wanted: &HashSet<u64>,
-) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = File::open(path)?;
-    set_readahead(&file);
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-        .with_batch_size(SHARD_READ_BATCH_ROWS)
-        .build()?;
-    let mut out: Vec<(IdVal, f64, f64)> = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let n = batch.num_rows();
-        if n == 0 {
-            continue;
-        }
-        let pix_col = batch.column(column_index(&batch, "pixel_id"));
-        let ra_col = batch.column(column_index(&batch, "ra"));
-        let dec_col = batch.column(column_index(&batch, "dec"));
-        let id_b_idx = column_index(&batch, "id_b");
+/// Extract (id_b, ra, dec) from a shard RecordBatch for rows whose pixel_id is in pixels_wanted.
+fn extract_shard_batch_rows(
+    batch: &RecordBatch,
+    pixels_wanted: &FxHashSet<u64>,
+) -> Vec<(IdVal, f64, f64)> {
+    let n = batch.num_rows();
+    if n == 0 {
+        return Vec::new();
+    }
+    let pix_col = batch.column(column_index(batch, "pixel_id"));
+    let ra_col = batch.column(column_index(batch, "ra"));
+    let dec_col = batch.column(column_index(batch, "dec"));
+    let id_b_idx = column_index(batch, "id_b");
+    let mut out = Vec::with_capacity(n);
 
-        // Fast path: shard schema is always (pixel_id UInt64, id_b ?, ra Float64, dec Float64) from partition_b_to_temp.
-        if let (Some(pix_arr), Some(ra_arr), Some(dec_arr)) = (
-            pix_col.as_any().downcast_ref::<UInt64Array>(),
-            ra_col.as_any().downcast_ref::<Float64Array>(),
-            dec_col.as_any().downcast_ref::<Float64Array>(),
-        ) {
-            let ra_slice = ra_arr.values();
-            let dec_slice = dec_arr.values();
-            out.reserve(n);
-            let id_col = batch.column(id_b_idx);
-            if let Some(id_i64) = id_col.as_any().downcast_ref::<Int64Array>() {
-                for row in 0..n {
-                    if !pixels_wanted.contains(&pix_arr.value(row)) {
-                        continue;
-                    }
+    if let (Some(pix_arr), Some(ra_arr), Some(dec_arr)) = (
+        pix_col.as_any().downcast_ref::<UInt64Array>(),
+        ra_col.as_any().downcast_ref::<Float64Array>(),
+        dec_col.as_any().downcast_ref::<Float64Array>(),
+    ) {
+        let ra_slice = ra_arr.values();
+        let dec_slice = dec_arr.values();
+        let id_col = batch.column(id_b_idx);
+        if let Some(id_i64) = id_col.as_any().downcast_ref::<Int64Array>() {
+            for row in 0..n {
+                if pixels_wanted.contains(&pix_arr.value(row)) {
                     out.push((IdVal::I64(id_i64.value(row)), ra_slice[row], dec_slice[row]));
                 }
-            } else {
-                for row in 0..n {
-                    if !pixels_wanted.contains(&pix_arr.value(row)) {
-                        continue;
-                    }
+            }
+        } else {
+            for row in 0..n {
+                if pixels_wanted.contains(&pix_arr.value(row)) {
                     out.push((
-                        get_id_value(&batch, "id_b", id_b_idx, row),
+                        get_id_value(batch, "id_b", id_b_idx, row),
                         ra_slice[row],
                         dec_slice[row],
                     ));
                 }
             }
+        }
+        return out;
+    }
+
+    for row in 0..n {
+        let pix_val = match pix_col.data_type() {
+            DataType::UInt64 => pix_col.as_any().downcast_ref::<UInt64Array>().unwrap().value(row),
+            DataType::Int64 => pix_col.as_any().downcast_ref::<Int64Array>().unwrap().value(row) as u64,
+            _ => continue,
+        };
+        if !pixels_wanted.contains(&pix_val) {
             continue;
         }
-
-        // Fallback: other column types (e.g. Float32 ra/dec, Dictionary id_b).
-        out.reserve(n);
-        for row in 0..n {
-            let pix_val = match pix_col.data_type() {
-                DataType::UInt64 => pix_col.as_any().downcast_ref::<UInt64Array>().unwrap().value(row),
-                DataType::Int64 => pix_col.as_any().downcast_ref::<Int64Array>().unwrap().value(row) as u64,
-                _ => continue,
-            };
-            if !pixels_wanted.contains(&pix_val) {
-                continue;
-            }
-            let id_val = get_id_value(&batch, "id_b", id_b_idx, row);
-            let ra = match ra_col.data_type() {
-                DataType::Float64 => ra_col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
-                DataType::Float32 => f64::from(ra_col.as_any().downcast_ref::<Float32Array>().unwrap().value(row)),
-                _ => continue,
-            };
-            let dec = match dec_col.data_type() {
-                DataType::Float64 => dec_col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
-                DataType::Float32 => f64::from(dec_col.as_any().downcast_ref::<Float32Array>().unwrap().value(row)),
-                _ => continue,
-            };
-            out.push((id_val, ra, dec));
-        }
+        let id_val = get_id_value(batch, "id_b", id_b_idx, row);
+        let ra = match ra_col.data_type() {
+            DataType::Float64 => ra_col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
+            DataType::Float32 => f64::from(ra_col.as_any().downcast_ref::<Float32Array>().unwrap().value(row)),
+            _ => continue,
+        };
+        let dec = match dec_col.data_type() {
+            DataType::Float64 => dec_col.as_any().downcast_ref::<Float64Array>().unwrap().value(row),
+            DataType::Float32 => f64::from(dec_col.as_any().downcast_ref::<Float32Array>().unwrap().value(row)),
+            _ => continue,
+        };
+        out.push((id_val, ra, dec));
     }
-    Ok(out)
+    out
+}
+
+/// Load one shard file, return rows whose pixel_id is in pixels_wanted. Shard ra/dec are in degrees.
+/// Uses parallel row-group decode when the shard has multiple row groups.
+fn load_one_shard(
+    path: &Path,
+    pixels_wanted: &FxHashSet<u64>,
+) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+    let batches = crate::parquet_parallel::read_parquet_parallel(path, SHARD_READ_BATCH_ROWS)?;
+    Ok(batches
+        .par_iter()
+        .flat_map(|b| extract_shard_batch_rows(b, pixels_wanted))
+        .collect())
 }
 
 /// Load B rows from pre-partitioned shards for the given set of pixel IDs (shards loaded in parallel).
@@ -551,7 +595,7 @@ fn load_one_shard(
 /// Shard files always store ra/dec in degrees (written by partition_b_to_temp).
 fn load_b_from_shards(
     shard_dir: &Path,
-    pixels_wanted: &HashSet<u64>,
+    pixels_wanted: &FxHashSet<u64>,
     n_shards: usize,
     _from_radians: bool,
 ) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
@@ -559,7 +603,7 @@ fn load_b_from_shards(
     let shard_indices: Vec<usize> = pixels_wanted
         .iter()
         .map(|&p| (p % n_shards as u64) as usize)
-        .collect::<HashSet<_>>()
+        .collect::<FxHashSet<_>>()
         .into_iter()
         .collect();
     let vecs: Vec<Result<Vec<(IdVal, f64, f64)>, _>> = shard_indices
@@ -578,7 +622,7 @@ fn load_b_from_shards(
 
 /// Compute pixels in chunk A plus all 8 neighbors (halo). Parallel over rows; merge with
 /// fold/reduce for better parallelism than single-threaded collect into HashSet.
-fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) -> HashSet<u64> {
+fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) -> FxHashSet<u64> {
     let layer = get(depth);
     (0..ra_deg.len())
         .into_par_iter()
@@ -591,7 +635,7 @@ fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) ->
             nested::append_bulk_neighbours(depth, center, &mut neighbours);
             neighbours
         })
-        .fold_with(HashSet::new(), |mut s, neighbours| {
+        .fold_with(FxHashSet::default(), |mut s, neighbours| {
             s.extend(neighbours);
             s
         })
@@ -599,15 +643,21 @@ fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) ->
             a.extend(b);
             a
         })
-        .unwrap_or_else(HashSet::new)
+        .unwrap_or_else(FxHashSet::default)
+}
+
+/// Estimated unique pixels for capacity hint (reduces rehashing).
+fn estimated_pixels(n_rows: usize) -> usize {
+    (n_rows / 4).min(300_000).max(4096)
 }
 
 /// Merge collected per-row results into (index, pixels). Used for profiling when PLEIADES_PROFILE=1.
 fn merge_pixels_and_index(
     collected: Vec<(u64, usize, Vec<u64>)>,
-) -> (HashMap<u64, Vec<usize>>, HashSet<u64>) {
-    let mut idx: HashMap<u64, Vec<usize>> = HashMap::new();
-    let mut pixels = HashSet::new();
+) -> (FxHashMap<u64, Vec<usize>>, FxHashSet<u64>) {
+    let cap = estimated_pixels(collected.len());
+    let mut idx: FxHashMap<u64, Vec<usize>> = FxHashMap::with_capacity_and_hasher(cap, Default::default());
+    let mut pixels = FxHashSet::with_capacity_and_hasher(cap, Default::default());
     for (center, row, neighbours) in collected {
         idx.entry(center).or_default().push(row);
         for p in neighbours {
@@ -618,8 +668,9 @@ fn merge_pixels_and_index(
 }
 
 /// Merge collected (pixel, row) pairs into index. Used for profiling when PLEIADES_PROFILE=1.
-fn merge_index_only(collected: Vec<(u64, usize)>) -> HashMap<u64, Vec<usize>> {
-    let mut idx: HashMap<u64, Vec<usize>> = HashMap::new();
+fn merge_index_only(collected: Vec<(u64, usize)>) -> FxHashMap<u64, Vec<usize>> {
+    let mut idx: FxHashMap<u64, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(estimated_pixels(collected.len()), Default::default());
     for (pix, row) in collected {
         idx.entry(pix).or_default().push(row);
     }
@@ -627,89 +678,67 @@ fn merge_index_only(collected: Vec<(u64, usize)>) -> HashMap<u64, Vec<usize>> {
 }
 
 /// One pass over chunk A: build HEALPix index (pixel -> row indices) and pixel set (centers + neighbors).
-/// Hashes each (ra, dec) once instead of separate pixels then index passes.
-/// When PLEIADES_PROFILE=1, times "map" (parallel map+fold) and "merge" (single-threaded reduce) separately.
+/// Uses parallel map + single-threaded merge (avoids DashMap contention). Pre-allocates collected Vec.
 fn pixels_and_index(
     ra_deg: &[f64],
     dec_deg: &[f64],
     depth: u8,
-) -> (HashMap<u64, Vec<usize>>, HashSet<u64>) {
+) -> (FxHashMap<u64, Vec<usize>>, FxHashSet<u64>) {
     let layer = get(depth);
     let profile = env::var("PLEIADES_PROFILE").is_ok();
+    let t_map = std::time::Instant::now();
+    let mut collected: Vec<(u64, usize, Vec<u64>)> = Vec::with_capacity(ra_deg.len());
+    (0..ra_deg.len())
+        .into_par_iter()
+        .map(|row| {
+            let lon = ra_deg[row] * DEG_TO_RAD;
+            let lat = dec_deg[row] * DEG_TO_RAD;
+            let center = layer.hash(lon, lat);
+            let mut neighbours = Vec::with_capacity(9);
+            neighbours.push(center);
+            nested::append_bulk_neighbours(depth, center, &mut neighbours);
+            (center, row, neighbours)
+        })
+        .collect_into_vec(&mut collected);
     if profile {
-        let t_map = std::time::Instant::now();
-        let collected: Vec<(u64, usize, Vec<u64>)> = (0..ra_deg.len())
-            .into_par_iter()
-            .map(|row| {
-                let lon = ra_deg[row] * DEG_TO_RAD;
-                let lat = dec_deg[row] * DEG_TO_RAD;
-                let center = layer.hash(lon, lat);
-                let mut neighbours = Vec::with_capacity(9);
-                neighbours.push(center);
-                nested::append_bulk_neighbours(depth, center, &mut neighbours);
-                (center, row, neighbours)
-            })
-            .collect();
         profile_log("pixels_and_index map", t_map.elapsed().as_secs_f64(), &format!("({} rows)", collected.len()));
-        let t_merge = std::time::Instant::now();
-        let result = merge_pixels_and_index(collected);
-        profile_log("pixels_and_index merge (HashSet/HashMap)", t_merge.elapsed().as_secs_f64(), &format!("({} pixels)", result.1.len()));
-        return result;
     }
-    // Concurrent insert: no merge phase. Each worker writes directly to DashMap/DashSet.
-    let index: DashMap<u64, Vec<usize>> = DashMap::new();
-    let pixels: DashSet<u64> = DashSet::new();
-    (0..ra_deg.len()).into_par_iter().for_each(|row| {
-        let lon = ra_deg[row] * DEG_TO_RAD;
-        let lat = dec_deg[row] * DEG_TO_RAD;
-        let center = layer.hash(lon, lat);
-        let mut neighbours = Vec::with_capacity(9);
-        neighbours.push(center);
-        nested::append_bulk_neighbours(depth, center, &mut neighbours);
-        index.entry(center).or_default().push(row);
-        for p in neighbours {
-            pixels.insert(p);
-        }
-    });
-    let index: HashMap<u64, Vec<usize>> = index.into_iter().collect();
-    let pixels: HashSet<u64> = pixels.into_iter().collect();
-    (index, pixels)
+    let t_merge = std::time::Instant::now();
+    let result = merge_pixels_and_index(collected);
+    if profile {
+        profile_log("pixels_and_index merge (HashSet/HashMap)", t_merge.elapsed().as_secs_f64(), &format!("({} pixels)", result.1.len()));
+    }
+    result
 }
 
 /// Build HEALPix index only (pixel -> row indices). One hash per row, no neighbor set.
-/// When PLEIADES_PROFILE=1, times "map" and "merge" separately.
+/// Uses parallel map + single-threaded merge (avoids DashMap contention).
 fn index_only(
     ra_deg: &[f64],
     dec_deg: &[f64],
     depth: u8,
-) -> HashMap<u64, Vec<usize>> {
+) -> FxHashMap<u64, Vec<usize>> {
     let layer = get(depth);
     let profile = env::var("PLEIADES_PROFILE").is_ok();
+    let t_map = std::time::Instant::now();
+    let mut collected: Vec<(u64, usize)> = Vec::with_capacity(ra_deg.len());
+    (0..ra_deg.len())
+        .into_par_iter()
+        .map(|row| {
+            let lon = ra_deg[row] * DEG_TO_RAD;
+            let lat = dec_deg[row] * DEG_TO_RAD;
+            (layer.hash(lon, lat), row)
+        })
+        .collect_into_vec(&mut collected);
     if profile {
-        let t_map = std::time::Instant::now();
-        let collected: Vec<(u64, usize)> = (0..ra_deg.len())
-            .into_par_iter()
-            .map(|row| {
-                let lon = ra_deg[row] * DEG_TO_RAD;
-                let lat = dec_deg[row] * DEG_TO_RAD;
-                (layer.hash(lon, lat), row)
-            })
-            .collect();
         profile_log("index_only map", t_map.elapsed().as_secs_f64(), &format!("({} rows)", collected.len()));
-        let t_merge = std::time::Instant::now();
-        let result = merge_index_only(collected);
-        profile_log("index_only merge (HashMap)", t_merge.elapsed().as_secs_f64(), &format!("({} pixels)", result.len()));
-        return result;
     }
-    // Concurrent insert: no merge phase.
-    let index: DashMap<u64, Vec<usize>> = DashMap::new();
-    (0..ra_deg.len()).into_par_iter().for_each(|row| {
-        let lon = ra_deg[row] * DEG_TO_RAD;
-        let lat = dec_deg[row] * DEG_TO_RAD;
-        let pix = layer.hash(lon, lat);
-        index.entry(pix).or_default().push(row);
-    });
-    index.into_iter().collect()
+    let t_merge = std::time::Instant::now();
+    let result = merge_index_only(collected);
+    if profile {
+        profile_log("index_only merge (HashMap)", t_merge.elapsed().as_secs_f64(), &format!("({} pixels)", result.len()));
+    }
+    result
 }
 
 /// Progress callback type: (chunk_ix, total_or_none, rows_a_read, matches_count).
@@ -754,9 +783,12 @@ fn partition_batch_to_row_results(
     let ra_idx = column_index(batch, ra_col);
     let dec_idx = column_index(batch, dec_col);
     let id_b_idx = column_index(batch, id_b_name);
-    let (ra_deg, dec_deg) = ra_dec_degrees(batch, ra_idx, dec_idx, from_radians)?;
+    let ra_dec = ra_dec_degrees(batch, ra_idx, dec_idx, from_radians)?;
+    let ra_deg = ra_dec.ra();
+    let dec_deg = ra_dec.dec();
     let n = batch.num_rows();
-    let row_results: Vec<(usize, u64, IdVal, f64, f64)> = (0..n)
+    let mut row_results: Vec<(usize, u64, IdVal, f64, f64)> = Vec::with_capacity(n);
+    (0..n)
         .into_par_iter()
         .map(|row| {
             let lon = ra_deg[row] * DEG_TO_RAD;
@@ -766,7 +798,7 @@ fn partition_batch_to_row_results(
             let id_val = get_id_value(batch, id_b_name, id_b_idx, row);
             (shard_ix, pixel_id, id_val, ra_deg[row], dec_deg[row])
         })
-        .collect();
+        .collect_into_vec(&mut row_results);
     Ok(row_results)
 }
 
@@ -783,19 +815,21 @@ fn partition_file_to_shard_dir(
     id_col_b: Option<&str>,
     from_radians: bool,
 ) -> Result<(u64, String), Box<dyn std::error::Error + Send + Sync>> {
-    let file_b = File::open(catalog_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
-    let arrow_schema = builder.schema().clone();
-    let mut reader = builder.with_batch_size(batch_size_b).build()?;
-
     let temp_shard_props = WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
         .build();
 
-    let first_batch = match reader.next() {
-        Some(Ok(b)) => b,
-        Some(Err(e)) => return Err(e.into()),
+    let all_batches = crate::parquet_parallel::read_parquet_parallel(catalog_path, batch_size_b)?;
+    let arrow_schema = match all_batches.first() {
+        Some(b) => b.schema(),
         None => {
+            let input_b = crate::parquet_mmap::ParquetInput::open(catalog_path)?;
+            ParquetRecordBatchReaderBuilder::try_new(input_b)?.schema().clone()
+        }
+    };
+    let first_batch = match all_batches.first() {
+        Some(b) if b.num_rows() > 0 => b.clone(),
+        _ => {
             let id_b_name_owned =
                 id_column_from_schema(arrow_schema.as_ref(), ra_col, dec_col, id_col_b);
             let id_b_type = id_type_from_schema(arrow_schema.as_ref(), &id_b_name_owned);
@@ -864,31 +898,53 @@ fn partition_file_to_shard_dir(
         })
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
-    let mut rows_written: u64 = 0;
-    let mut buffers: Vec<Vec<(u64, IdVal, f64, f64)>> = (0..n_shards).map(|_| Vec::new()).collect();
     /// Larger flush reduces Parquet write() calls and RecordBatch builds during partition.
     const FLUSH_AT: usize = 131_072;
 
-    // Collect all batches then process in parallel (pixel assignment per batch).
-    let mut batches: Vec<RecordBatch> = vec![first_batch];
-    for batch in reader {
-        let batch = batch?;
-        if batch.num_rows() > 0 {
-            batches.push(batch);
-        }
-    }
+    // Batches from parallel decode (already includes first_batch).
+    let batches: Vec<RecordBatch> = all_batches;
     let batch_results: Vec<Vec<(usize, u64, IdVal, f64, f64)>> = batches
         .par_iter()
         .map(|b| partition_batch_to_row_results(b, depth, n_shards, &id_b_name, ra_col, dec_col, from_radians))
         .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
-    for row_results in batch_results {
-        for (shard_ix, pixel_id, id_val, ra, dec) in row_results {
-            buffers[shard_ix].push((pixel_id, id_val, ra, dec));
-        }
-        for (s, buf) in buffers.iter_mut().enumerate() {
-            while buf.len() >= FLUSH_AT {
-                let chunk: Vec<(u64, IdVal, f64, f64)> = buf.drain(..FLUSH_AT).collect();
+    // Group each batch's results by shard.
+    let per_batch_per_shard: Vec<Vec<Vec<(u64, IdVal, f64, f64)>>> = batch_results
+        .par_iter()
+        .map(|rows| {
+            let mut by_shard: Vec<Vec<(u64, IdVal, f64, f64)>> = (0..n_shards).map(|_| Vec::new()).collect();
+            for (shard_ix, pixel_id, id_val, ra, dec) in rows {
+                by_shard[*shard_ix].push((*pixel_id, id_val.clone(), *ra, *dec));
+            }
+            by_shard
+        })
+        .collect();
+
+    // Per-shard: merge all batches' rows and write in parallel.
+    let shard_data: Vec<Vec<(u64, IdVal, f64, f64)>> = (0..n_shards)
+        .into_par_iter()
+        .map(|s| {
+            per_batch_per_shard
+                .iter()
+                .flat_map(|batch| batch[s].iter().cloned())
+                .collect()
+        })
+        .collect();
+
+    let writer_data: Vec<(ArrowWriter<BufWriter<File>>, Vec<(u64, IdVal, f64, f64)>)> = writers
+        .into_iter()
+        .zip(shard_data)
+        .map(|(opt, data)| (opt.unwrap(), data))
+        .collect();
+
+    let n_writers = writer_data.len();
+    let mut write_results: Vec<Result<u64, Box<dyn std::error::Error + Send + Sync>>> =
+        Vec::with_capacity(n_writers);
+    writer_data
+        .into_par_iter()
+        .map(|(mut writer, data)| -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+            let mut written = 0u64;
+            for chunk in data.chunks(FLUSH_AT) {
                 let pix: Vec<u64> = chunk.iter().map(|r| r.0).collect();
                 let ids: Vec<IdVal> = chunk.iter().map(|r| r.1.clone()).collect();
                 let ras: Vec<f64> = chunk.iter().map(|r| r.2).collect();
@@ -898,7 +954,7 @@ fn partition_file_to_shard_dir(
                 let ra_arr = Arc::new(Float64Array::from(ras));
                 let dec_arr = Arc::new(Float64Array::from(decs));
                 let batch_out = RecordBatch::try_new(
-                    shard_schema.clone(),
+                    Arc::clone(&shard_schema),
                     vec![
                         Arc::new(pix_arr),
                         id_arr,
@@ -906,41 +962,19 @@ fn partition_file_to_shard_dir(
                         dec_arr,
                     ],
                 )?;
-                writers[s].as_mut().unwrap().write(&batch_out)?;
-                rows_written += FLUSH_AT as u64;
+                writer.write(&batch_out)?;
+                written += chunk.len() as u64;
             }
-        }
-    }
+            writer.close()?;
+            Ok(written)
+        })
+        .collect_into_vec(&mut write_results);
 
-    // Flush remaining buffers
-    for (s, buf) in buffers.iter_mut().enumerate() {
-        if buf.is_empty() {
-            continue;
-        }
-        let pix: Vec<u64> = buf.iter().map(|r| r.0).collect();
-        let ids: Vec<IdVal> = buf.iter().map(|r| r.1.clone()).collect();
-        let ras: Vec<f64> = buf.iter().map(|r| r.2).collect();
-        let decs: Vec<f64> = buf.iter().map(|r| r.3).collect();
-        let pix_arr = UInt64Array::from(pix);
-        let id_arr = build_id_column_single(&ids);
-        let ra_arr = Arc::new(Float64Array::from(ras));
-        let dec_arr = Arc::new(Float64Array::from(decs));
-        let batch_out = RecordBatch::try_new(
-            shard_schema.clone(),
-            vec![
-                Arc::new(pix_arr),
-                id_arr,
-                ra_arr,
-                dec_arr,
-            ],
-        )?;
-        writers[s].as_mut().unwrap().write(&batch_out)?;
-        rows_written += buf.len() as u64;
-    }
-
-    for w in writers.iter_mut() {
-        w.take().unwrap().close()?;
-    }
+    let rows_written: u64 = write_results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum();
 
     Ok((rows_written, id_b_name_owned))
 }
@@ -1008,8 +1042,8 @@ pub fn cone_search_impl(
     from_radians: bool,
     batch_size: usize,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let file = File::open(catalog_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let input = crate::parquet_mmap::ParquetInput::open(catalog_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
     let input_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size).build()?;
 
@@ -1023,8 +1057,9 @@ pub fn cone_search_impl(
         }
         let ra_idx = column_index(&batch, ra_col);
         let dec_idx = column_index(&batch, dec_col);
-        let (ra_deg_vec, dec_deg_vec) =
-            ra_dec_degrees(&batch, ra_idx, dec_idx, from_radians)?;
+        let ra_dec = ra_dec_degrees(&batch, ra_idx, dec_idx, from_radians)?;
+        let ra_deg_vec = ra_dec.ra();
+        let dec_deg_vec = ra_dec.dec();
         let n = batch.num_rows();
         let mut sep_vec: Vec<f64> = Vec::with_capacity(n);
         let mut mask_vec: Vec<bool> = Vec::with_capacity(n);
@@ -1122,7 +1157,7 @@ pub fn batch_cone_search_impl(
     batch_size: usize,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     if queries.is_empty() {
-        let schema = ParquetRecordBatchReaderBuilder::try_new(File::open(catalog_path)?)?
+        let schema = ParquetRecordBatchReaderBuilder::try_new(crate::parquet_mmap::ParquetInput::open(catalog_path)?)?
             .schema()
             .clone();
         let empty_schema = Arc::new(Schema::new(
@@ -1153,8 +1188,8 @@ pub fn batch_cone_search_impl(
         return Ok(0);
     }
 
-    let file = File::open(catalog_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let input = crate::parquet_mmap::ParquetInput::open(catalog_path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
     let input_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size).build()?;
 
@@ -1168,8 +1203,9 @@ pub fn batch_cone_search_impl(
         }
         let ra_idx = column_index(&batch, ra_col);
         let dec_idx = column_index(&batch, dec_col);
-        let (ra_deg_vec, dec_deg_vec) =
-            ra_dec_degrees(&batch, ra_idx, dec_idx, from_radians)?;
+        let ra_dec = ra_dec_degrees(&batch, ra_idx, dec_idx, from_radians)?;
+        let ra_deg_vec = ra_dec.ra();
+        let dec_deg_vec = ra_dec.dec();
         let n = batch.num_rows();
 
         let mut best_sep: Vec<f64> = vec![f64::INFINITY; n];
@@ -1289,8 +1325,8 @@ pub fn attach_match_coords_impl(
                               ra_col: &str,
                               dec_col: &str|
      -> Result<HashMap<IdVal, (f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
-        let file = File::open(path)?;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
+        let input = crate::parquet_mmap::ParquetInput::open(path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(input)?.build()?;
         let mut map = HashMap::new();
         for batch in reader {
             let batch = batch?;
@@ -1300,7 +1336,9 @@ pub fn attach_match_coords_impl(
             let id_idx = column_index(&batch, id_col_name);
             let ra_idx = column_index(&batch, ra_col);
             let dec_idx = column_index(&batch, dec_col);
-            let (ra_vec, dec_vec) = ra_dec_degrees(&batch, ra_idx, dec_idx, false)?;
+            let ra_dec = ra_dec_degrees(&batch, ra_idx, dec_idx, false)?;
+            let ra_vec = ra_dec.ra();
+            let dec_vec = ra_dec.dec();
             for i in 0..batch.num_rows() {
                 let id_val = get_id_value(&batch, id_col_name, id_idx, i);
                 map.insert(id_val, (ra_vec[i], dec_vec[i]));
@@ -1310,8 +1348,8 @@ pub fn attach_match_coords_impl(
     };
 
     let infer_id = |path: &Path, ra_col: &str, dec_col: &str| -> String {
-        if let Ok(f) = File::open(path) {
-            if let Ok(b) = ParquetRecordBatchReaderBuilder::try_new(f) {
+        if let Ok(input) = crate::parquet_mmap::ParquetInput::open(path) {
+            if let Ok(b) = ParquetRecordBatchReaderBuilder::try_new(input) {
                 let schema = b.schema();
                 return id_column_from_schema(schema.as_ref(), ra_col, dec_col, None);
             }
@@ -1327,8 +1365,8 @@ pub fn attach_match_coords_impl(
     let a_map = build_id_to_ra_dec(catalog_a_path, &id_a_cat, ra_col, dec_col)?;
     let b_map = build_id_to_ra_dec(catalog_b_path, &id_b_cat, ra_col, dec_col)?;
 
-    let file_m = File::open(matches_path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file_m)?.build()?;
+    let input_m = crate::parquet_mmap::ParquetInput::open(matches_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(input_m)?.build()?;
     let schema = reader.schema();
     let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let id_a_name = names
@@ -1437,8 +1475,8 @@ fn partition_b_to_memory(
     from_radians: bool,
 ) -> Result<(Vec<Vec<(u64, IdVal, f64, f64)>>, String, u64), Box<dyn std::error::Error + Send + Sync>> {
     let layer = get(depth);
-    let file_b = File::open(catalog_b)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file_b)?;
+    let input_b = crate::parquet_mmap::ParquetInput::open(catalog_b)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(input_b)?;
     let arrow_schema = builder.schema().clone();
     let mut reader = builder.with_batch_size(batch_size_b).build()?;
 
@@ -1462,9 +1500,12 @@ fn partition_b_to_memory(
         let ra_idx = column_index(batch, ra_col);
         let dec_idx = column_index(batch, dec_col);
         let id_b_idx = column_index(batch, &id_b_name);
-        let (ra_deg, dec_deg) = ra_dec_degrees(batch, ra_idx, dec_idx, from_radians)?;
+        let ra_dec = ra_dec_degrees(batch, ra_idx, dec_idx, from_radians)?;
+        let ra_deg = ra_dec.ra();
+        let dec_deg = ra_dec.dec();
         let n = batch.num_rows();
-        let row_results: Vec<(usize, u64, IdVal, f64, f64)> = (0..n)
+        let mut row_results: Vec<(usize, u64, IdVal, f64, f64)> = Vec::with_capacity(n);
+        (0..n)
             .into_par_iter()
             .map(|row| {
                 let lon = ra_deg[row] * DEG_TO_RAD;
@@ -1474,7 +1515,7 @@ fn partition_b_to_memory(
                 let id_val = get_id_value(batch, &id_b_name, id_b_idx, row);
                 (shard_ix, pixel_id, id_val, ra_deg[row], dec_deg[row])
             })
-            .collect();
+            .collect_into_vec(&mut row_results);
         for (shard_ix, pixel_id, id_val, ra, dec) in row_results {
             buffers[shard_ix].push((pixel_id, id_val, ra, dec));
         }
@@ -1496,13 +1537,13 @@ fn partition_b_to_memory(
 /// Load B rows from in-memory shard buffers for the given set of pixel IDs (no I/O).
 fn load_b_from_memory(
     shard_buffers: &[Vec<(u64, IdVal, f64, f64)>],
-    pixels_wanted: &HashSet<u64>,
+    pixels_wanted: &FxHashSet<u64>,
     n_shards: usize,
 ) -> Vec<(IdVal, f64, f64)> {
     let shard_indices: Vec<usize> = pixels_wanted
         .iter()
         .map(|&p| (p % n_shards as u64) as usize)
-        .collect::<HashSet<_>>()
+        .collect::<FxHashSet<_>>()
         .into_iter()
         .collect();
     let out: Vec<(IdVal, f64, f64)> = shard_indices
@@ -1539,9 +1580,10 @@ fn group_b_by_pixel(
     ra_b: &[f64],
     dec_b: &[f64],
     depth: u8,
-) -> HashMap<u64, Vec<usize>> {
+) -> FxHashMap<u64, Vec<usize>> {
     let layer = get(depth);
-    let mut by_pixel: HashMap<u64, Vec<usize>> = HashMap::new();
+    let mut by_pixel: FxHashMap<u64, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(estimated_pixels(ra_b.len()), Default::default());
     for (b_row_ix, (&ra, &dec)) in ra_b.iter().zip(dec_b.iter()).enumerate() {
         let pix = layer.hash(ra * DEG_TO_RAD, dec * DEG_TO_RAD);
         by_pixel.entry(pix).or_default().push(b_row_ix);
@@ -1566,7 +1608,7 @@ fn join_strategy() -> String {
 /// Returns per-row matches (candidate_ix, b_row_ix, sep_arcsec).
 fn run_cpu_join(
     b_cols: &BColumns,
-    index_ref: &HashMap<u64, Vec<usize>>,
+    index_ref: &FxHashMap<u64, Vec<usize>>,
     ra_flat_ref: &[f64],
     dec_flat_ref: &[f64],
     radius_arcsec: f64,
@@ -1575,13 +1617,19 @@ fn run_cpu_join(
 ) -> Vec<Vec<(usize, usize, f64)>> {
     let ra_b = &b_cols.ra_b[..];
     let dec_b = &b_cols.dec_b[..];
+
+    let t_group = std::time::Instant::now();
     let by_pixel = group_b_by_pixel(ra_b, dec_b, depth_local);
+    if env::var("PLEIADES_PROFILE").is_ok() {
+        profile_log("join_group_b", t_group.elapsed().as_secs_f64(), &format!("({} pixels)", by_pixel.len()));
+    }
 
     let radius_rad = radius_arcsec / RAD_TO_ARCSEC;
     let a_max = (radius_rad * 0.5).sin().powi(2);
     let use_dot_product = radius_arcsec < 600.0; // 10 arcmin: dot product is faster for small angles
     let cos_radius_rad = radius_rad.cos();
 
+    let t_per_pixel = std::time::Instant::now();
     let per_pixel: Vec<Vec<(usize, Vec<(usize, usize, f64)>)>> = by_pixel
         .par_iter()
         .map(|(pixel, b_indices)| {
@@ -1886,6 +1934,9 @@ fn run_cpu_join(
             out
         })
         .collect();
+    if env::var("PLEIADES_PROFILE").is_ok() {
+        profile_log("join_haversine_loop", t_per_pixel.elapsed().as_secs_f64(), "(per-pixel)");
+    }
 
     let mut row_matches: Vec<Vec<(usize, usize, f64)>> = (0..b_cols.len()).map(|_| Vec::new()).collect();
     for chunk in per_pixel {
@@ -2006,7 +2057,7 @@ pub fn cross_match_impl(
     };
 
     let use_b_prefetch = shard_dir.is_some() && b_in_memory.is_none();
-    let a_channel_cap = if use_b_prefetch { 2 } else { 1 };
+    let a_channel_cap = if use_b_prefetch { 4 } else { 2 };
     if verbose && use_b_prefetch {
         verbose_log("B prefetch: overlap index||load B and join||load B (two requests in flight)");
     }
@@ -2016,14 +2067,14 @@ pub fn cross_match_impl(
     let path_a = catalog_a.to_path_buf();
     let batch_size_a_prefetch = batch_size_a;
     let reader_handle = thread::spawn(move || {
-        let file_a = match File::open(&path_a) {
-            Ok(f) => f,
+        let input_a = match crate::parquet_mmap::ParquetInput::open(&path_a) {
+            Ok(i) => i,
             Err(e) => {
                 let _ = tx_a.send(Err(e.into()));
                 return;
             }
         };
-        let reader_a = match ParquetRecordBatchReaderBuilder::try_new(file_a)
+        let reader_a = match ParquetRecordBatchReaderBuilder::try_new(input_a)
             .and_then(|b| b.with_batch_size(batch_size_a_prefetch).build())
         {
             Ok(r) => r,
@@ -2049,9 +2100,9 @@ pub fn cross_match_impl(
     });
 
     type BLoadResult = Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>>;
-    // Capacity 2: send current + next B request so index||load B and join||load B overlap.
-    let (tx_b_request, rx_b_request) = mpsc::sync_channel::<Option<HashSet<u64>>>(2);
-    let (tx_b_response, rx_b_response) = mpsc::sync_channel::<BLoadResult>(2);
+    // Capacity 4: send current + next B requests so index||load B and join||load B overlap.
+    let (tx_b_request, rx_b_request) = mpsc::sync_channel::<Option<FxHashSet<u64>>>(4);
+    let (tx_b_response, rx_b_response) = mpsc::sync_channel::<BLoadResult>(4);
     let b_prefetch_handle = if use_b_prefetch {
         let shard_dir_b = shard_dir.as_ref().unwrap().clone();
         Some(thread::spawn(move || {
@@ -2099,7 +2150,7 @@ pub fn cross_match_impl(
     let mut next_batch = if use_b_prefetch { recv_a(&rx_a)? } else { None };
     let mut prefetched_b: Option<Vec<(IdVal, f64, f64)>> = None;
     // Reuse pixels computed for B prefetch as pixels_wanted next iteration (avoids re-computing).
-    let mut next_pixels_wanted: Option<HashSet<u64>> = None;
+    let mut next_pixels_wanted: Option<FxHashSet<u64>> = None;
 
     while let Some(batch_a) = current_batch.take() {
         chunks_processed += 1;
@@ -2120,16 +2171,18 @@ pub fn cross_match_impl(
         let dec_idx = column_index(&batch_a, dec_col);
         let id_a_idx = column_index(&batch_a, &id_a_col);
 
-        let (ra_deg_a, dec_deg_a) = ra_dec_degrees(&batch_a, ra_idx, dec_idx, from_radians)?;
+        let ra_dec_a = ra_dec_degrees(&batch_a, ra_idx, dec_idx, from_radians)?;
+        let ra_deg_a = ra_dec_a.ra();
+        let dec_deg_a = ra_dec_a.dec();
 
         let t_pixels_index = std::time::Instant::now();
         let (index, pixels_wanted, used_index_only) = if let Some(reuse) = next_pixels_wanted.take() {
             // Chunk 1+: reuse pixels from previous B-prefetch; only build index.
-            let index = index_only(&ra_deg_a, &dec_deg_a, depth);
+            let index = index_only(ra_deg_a, dec_deg_a, depth);
             (index, reuse, true)
         } else {
             // Chunk 0: single pass for both index and pixel set.
-            let (idx, px) = pixels_and_index(&ra_deg_a, &dec_deg_a, depth);
+            let (idx, px) = pixels_and_index(ra_deg_a, dec_deg_a, depth);
             (idx, px, false)
         };
         let pixels_index_label = if used_index_only {
@@ -2146,8 +2199,8 @@ pub fn cross_match_impl(
             if let Some(ref next) = next_batch {
                 let ra_idx_n = column_index(next, ra_col);
                 let dec_idx_n = column_index(next, dec_col);
-                let (ra_n, dec_n) = ra_dec_degrees(next, ra_idx_n, dec_idx_n, from_radians)?;
-                let pixels_next = pixels_in_chunk_with_neighbors(&ra_n, &dec_n, depth);
+                let ra_dec_n = ra_dec_degrees(next, ra_idx_n, dec_idx_n, from_radians)?;
+                let pixels_next = pixels_in_chunk_with_neighbors(ra_dec_n.ra(), ra_dec_n.dec(), depth);
                 let _ = tx_b_request.send(Some(pixels_next.clone()));
                 next_pixels_wanted = Some(pixels_next);
             }
@@ -2160,13 +2213,14 @@ pub fn cross_match_impl(
             );
         }
 
-        // Build id_a_flat and ra/dec flat arrays for join (index already built above).
-        let id_a_flat: Vec<IdVal> = (0..n_a)
+        // Build id_a_flat; use ra/dec slices directly (zero-copy when Float64+degrees).
+        let mut id_a_flat: Vec<IdVal> = Vec::with_capacity(n_a);
+        (0..n_a)
             .into_par_iter()
             .map(|row| get_id_value(&batch_a, &id_a_col, id_a_idx, row))
-            .collect();
-        let ra_flat: Vec<f64> = ra_deg_a.to_vec();
-        let dec_flat: Vec<f64> = dec_deg_a.to_vec();
+            .collect_into_vec(&mut id_a_flat);
+        let ra_flat_ref = ra_deg_a;
+        let dec_flat_ref = dec_deg_a;
 
         let mut matches_id_a: Vec<IdVal> = Vec::new();
         let mut matches_id_b: Vec<IdVal> = Vec::new();
@@ -2208,8 +2262,6 @@ pub fn cross_match_impl(
         }
         let t_join = std::time::Instant::now();
         let index_ref = &index;
-        let ra_flat_ref = &ra_flat;
-        let dec_flat_ref = &dec_flat;
         let radius = radius_arcsec;
         let depth_local = depth;
 
@@ -2560,8 +2612,8 @@ pub fn cross_match_impl(
         let (paths, n) = list_shard_paths(shard_dir.as_ref().unwrap())?;
         rows_b_read = 0u64;
         for path in paths.iter().take(n) {
-            let f = File::open(path)?;
-            let meta = ParquetRecordBatchReaderBuilder::try_new(f)?
+            let input = crate::parquet_mmap::ParquetInput::open(path)?;
+            let meta = ParquetRecordBatchReaderBuilder::try_new(input)?
                 .metadata()
             .clone();
             rows_b_read += meta
@@ -2610,8 +2662,8 @@ pub fn cross_match_impl(
 
     if let Some(n) = n_nearest {
         apply_n_nearest(output_path, &id_a_col, &id_b_col, n)?;
-        let file_out = File::open(output_path)?;
-        let meta = ParquetRecordBatchReaderBuilder::try_new(file_out)?
+        let input_out = crate::parquet_mmap::ParquetInput::open(output_path)?;
+        let meta = ParquetRecordBatchReaderBuilder::try_new(input_out)?
             .metadata()
         .clone();
         matches_count = meta
@@ -2767,8 +2819,8 @@ fn apply_n_nearest(
     id_b_col: &str,
     n_nearest: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let file = File::open(output_path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+    let input = crate::parquet_mmap::ParquetInput::open(output_path)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(input)?
     .build()?;
     let schema = reader.schema().clone();
     let id_a_idx = schema.index_of(id_a_col)?;

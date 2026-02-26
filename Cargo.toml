@@ -10,27 +10,36 @@ name = "pleiades_core"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["python"]
+default = ["python", "simd", "rtree", "parquet_mmap"]
 # Enable PyO3 bindings for maturin/Python extension build.
 python = ["pyo3"]
 # macOS: enable F_RDAHEAD read-ahead on opened files (faster sequential I/O).
 macos_readahead = ["dep:libc"]
 # Optional wgpu-based GPU haversine kernel (Vulkan/Metal/D3D12/WebGPU).
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Optional R-tree for candidate pruning (PLEIADES_JOIN_STRATEGY=rtree).
+rtree = ["dep:rstar"]
+# SIMD haversine on CPU path (AVX2/NEON) — 4–8 distances per call when GPU not used.
+simd = []
+# Parquet mmap: file mapped into address space (C).
+parquet_mmap = ["dep:memmap2"]
 
 [dependencies]
-arrow = "52"
+arrow = { version = "52", default-features = false, features = ["ffi"] }
 libc = { version = "0.2", optional = true }
 parquet = { version = "52", default-features = false, features = ["arrow", "snap"] }
 chrono = "=0.4.39"  # pin: 0.4.40+ adds Datelike::quarter() conflicting with arrow-arith
 cdshealpix = "0.9"
 rayon = "1.10"
-dashmap = "6"
 tempfile = "3"
 pyo3 = { version = "0.23", optional = true, features = ["extension-module"] }
+rstar = { version = "0.12", optional = true }
 wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
+memmap2 = { version = "0.9", optional = true }
+bytes = "1"
+rustc-hash = "2"
 
 [dev-dependencies]
 tempfile = "3"

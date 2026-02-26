@@ -3,10 +3,19 @@
 //! Built as a Python extension via PyO3/Maturin. Uses cdshealpix (HEALPix),
 //! Arrow/Parquet for streaming I/O, and haversine for angular distance.
 
-// Forbid unsafe except when macos_readahead is enabled (single fcntl FFI call in engine).
-#![cfg_attr(not(feature = "macos_readahead"), forbid(unsafe_code))]
+// Forbid unsafe except when macos_readahead (fcntl) or simd (arch intrinsics) is enabled.
+#![cfg_attr(
+    not(any(feature = "macos_readahead", feature = "simd")),
+    forbid(unsafe_code)
+)]
 
 pub mod engine;
+
+#[cfg(feature = "simd")]
+mod haversine_simd;
+
+mod parquet_mmap;
+mod parquet_parallel;
 
 #[cfg(feature = "wgpu")]
 pub mod gpu;

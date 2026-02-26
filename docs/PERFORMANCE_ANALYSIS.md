@@ -53,10 +53,10 @@ catalog_a.parquet          catalog_b.parquet (or shard dir)
 - **Where:** A channel capacity 1 or 2 (for A and B prefetch). Main thread can block the A reader if the join is slow.
 - **Effect:** If join dominates, prefetch may stall; increasing capacity (e.g. 3–4) could improve overlap.
 
-### 2.4 Haversine is scalar (medium impact on CPU path)
+### 2.4 Haversine SIMD (addressed)
 
-- **Where:** `haversine_rad`, `haversine_arcsec_8_rad`, `haversine_arcsec_4_rad` in `engine.rs` are hand-unrolled (8/4/1) but **not SIMD**.
-- **Effect:** CPU join is compute-bound; SIMD (e.g. 4 or 8 distances per vector) could reduce time when GPU is not used or pair count &lt; threshold.
+- **Implementation:** With the `simd` feature (default), `haversine_a_4_rad` and `haversine_a_8_rad` use AVX2 on x86_64 for vectorized loads, deg-to-rad conversion, dlat/dlon arithmetic, and mul_add. Sin/cos remain scalar (no native SIMD transcendentals). See `src/haversine_simd.rs`.
+- **Effect:** Reduces CPU join time when GPU is not used.
 
 ### 2.5 Match output write (lower impact)
 
@@ -80,43 +80,38 @@ catalog_a.parquet          catalog_b.parquet (or shard dir)
 | **HLC2**              | Heterogeneous (CPU+GPU) cross-match for large catalogs | Similar goal (fast cross-match); we already have optional wgpu; can borrow ideas for when to use GPU and how to chunk. |
 | **Apache Arrow (Acero)** | Hash join with row table, 64-bit offsets; streaming limitations | Arrow’s hash join is in-memory; we do spatial join (haversine). Takeaway: parallel row-group decode and buffering (e.g. async reader) are the direction for “same file, more throughput.” |
 | **parquet / parquet2 (Rust)** | Metadata first, then row groups; async reader with `next_row_group()` and concurrent decode | **Directly addresses pain #1:** parallel row-group decode (multiple row groups in parallel) instead of one sequential reader. |
-| **SimSIMD / haversine SIMD** | SIMD kernels for haversine and other distances | **Directly addresses pain #4:** use SIMD (e.g. simsimd or custom AVX2/NEON) for 4–8 haversine per call to speed up CPU path. |
+| **SimSIMD / haversine SIMD** | SIMD kernels for haversine and other distances | **Addressed:** custom AVX2 in `haversine_simd.rs` for 4–8 haversine per call on CPU path. |
 
-**Summary:** The two highest-leverage, single-machine-friendly improvements are: **(1) parallel Parquet row-group decode** for A and B, and **(2) SIMD haversine** on the CPU path. Partition merge and channel sizing are secondary but straightforward.
+**Summary:** The highest-leverage improvements are: **(1) parallel Parquet row-group decode** for A and B (not yet done), and **(2) SIMD haversine** (implemented, default feature). Partition merge and channel sizing are secondary.
 
 ---
 
 ## 4. Recommendations (faster, still single-machine)
 
-### 4.1 Parallel Parquet decode (highest impact)
+### 4.1 Parallel Parquet decode (implemented)
 
-- **Goal:** Decode multiple row groups of the **same** file in parallel so multiple cores are used during read.
-- **Options:**
-  - **Arrow Rust:** Check if `parquet::arrow::async_reader` (e.g. `ParquetRecordBatchStream`, `next_row_group()`) or a row-group–level API is available in the version you use (arrow 52 / parquet 52). If so, drive multiple row groups in parallel (e.g. Rayon over row group indices) and feed batches into the existing channel.
-  - **Alternative:** Use a reader that exposes row-group boundaries; spawn N workers that each decode a subset of row groups and send batches to the same channel. May require a different crate or a fork that exposes row-group–level read.
-- **Single-machine:** Stays on one machine; no distributed I/O. Only CPU and possibly disk bandwidth are better utilized.
+- **Status:** Implemented. Decodes multiple row groups of the same file in parallel via Rayon.
+- **Mechanism:** `parquet_parallel::read_parquet_parallel()` splits row group indices across workers; each worker opens the file, uses `ParquetRecordBatchReaderBuilder::with_row_groups()` for its subset, decodes to RecordBatches, and returns. Falls back to sequential read when 0–1 row groups.
+- **Integration:** Used in `partition_file_to_shard_dir` (catalog B partitioning) and `load_one_shard` (B loading from pre-partitioned shards).
+- **Files:** `src/parquet_parallel.rs`; `set_readahead_for_parquet_input` moved to `parquet_mmap.rs`.
 
-### 4.2 SIMD haversine on CPU path (high impact)
+### 4.2 SIMD haversine on CPU path (implemented)
 
-- **Goal:** Replace or augment the current scalar haversine (8/4/1 batches) with SIMD so 4–8 distances are computed per call.
-- **Options:**
-  - **simsimd** (or similar): Use a crate that provides SIMD haversine; integrate into `run_cpu_join` for the hot loops (batch-of-8 and batch-of-4, or a single larger batch).
-  - **Custom:** Use `std::simd` (Rust nightly or stable when available) or architecture-specific intrinsics (AVX2/NEON) to compute 4×f64 or 8×f64 haversine; keep same API (inputs: slices of ra/dec; output: separations).
-- **Single-machine:** Purely compute; no change to distribution model.
+- **Status:** Implemented via `simd` feature (default). Uses `std::arch` AVX2 on x86_64 for 4×f64 haversine `a` term (cheap-reject path); 8-lane batches call 4-lane twice. Runtime feature detection falls back to scalar on CPUs without AVX2.
+- **Files:** `src/haversine_simd.rs`; engine dispatches via `haversine_a_4_rad` / `haversine_a_8_rad`.
 
-### 4.3 Partition B: parallel merge and write (medium impact)
+### 4.2b Parquet mmap (implemented, opt-in)
 
-- **Goal:** After parallel pixel assignment, avoid a single-threaded merge; write shards in parallel.
-- **Options:**
-  - Merge per-shard results in parallel (e.g. each shard’s Vec is filled by one worker, or merge by shard index in parallel), then **parallel flush**: one thread per shard (or a pool) so multiple `ArrowWriter::write()` and `close()` run concurrently. Requires one writer per shard (you already have that); only the merge logic and who calls `write` need to change.
-- **Single-machine:** Better use of many cores during the first B partition pass.
+- **Status:** Implemented via `parquet_mmap` feature (opt-in). Uses memory-mapped I/O (`memmap2`) for Parquet reads. On macOS with multi-shard workloads, mmap can be slower than File+read (partition B and load B); on Linux/single-file sequential reads it may help. Build with `--features parquet_mmap` to enable.
+- **Files:** `src/parquet_mmap.rs`; all Parquet read paths use `ParquetInput::open()`.
 
-### 4.4 Prefetch and backpressure (low–medium impact)
+### 4.3 Partition B: parallel merge and write (implemented)
 
-- **Goal:** Reduce chance that a slow join blocks the A (or B) prefetcher.
-- **Options:**
-  - Increase A channel capacity (e.g. 3–4 batches) and optionally B response capacity so the main thread can run join while more batches are read.
-  - Optionally make batch size for A slightly larger so there are fewer handoffs (tune with benchmarks).
+- **Status:** Implemented. After parallel decode and `partition_batch_to_row_results`, results are grouped by shard in parallel, then each shard's data is written in parallel via Rayon.
+
+### 4.4 Prefetch and backpressure (implemented)
+
+- **Status:** A channel capacity increased to 4 (was 2) when B prefetch used, 2 otherwise. B request/response channels increased to 4 (was 2).
 
 ### 4.5 Overlap match output write (lower impact)
 
@@ -125,7 +120,15 @@ catalog_a.parquet          catalog_b.parquet (or shard dir)
   - Background writer thread: main thread sends match RecordBatches via a channel; writer thread does `ArrowWriter::write` and buffers; main thread only builds batches and enqueues. Requires careful close/flush on finish.
 - **Single-machine:** Same process; better overlap of join and I/O.
 
-### 4.6 GPU threshold and tuning (situational)
+### 4.6 Join strategy: A-driven and R-tree (experimental)
+
+- **PLEIADES_JOIN_STRATEGY** env var selects the CPU join algorithm:
+  - **bdynamic** (default): B-driven — for each B row, find A candidates. Uses dec pre-filter, block bbox, a≤a_max cheap reject.
+  - **adynamic**: A-driven — for each A candidate, find B rows in dec window. Use when |A| < |B| in a pixel.
+  - **rtree**: R-tree — build spatial index on A candidates (≥2000), range-query per B row. Requires `--features rtree`.
+- Benchmark with your catalogs to see which strategy is faster.
+
+### 4.7 GPU threshold and tuning (situational)
 
 - **Goal:** Use GPU for more workloads where it wins, without hurting small runs.
 - **Options:**
@@ -134,18 +137,72 @@ catalog_a.parquet          catalog_b.parquet (or shard dir)
 
 ---
 
-## 5. Priority order (single-machine, max speedup)
+## 5. Benchmark profile (10M×10M, 4 chunks, ~11.5s)
 
-1. **Parallel Parquet decode** (A and, where applicable, B shards) — removes the biggest single-threaded bottleneck.
-2. **SIMD haversine** — large gain on CPU path with no architectural change.
-3. **Parallel partition-B merge + write** — faster first run when B is a file.
-4. **Prefetch channel sizing** — quick change; validate with benchmarks.
-5. **Background match writer** — if profiling shows write time is non-negligible.
-6. **GPU threshold tuning** — per-environment.
+From `run_benchmarks.sh` with `--verbose`:
+
+| Phase | Time | % of total | Hot path |
+|-------|------|------------|----------|
+| **Join** | ~6.3s | **55%** | haversine loop, cheap reject, SIMD 4/8-lane |
+| **Pixels+index** | ~2.2s | 19% | Chunk 1: full index; others: index lookup |
+| **Load B** | ~1.2s | 10% | Parallel row-group decode per shard |
+| **Partition B** | ~1.1s | 10% | Parallel decode + single-thread merge |
+| **Write** | ~0s | 0% | Negligible |
+
+**Profile with:** `./scripts/run_profile.sh` (sample) or `./scripts/run_profile.sh --profile` (sub-phase timing). See `docs/PROFILING.md`.
 
 ---
 
-## 6. Move more work to Rust
+## 5.1 CPU profile analysis (sample, 10M×10M)
+
+From `profile_20260226_130908.txt` (macOS sample, Python process):
+
+**Sort by top of stack (application hotspots):**
+
+| Symbol | Samples | % | Interpretation |
+|--------|---------|---|-----------------|
+| `Vec::from_iter` | 5730 | ~6% | Building vectors from parallel collect (pixels merge) |
+| `HashMap::insert` | 2500 | ~2.5% | Index building (pixel→candidates) |
+| `cross_match_impl` | 2477 | ~2.5% | Main engine loop |
+| `Hasher::write` | 1426 | ~1.5% | Hashing for HashMap keys |
+| `DashMap::_insert` | 1155 | ~1% | Concurrent index (chunk 1: pixels_and_index) |
+| `extract_shard_batch_rows` | 867 | ~1% | Load B from shards, filter by pixel |
+| `__sincos_stret` | 755 | ~1% | sin/cos in cdshealpix Layer::hash |
+| `RawTable::reserve_rehash` | 738 | ~1% | HashMap rehashing |
+| `quicksort` | 432 | ~0.5% | sort_unstable in join (candidates_by_dec) |
+
+*(~66k samples in kernel wait states: `__psynch_cvwait`, `semaphore_wait` — Rayon workers; excluded from above.)*
+
+**Improvement suggestions (highest impact first):**
+
+1. **Pre-size index containers**  
+   - In `merge_pixels_and_index`, `merge_index_only`, `group_b_by_pixel`: estimate pixel count (e.g. `ra_deg.len() / 100`) and call `HashMap::with_capacity` before the merge loop. Reduces `reserve_rehash` and allocation churn.
+2. **DashMap → map+merge** — Implemented. Replaced `DashMap`/`DashSet` with parallel `map()` + single-threaded `merge_pixels_and_index` / `merge_index_only`. Eliminates lock contention; removed `dashmap` dependency.
+3. **Batch HEALPix hash**
+   - `cdshealpix::Layer::hash` + sin/cos dominate ~755 samples. cdshealpix 0.9 does not expose `hash_many` or bulk API; per-row `layer.hash(lon, lat)` remains.
+4. **Pre-allocate Vecs in collect** — Implemented
+   - `pixels_and_index`, `index_only`, `partition_batch_to_row_results`, partition in-memory, `id_a_flat`, and partition write use `collect_into_vec` with pre-allocated `Vec::with_capacity(n)`.
+5. **Reserve in HashMap** — Implemented via `estimated_pixels()`; `HashMap`/`HashSet` use `with_capacity`.
+6. **Try `PLEIADES_JOIN_STRATEGY=adynamic`**  
+   - For chunks where |A candidates| < |B rows| per pixel, adynamic may do less work. Benchmark on your data.
+7. **extract_shard_batch_rows** — Implemented
+   - `pixels_wanted` now uses `FxHashSet<u64>` for faster lookups.
+
+---
+
+## 6. Priority order (single-machine, max speedup)
+
+1. **Parallel Parquet decode** — done. §4.1.
+2. **SIMD haversine** — done. AVX2 in `haversine_simd.rs` (default feature).
+3. **Index pre-sizing and map+merge** (profile-driven) — Implemented: `HashMap::with_capacity` via `estimated_pixels()`; DashMap replaced with map+merge.
+4. **Parallel partition-B merge + write** — faster first run when B is a file.
+5. **Prefetch channel sizing** — quick change; validate with benchmarks.
+6. **Background match writer** — if profiling shows write time is non-negligible.
+7. **GPU threshold tuning** — per-environment.
+
+---
+
+## 7. Move more work to Rust
 
 These Python-side operations are good candidates to move (or delegate) to Rust for speed.
 
@@ -162,8 +219,9 @@ These Python-side operations are good candidates to move (or delegate) to Rust f
 
 ---
 
-## 7. References
+## 8. References
 
+- **PROFILING.md** (this repo): how to profile and interpret results.
 - **ARCHITECTURE.md** (this repo): flow, bottlenecks, knobs.
 - **Arrow Rust async reader:** `parquet::arrow::async_reader`, `ParquetRecordBatchStream`, row-group concurrency.
 - **parquet2:** Row-group–level read and parallel decode patterns.

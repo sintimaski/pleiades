@@ -366,6 +366,38 @@ def test_rust_with_prepartitioned_b_matches_reference(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
+def test_rust_join_strategy_adynamic_matches_reference(tmp_path: Path) -> None:
+    """With PLEIADES_JOIN_STRATEGY=adynamic, (id_a, id_b) set equals reference."""
+    pytest.importorskip("pleiades_core")
+    import os
+
+    table_a, table_b, expected = make_catalogs_exact_n_pairs(
+        n_pairs=4, radius_arcsec=2.0, n_a_extra=10, n_b_extra=10, seed=31
+    )
+    path_a, path_b = write_catalogs(table_a, table_b, tmp_path)
+    out = tmp_path / "matches_adynamic.parquet"
+    old = os.environ.get("PLEIADES_JOIN_STRATEGY")
+    try:
+        os.environ["PLEIADES_JOIN_STRATEGY"] = "adynamic"
+        pleiades.cross_match(
+            catalog_a=path_a,
+            catalog_b=path_b,
+            radius_arcsec=2.0,
+            output_path=out,
+        )
+    finally:
+        if old is not None:
+            os.environ["PLEIADES_JOIN_STRATEGY"] = old
+        elif "PLEIADES_JOIN_STRATEGY" in os.environ:
+            del os.environ["PLEIADES_JOIN_STRATEGY"]
+    t = read_matches(out)
+    id_b_col = "id_b" if "id_b" in t.column_names else "object_id"
+    got_set = match_set_from_table(t, "source_id", id_b_col)
+    expected_set = {(e[0], e[1]) for e in expected}
+    assert got_set == expected_set, f"got {got_set}, expected {expected_set}"
+
+
+@pytest.mark.integration
 def test_rust_n_nearest_reduces_output(tmp_path: Path) -> None:
     """With n_nearest=1, at most one match per id_a."""
     pytest.importorskip("pleiades_core")

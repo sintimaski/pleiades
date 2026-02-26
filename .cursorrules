@@ -117,7 +117,7 @@ project_root/
 ## Dependencies
 - Use `uv` for Python dependency management; lock file via `uv lock`
 - Rust dependencies in `Cargo.toml`; pin versions for reproducibility
-- Build: `maturin` for building the Rust extension and packaging the Python wheel
+- Build: `uv run maturin develop --features macos_readahead --release` for building the Rust extension and packaging the Python wheel
 
 ## Code Review Checklist
 - [ ] Code follows PEP 8 / rustfmt and project style guidelines
