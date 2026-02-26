@@ -16,6 +16,7 @@ pub enum ParquetInput {
 /// Unified Read type for both File and Mmap paths.
 pub enum ParquetInputRead {
     File(std::io::BufReader<std::fs::File>),
+    #[allow(dead_code)]
     Mmap(Cursor<Vec<u8>>),
 }
 

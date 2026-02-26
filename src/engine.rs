@@ -157,6 +157,7 @@ fn ra_dec_to_xyz_deg(ra_deg: f64, dec_deg: f64) -> (f64, f64, f64) {
 /// Angular separation in arcsec via dot product of unit vectors. Fast for small angles.
 /// dot = cos(θ); θ = acos(dot); sep_arcsec = θ * RAD_TO_ARCSEC.
 #[inline(always)]
+#[allow(dead_code)]
 fn dot_product_arcsec(
     x1: f64, y1: f64, z1: f64,
     x2: f64, y2: f64, z2: f64,
@@ -167,6 +168,7 @@ fn dot_product_arcsec(
 
 /// SIMD-friendly haversine for 4 lanes: branchless loop for autovectorization (sin/cos/asin stay scalar per lane).
 #[inline(always)]
+#[allow(dead_code)]
 fn haversine_arcsec_4_rad(
     ra1_deg: &[f64; 4],
     dec1_deg: &[f64; 4],
@@ -228,6 +230,7 @@ fn haversine_a_4_rad(
 
 /// SIMD-friendly haversine for 8 lanes: two 4-lane batches for cache and autovectorization.
 #[inline(always)]
+#[allow(dead_code)]
 fn haversine_arcsec_8_rad(
     ra1_deg: &[f64; 8],
     dec1_deg: &[f64; 8],
@@ -631,6 +634,7 @@ fn load_b_from_shards(
 /// Compute pixels in chunk A plus all 8 neighbors (halo). Parallel over rows; merge with
 /// fold/reduce for better parallelism than single-threaded collect into HashSet.
 /// Uses thread-local cache for neighbor lists to avoid repeated append_bulk_neighbours.
+#[allow(dead_code)]
 fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) -> FxHashSet<u64> {
     let layer = get(depth);
     (0..ra_deg.len())
@@ -926,7 +930,7 @@ fn partition_file_to_shard_dir(
         Field::new("dec", DataType::Float64, false),
     ]));
 
-    let mut writers: Vec<Option<ArrowWriter<BufWriter<File>>>> = (0..n_shards)
+    let writers: Vec<Option<ArrowWriter<BufWriter<File>>>> = (0..n_shards)
         .map(|s| {
             let path = shard_dir.join(format!("shard_{:04}.parquet", s));
             let f = File::create(&path).map_err(|e| format!("create shard {}: {}", s, e))?;
@@ -1050,7 +1054,7 @@ pub fn partition_catalog_impl(
     batch_size: usize,
     ra_col: &str,
     dec_col: &str,
-    id_col: Option<&str>,
+    _id_col: Option<&str>,
     from_radians: bool,
 ) -> Result<(u64, String), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(output_dir).map_err(|e| format!("create output dir: {}", e))?;
@@ -1062,7 +1066,7 @@ pub fn partition_catalog_impl(
         batch_size,
         ra_col,
         dec_col,
-        id_col,
+        _id_col,
         from_radians,
     )
 }
@@ -1078,14 +1082,14 @@ pub fn cone_search_impl(
     output_path: &Path,
     ra_col: &str,
     dec_col: &str,
-    id_col: Option<&str>,
+    _id_col: Option<&str>,
     from_radians: bool,
     batch_size: usize,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let input = crate::parquet_mmap::ParquetInput::open(catalog_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
     let input_schema = builder.schema().clone();
-    let mut reader = builder.with_batch_size(batch_size).build()?;
+    let reader = builder.with_batch_size(batch_size).build()?;
 
     let mut writer: Option<ArrowWriter<BufWriter<File>>> = None;
     let mut total_written: u64 = 0;
@@ -1153,7 +1157,7 @@ pub fn cone_search_impl(
         total_written += n_filtered as u64;
     }
 
-    if let Some(mut w) = writer {
+    if let Some(w) = writer {
         w.close()?;
     } else {
         let schema = input_schema.as_ref();
@@ -1192,7 +1196,7 @@ pub fn batch_cone_search_impl(
     output_path: &Path,
     ra_col: &str,
     dec_col: &str,
-    id_col: Option<&str>,
+    _id_col: Option<&str>,
     from_radians: bool,
     batch_size: usize,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
@@ -1231,7 +1235,7 @@ pub fn batch_cone_search_impl(
     let input = crate::parquet_mmap::ParquetInput::open(catalog_path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
     let input_schema = builder.schema().clone();
-    let mut reader = builder.with_batch_size(batch_size).build()?;
+    let reader = builder.with_batch_size(batch_size).build()?;
 
     let mut writer: Option<ArrowWriter<BufWriter<File>>> = None;
     let mut total_written: u64 = 0;
@@ -1312,7 +1316,7 @@ pub fn batch_cone_search_impl(
         total_written += n_filtered as u64;
     }
 
-    if let Some(mut w) = writer {
+    if let Some(w) = writer {
         w.close()?;
     } else {
         let schema = input_schema.as_ref();
@@ -1430,10 +1434,6 @@ pub fn attach_match_coords_impl(
         let id_a_idx = column_index(&batch, id_a_name);
         let id_b_idx = column_index(&batch, id_b_name);
         let n = batch.num_rows();
-        let mut ra_a: Vec<Option<f64>> = Vec::with_capacity(n);
-        let mut dec_a: Vec<Option<f64>> = Vec::with_capacity(n);
-        let mut ra_b: Vec<Option<f64>> = Vec::with_capacity(n);
-        let mut dec_b: Vec<Option<f64>> = Vec::with_capacity(n);
         let mut ra_a_vals: Vec<f64> = Vec::with_capacity(n);
         let mut dec_a_vals: Vec<f64> = Vec::with_capacity(n);
         let mut ra_b_vals: Vec<f64> = Vec::with_capacity(n);
@@ -2199,6 +2199,11 @@ pub fn cross_match_impl(
     let mut prefetched_b: Option<Vec<(IdVal, f64, f64)>> = None;
     // Reuse pixels computed for B prefetch as pixels_wanted next iteration (avoids re-computing).
     let mut next_pixels_wanted: Option<FxHashSet<u64>> = None;
+    // Prebuilt (index, pixels) for current chunk when we ran index build in parallel with previous join.
+    let mut prebuilt_index_pixels: Option<(FxHashMap<u64, Vec<usize>>, FxHashSet<u64>)> = None;
+    let mut index_prebuild_handle: Option<
+        thread::JoinHandle<Result<(FxHashMap<u64, Vec<usize>>, FxHashSet<u64>), Box<dyn std::error::Error + Send + Sync>>>,
+    > = None;
 
     while let Some(batch_a) = current_batch.take() {
         chunks_processed += 1;
@@ -2224,8 +2229,17 @@ pub fn cross_match_impl(
         let dec_deg_a = ra_dec_a.dec();
 
         let t_pixels_index = std::time::Instant::now();
-        let (index, pixels_wanted, used_index_only) = if let Some(reuse) = next_pixels_wanted.take() {
-            // Chunk 1+: reuse pixels from previous B-prefetch; only build index.
+        // Consume previous iteration's index prebuild (ran in parallel with last chunk's join+write).
+        if let Some(h) = index_prebuild_handle.take() {
+            if let Ok(Ok((idx, px))) = h.join() {
+                prebuilt_index_pixels = Some((idx, px));
+            }
+        }
+        let (index, pixels_wanted, used_index_only) = if let Some((idx, px)) = prebuilt_index_pixels.take() {
+            // Use index+pixels prebuilt in parallel with previous chunk's join.
+            (idx, px, true)
+        } else if let Some(reuse) = next_pixels_wanted.take() {
+            // Chunk 1+ (no prebuild): reuse pixels from previous B-prefetch; only build index.
             let index = index_only(ra_deg_a, dec_deg_a, depth);
             (index, reuse, true)
         } else {
@@ -2239,18 +2253,11 @@ pub fn cross_match_impl(
             " (pixels_and_index)"
         };
 
-        // Send B load requests so prefetch runs in parallel: current chunk (when first), and next chunk.
+        // Send B load request for current chunk when first (no prefetch yet). For next chunk, the
+        // index prebuild (spawned during join) will send it.
         if use_b_prefetch {
             if prefetched_b.is_none() {
                 let _ = tx_b_request.send(Some(pixels_wanted.clone()));
-            }
-            if let Some(ref next) = next_batch {
-                let ra_idx_n = column_index(next, ra_col);
-                let dec_idx_n = column_index(next, dec_col);
-                let ra_dec_n = ra_dec_degrees(next, ra_idx_n, dec_idx_n, from_radians)?;
-                let pixels_next = pixels_in_chunk_with_neighbors(ra_dec_n.ra(), ra_dec_n.dec(), depth);
-                let _ = tx_b_request.send(Some(pixels_next.clone()));
-                next_pixels_wanted = Some(pixels_next);
             }
         }
         if verbose {
@@ -2318,6 +2325,22 @@ pub fn cross_match_impl(
         }
         if verbose {
             verbose_log_timed("  load B", t_load.elapsed().as_secs_f64(), &format!("({} rows)", n_b_loaded));
+        }
+        // Spawn index prebuild for next chunk to run in parallel with join+write.
+        if use_b_prefetch {
+            if let Some(ref next) = next_batch {
+                let tx_b = tx_b_request.clone();
+                let ra_idx_n = column_index(next, ra_col);
+                let dec_idx_n = column_index(next, dec_col);
+                let ra_dec_n = ra_dec_degrees(next, ra_idx_n, dec_idx_n, from_radians)?;
+                let ra_owned: Vec<f64> = ra_dec_n.ra().to_vec();
+                let dec_owned: Vec<f64> = ra_dec_n.dec().to_vec();
+                index_prebuild_handle = Some(thread::spawn(move || {
+                    let (idx, px) = pixels_and_index(&ra_owned, &dec_owned, depth);
+                    let _ = tx_b.send(Some(px.clone()));
+                    Ok((idx, px))
+                }));
+            }
         }
         let t_join = std::time::Instant::now();
         let index_ref = &index;

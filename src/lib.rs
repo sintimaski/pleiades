@@ -174,12 +174,28 @@ impl CrossMatchIter {
                     let cur = slf.current.read().unwrap();
                     let (a, b, s) = cur.as_ref().unwrap();
                     let id_a: PyObject = match &a[i] {
-                        engine::IdVal::I64(x) => x.into_py(py),
-                        engine::IdVal::Str(st) => st.clone().into_py(py),
+                        engine::IdVal::I64(x) => {
+                            x.into_pyobject(py).expect("infallible").into_any().unbind()
+                        }
+                        engine::IdVal::Str(st) => {
+                            st.clone()
+                                .into_pyobject(py)
+                                .expect("infallible")
+                                .into_any()
+                                .unbind()
+                        }
                     };
                     let id_b: PyObject = match &b[i] {
-                        engine::IdVal::I64(x) => x.into_py(py),
-                        engine::IdVal::Str(st) => st.clone().into_py(py),
+                        engine::IdVal::I64(x) => {
+                            x.into_pyobject(py).expect("infallible").into_any().unbind()
+                        }
+                        engine::IdVal::Str(st) => {
+                            st.clone()
+                                .into_pyobject(py)
+                                .expect("infallible")
+                                .into_any()
+                                .unbind()
+                        }
                     };
                     (id_a, id_b, s[i])
                 };
@@ -266,7 +282,7 @@ fn cross_match_iter(
             current: std::sync::RwLock::new(None),
             index: std::sync::atomic::AtomicUsize::new(0),
         };
-        Ok(iter.into_py(py).into_any())
+        Ok(iter.into_pyobject(py).expect("infallible").into_any().unbind())
     })
 }
 
@@ -308,7 +324,7 @@ fn cone_search(
 #[pyfunction]
 #[pyo3(signature = (catalog_path, queries, output_path, ra_col="ra", dec_col="dec", id_col=None, ra_dec_units="deg", batch_size=100_000))]
 fn batch_cone_search(
-    py: Python<'_>,
+    _py: Python<'_>,
     catalog_path: &str,
     queries: Bound<'_, PyAny>,
     output_path: &str,
