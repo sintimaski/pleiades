@@ -8,7 +8,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import astropy.units as u
 import cdshealpix.nested as cds_nested
@@ -17,10 +17,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from astropy.coordinates import Latitude, Longitude
 
+from pleiades._log import get_logger
+from pleiades.config import get_output_base_dir
 from pleiades.models import CrossMatchResult
 from pleiades.validation import (
     validate_catalog_schema,
     validate_cross_match_args,
+    validate_output_path,
     validate_prepartitioned_dir,
 )
 
@@ -41,6 +44,8 @@ def suggest_healpix_depth(radius_arcsec: float) -> int:
         return DEPTH_DEFAULT
     depth = round(8 + math.log2(1.0 / radius_arcsec))
     return max(5, min(13, depth))
+
+
 # Benchmark-style defaults (1M rows: batch = rows/4, n_shards = 16)
 BATCH_SIZE_A = 250_000
 BATCH_SIZE_B = 250_000
@@ -56,7 +61,7 @@ def _lonlat_deg_to_healpix(
     """Convert ra/dec in degrees to nested HEALPix pixel IDs (cdshealpix expects units)."""
     lon = Longitude(ra_deg, unit=u.deg)
     lat = Latitude(dec_deg, unit=u.deg)
-    return cds_nested.lonlat_to_healpix(lon, lat, depth)
+    return cast(np.ndarray, cds_nested.lonlat_to_healpix(lon, lat, depth))
 
 
 def _haversine_matrix_arcsec(
@@ -78,7 +83,7 @@ def _haversine_matrix_arcsec(
         + np.cos(dec1[:, np.newaxis]) * np.cos(dec2) * np.sin(dra / 2) ** 2
     )
     dist_rad = 2 * np.arcsin(np.minimum(np.sqrt(x), 1.0))
-    return np.degrees(dist_rad) * 3600.0
+    return cast(np.ndarray, np.degrees(dist_rad) * 3600.0)
 
 
 def _angular_distance_arcsec(
@@ -96,7 +101,7 @@ def _angular_distance_arcsec(
     dra = ra2 - ra1
     x = np.sin(ddec / 2) ** 2 + np.cos(dec1) * np.cos(dec2) * np.sin(dra / 2) ** 2
     dist_rad = 2 * np.arcsin(np.minimum(np.sqrt(x), 1.0))
-    return np.degrees(dist_rad) * 3600.0
+    return cast(np.ndarray, np.degrees(dist_rad) * 3600.0)
 
 
 def _id_column(table: pa.Table, id_col: str | None) -> str:
@@ -466,7 +471,11 @@ def cross_match(
     depth_resolved = (
         depth
         if depth is not None
-        else (DEPTH_DEFAULT if catalog_b.is_dir() else suggest_healpix_depth(radius_arcsec))
+        else (
+            DEPTH_DEFAULT
+            if catalog_b.is_dir()
+            else suggest_healpix_depth(radius_arcsec)
+        )
     )
     validate_cross_match_args(
         radius_arcsec, n_nearest=n_nearest, depth=depth_resolved, n_shards=n_shards
@@ -492,8 +501,18 @@ def cross_match(
             must_have_id=True,
         )
 
+    base_dir = get_output_base_dir()
+    output_path = validate_output_path(output_path, path_type="file", base_dir=base_dir)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
+    log = get_logger()
+    log.info(
+        "cross_match start: catalog_a=%s catalog_b=%s radius_arcsec=%s output=%s",
+        catalog_a,
+        catalog_b,
+        radius_arcsec,
+        output_path,
+    )
 
     try:
         import pleiades_core  # type: ignore[import-untyped]
@@ -642,7 +661,7 @@ def cross_match(
                         ra_col=ra_col,
                         dec_col=dec_col,
                     )
-            return CrossMatchResult(
+            res = CrossMatchResult(
                 output_path=out_path,
                 rows_a_read=int(result["rows_a_read"]),
                 rows_b_read=int(result["rows_b_read"]),
@@ -650,6 +669,12 @@ def cross_match(
                 chunks_processed=int(result["chunks_processed"]),
                 time_seconds=float(result["time_seconds"]),
             )
+            log.info(
+                "cross_match done: %s matches in %.2fs",
+                res.matches_count,
+                res.time_seconds,
+            )
+            return res
         # Older Rust extension returns None; fallback infers stats from Parquet
         import warnings
 
@@ -676,7 +701,7 @@ def cross_match(
                 else 0
             )
         )
-        return CrossMatchResult(
+        res = CrossMatchResult(
             output_path=str(output_path),
             rows_a_read=pf_a.metadata.num_rows if pf_a.metadata else 0,
             rows_b_read=rows_b,
@@ -684,6 +709,12 @@ def cross_match(
             chunks_processed=0,
             time_seconds=elapsed,
         )
+        log.info(
+            "cross_match done: %s matches in %.2fs",
+            res.matches_count,
+            res.time_seconds,
+        )
+        return res
     except ImportError:
         raise ImportError(
             "Pleiades requires the Rust engine for cross-match. "

@@ -145,6 +145,7 @@ Set `PLEIADES_VERBOSE=1` to log per-chunk timing (pixels+index, load B, join, wr
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — flow, Rust vs Python roles, bottlenecks and knobs
 - [DATA_SOURCES.md](DATA_SOURCES.md) — Gaia, IRSA, SDSS, LSST: where to get Parquet catalogs
+- [docs/PRODUCTION.md](docs/PRODUCTION.md) — production checklist, env vars, path safety, logging
 
 Command-line help: `pleiades --help`, `pleiades cross-match --help`.
 
@@ -158,10 +159,9 @@ Command-line help: `pleiades --help`, `pleiades cross-match --help`.
 
 ```bash
 $ uv run maturin develop
-$ uv run ruff check . && uv run ruff format .
-$ uv run mypy python/
-$ uv run pytest tests/
-# or: uv run python run_tests.py --benchmark
+$ uv run python run_tests.py --lint    # ruff + mypy
+$ uv run python run_tests.py          # Rust + Python tests
+$ uv run python run_tests.py --benchmark   # tests + small benchmark
 ```
 
 I/O profiling on macOS: `./scripts/profile_io.sh` (optionally `--fs-usage` with sudo). Publish: use CI for multi-platform wheels; see `.github/workflows/wheels.yml`.

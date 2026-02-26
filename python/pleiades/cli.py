@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+from pleiades._log import get_logger
+from pleiades.validation import CatalogValidationError
 
 
 def _path(s: str) -> Path:
@@ -14,12 +18,13 @@ def _path(s: str) -> Path:
 
 def cmd_cross_match(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """Run cross-match from CLI."""
-    import os
-
     import pleiades
 
     if getattr(args, "verbose", False):
         os.environ["PLEIADES_VERBOSE"] = "1"
+    get_logger().info(
+        "CLI cross-match: %s x %s -> %s", args.catalog_a, args.catalog_b, args.output
+    )
     batch_kw: dict = {}
     if getattr(args, "batch_size", None) is not None:
         batch_kw["batch_size_a"] = args.batch_size
@@ -190,6 +195,9 @@ def main() -> int:
     try:
         exit_code = args.func(parser, args)
         return int(exit_code)
+    except CatalogValidationError as e:
+        print(f"pleiades: {e}", file=sys.stderr)
+        return 1
     except (FileNotFoundError, OSError, ValueError) as e:
         print(f"pleiades: {e}", file=sys.stderr)
         return 1

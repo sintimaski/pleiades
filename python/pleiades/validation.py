@@ -167,3 +167,48 @@ def validate_prepartitioned_dir(path: str | Path) -> tuple[int, pa.Schema]:
 
     n_shards = len(shard_files)
     return n_shards, first
+
+
+def validate_output_path(
+    path: str | Path,
+    *,
+    path_type: str = "file",
+    base_dir: str | Path | None = None,
+) -> Path:
+    """
+    Validate an output path for safety (e.g. path traversal).
+
+    Resolves the path and optionally ensures it is under base_dir.
+    Use base_dir in production to restrict writes to a known directory.
+
+    Args:
+        path: Intended output path (file or directory).
+        path_type: "file" or "dir" — for file, parent dir is checked.
+        base_dir: If set, resolved path must be under this directory.
+
+    Returns:
+        Resolved Path (file or dir, parent created later by caller).
+
+    Raises:
+        CatalogValidationError: If path is invalid or escapes base_dir.
+    """
+    p = Path(path).resolve()
+    if base_dir is not None:
+        base = Path(base_dir).resolve()
+        try:
+            p_relative = p.relative_to(base)
+        except ValueError:
+            raise CatalogValidationError(
+                f"Output path {p} is not under base directory {base}. "
+                "Restrict output to a known directory in production."
+            ) from None
+        if ".." in p_relative.parts:
+            raise CatalogValidationError(
+                f"Output path resolves outside base directory: {p}"
+            )
+    if path_type == "file":
+        parent = p.parent
+        if parent != p and not parent.exists():
+            # Allow creation later; just ensure parent path is valid
+            pass
+    return p

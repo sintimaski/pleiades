@@ -11,6 +11,7 @@ from pleiades.validation import (
     CatalogValidationError,
     validate_catalog_schema,
     validate_cross_match_args,
+    validate_output_path,
     validate_prepartitioned_dir,
 )
 
@@ -209,3 +210,37 @@ class TestValidatePrepartitionedDir:
         )
         with pytest.raises(CatalogValidationError, match="columns"):
             validate_prepartitioned_dir(tmp_path)
+
+
+@pytest.mark.unit
+class TestValidateOutputPath:
+    """Tests for validate_output_path()."""
+
+    def test_resolves_path_returns_path(self, tmp_path: Path) -> None:
+        """Valid file path under tmp_path returns resolved Path."""
+        out = tmp_path / "sub" / "matches.parquet"
+        got = validate_output_path(out, path_type="file")
+        assert got == out.resolve()
+        assert got.name == "matches.parquet"
+
+    def test_with_base_dir_under_returns_resolved(self, tmp_path: Path) -> None:
+        """Path under base_dir is allowed."""
+        base = tmp_path / "output"
+        base.mkdir()
+        out = base / "matches.parquet"
+        got = validate_output_path(out, path_type="file", base_dir=base)
+        assert got == out.resolve()
+
+    def test_with_base_dir_outside_raises(self, tmp_path: Path) -> None:
+        """Path outside base_dir raises CatalogValidationError."""
+        base = tmp_path / "allowed"
+        base.mkdir()
+        other = tmp_path / "other" / "out.parquet"
+        with pytest.raises(CatalogValidationError, match="not under base"):
+            validate_output_path(other, path_type="file", base_dir=base)
+
+    def test_dir_path_type_accepted(self, tmp_path: Path) -> None:
+        """path_type='dir' accepts directory path."""
+        d = tmp_path / "out_dir"
+        got = validate_output_path(d, path_type="dir")
+        assert got == d.resolve()

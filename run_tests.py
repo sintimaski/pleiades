@@ -6,6 +6,7 @@ From repo root:
   uv run python run_tests.py --benchmark        # tests + benchmark (small catalogs)
   uv run python run_tests.py --benchmark-only   # only benchmark (no tests)
   uv run python run_tests.py --benchmark-only --benchmark-rows 50000
+  uv run python run_tests.py --lint   # ruff + mypy only
   uv run python scripts/benchmark_cross_match.py --rows 100000  # or run script directly
 Rust tests are skipped if cargo is not available.
 """
@@ -62,6 +63,30 @@ def run_python_tests() -> bool:
         return False
 
 
+def run_lint() -> bool:
+    """Run ruff and mypy. Return True if success, False otherwise."""
+    root = project_root()
+    try:
+        for cmd, label in [
+            ([sys.executable, "-m", "ruff", "check", "python/", "tests/"], "ruff check"),
+            ([sys.executable, "-m", "ruff", "format", "--check", "python/", "tests/"], "ruff format"),
+            ([sys.executable, "-m", "mypy", "python/pleiades", "--config-file", "pyproject.toml"], "mypy"),
+        ]:
+            proc = subprocess.run(
+                cmd,
+                cwd=root,
+                capture_output=False,
+                timeout=120,
+            )
+            if proc.returncode != 0:
+                print(f"Lint failed: {label}", file=sys.stderr)
+                return False
+        return True
+    except subprocess.TimeoutExpired:
+        print("Lint timed out.", file=sys.stderr)
+        return False
+
+
 def run_benchmark(
     rows: int = 5000,
     timeout: int = 120,
@@ -107,7 +132,19 @@ def main() -> int:
         metavar="N",
         help="Rows per catalog for benchmark (default: 5000).",
     )
+    parser.add_argument(
+        "--lint",
+        action="store_true",
+        help="Run ruff and mypy only (no tests).",
+    )
     args = parser.parse_args()
+
+    if args.lint:
+        print("=== Lint (ruff + mypy) ===\n")
+        if not run_lint():
+            return 1
+        print("\nLint passed.")
+        return 0
 
     if args.benchmark_only:
         print("=== Benchmark (cross_match) only ===\n")
