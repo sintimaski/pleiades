@@ -737,6 +737,7 @@ fn pixels_and_index(
         Vec::with_capacity(ra_deg.len());
     (0..ra_deg.len())
         .into_par_iter()
+        .with_min_len(4096)
         .map(|row| {
             let lon = ra_deg[row] * DEG_TO_RAD;
             let lat = dec_deg[row] * DEG_TO_RAD;
@@ -768,6 +769,7 @@ fn index_only(
     let mut collected: Vec<(u64, usize)> = Vec::with_capacity(ra_deg.len());
     (0..ra_deg.len())
         .into_par_iter()
+        .with_min_len(4096)
         .map(|row| {
             let lon = ra_deg[row] * DEG_TO_RAD;
             let lat = dec_deg[row] * DEG_TO_RAD;
@@ -2312,16 +2314,22 @@ pub fn cross_match_impl(
         };
         let b_cols = BColumns::from(b_rows_vec);
         let n_b_loaded = b_cols.len();
-        // Pre-allocate match vectors to reduce reallocs during join (heuristic: ~0.1% of cross product).
-        let est_matches = (n_a * n_b_loaded / 1000).min(10_000_000).max(256);
-        matches_id_a.reserve(est_matches);
-        matches_id_b.reserve(est_matches);
-        matches_sep.reserve(est_matches);
+        // Pre-allocate match vectors to reduce reallocs during join.
+        // Heuristic: ~0.1% of cross product, scaling up with larger radius; 1.5x headroom.
+        let density = 0.001
+            * (1.0 + (radius_arcsec / 60.0).min(50.0));
+        let est_matches = ((n_a as f64 * n_b_loaded as f64 * density) as usize)
+            .min(10_000_000)
+            .max(256);
+        let est_cap = est_matches + (est_matches >> 1);
+        matches_id_a.reserve(est_cap);
+        matches_id_b.reserve(est_cap);
+        matches_sep.reserve(est_cap);
         if include_coords {
-            matches_ra_a.reserve(est_matches);
-            matches_dec_a.reserve(est_matches);
-            matches_ra_b.reserve(est_matches);
-            matches_dec_b.reserve(est_matches);
+            matches_ra_a.reserve(est_cap);
+            matches_dec_a.reserve(est_cap);
+            matches_ra_b.reserve(est_cap);
+            matches_dec_b.reserve(est_cap);
         }
         if verbose {
             verbose_log_timed("  load B", t_load.elapsed().as_secs_f64(), &format!("({} rows)", n_b_loaded));
@@ -2820,6 +2828,7 @@ impl Ord for NearestEntry {
 }
 
 /// Per-chunk: keep only n smallest-separation matches per id_a. Reduces match list before write.
+/// Uses select_nth_unstable instead of full sort when list.len() > n (O(n) vs O(m log m)).
 fn merge_to_n_nearest(
     id_a: Vec<IdVal>,
     id_b: Vec<IdVal>,
@@ -2827,16 +2836,22 @@ fn merge_to_n_nearest(
     n: u32,
 ) -> (Vec<IdVal>, Vec<IdVal>, Vec<f64>) {
     let n = n as usize;
-    let mut by_a: HashMap<IdVal, Vec<(f64, IdVal)>> = HashMap::new();
+    let mut by_a: FxHashMap<IdVal, Vec<(f64, IdVal)>> = FxHashMap::default();
     for ((a, b), s) in id_a.into_iter().zip(id_b).zip(sep) {
         by_a.entry(a).or_default().push((s, b));
     }
     let mut out_a = Vec::new();
     let mut out_b = Vec::new();
     let mut out_sep = Vec::new();
+    let cmp = |a: &(f64, IdVal), b: &(f64, IdVal)| a.0.total_cmp(&b.0);
     for (a, mut list) in by_a {
-        list.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (s, b) in list.into_iter().take(n) {
+        let take = list.len().min(n);
+        if list.len() > n {
+            list.select_nth_unstable_by(n - 1, cmp);
+            list.truncate(n);
+        }
+        list.sort_by(cmp);
+        for (s, b) in list.into_iter().take(take) {
             out_a.push(a.clone());
             out_b.push(b);
             out_sep.push(s);
@@ -2846,6 +2861,7 @@ fn merge_to_n_nearest(
 }
 
 /// Like merge_to_n_nearest but also keeps ra_a, dec_a, ra_b, dec_b in sync.
+/// Uses select_nth_unstable instead of full sort when list.len() > n.
 fn merge_to_n_nearest_with_coords(
     id_a: Vec<IdVal>,
     id_b: Vec<IdVal>,
@@ -2857,7 +2873,7 @@ fn merge_to_n_nearest_with_coords(
     n: u32,
 ) -> (Vec<IdVal>, Vec<IdVal>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let n = n as usize;
-    let mut by_a: HashMap<IdVal, Vec<(f64, IdVal, f64, f64, f64, f64)>> = HashMap::new();
+    let mut by_a: FxHashMap<IdVal, Vec<(f64, IdVal, f64, f64, f64, f64)>> = FxHashMap::default();
     for (((((a, b), s), ra), dec), (rb, db)) in id_a
         .into_iter()
         .zip(id_b)
@@ -2875,9 +2891,16 @@ fn merge_to_n_nearest_with_coords(
     let mut out_dec_a = Vec::new();
     let mut out_ra_b = Vec::new();
     let mut out_dec_b = Vec::new();
+    let cmp =
+        |a: &(f64, IdVal, f64, f64, f64, f64), b: &(f64, IdVal, f64, f64, f64, f64)| a.0.total_cmp(&b.0);
     for (a, mut list) in by_a {
-        list.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-        for (s, b, ra, dec, rb, db) in list.into_iter().take(n) {
+        let take = list.len().min(n);
+        if list.len() > n {
+            list.select_nth_unstable_by(n - 1, cmp);
+            list.truncate(n);
+        }
+        list.sort_by(cmp);
+        for (s, b, ra, dec, rb, db) in list.into_iter().take(take) {
             out_a.push(a.clone());
             out_b.push(b);
             out_sep.push(s);

@@ -10,7 +10,7 @@ name = "pleiades_core"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["python", "simd"]
+default = ["python", "simd", "macos_readahead"]
 # Enable PyO3 bindings for maturin/Python extension build.
 python = ["pyo3"]
 # macOS: enable F_RDAHEAD read-ahead on opened files (faster sequential I/O).

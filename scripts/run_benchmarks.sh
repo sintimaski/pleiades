@@ -40,7 +40,8 @@ echo "  log: $LOG_STDOUT (logs/ keeps last $KEEP_LAST_N_RUNS runs)"
 echo "  extra args: ${*:-none}"
 echo "---"
 
-# 1M-row fixtures; tool defaults (batch 250k, n_shards 16) match this scale
+# 10M-row fixtures; build with maturin develop --release for best perf.
+# I/O optimizations: parquet_mmap + macos_readahead are default features.
 # Optional: set RAYON_NUM_THREADS to cap or boost parallelism (e.g. 8).
 RAYON_NUM_THREADS=10
 ROWS=10000000
