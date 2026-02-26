@@ -5,10 +5,12 @@
 //! (Parquet read with known ra/dec/id columns); invalid external data is rejected by the
 //! Python validation layer before the engine is invoked.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::env;
 
+use arrayvec::ArrayVec;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use std::io::BufWriter;
@@ -522,7 +524,13 @@ fn extract_shard_batch_rows(
     let ra_col = batch.column(column_index(batch, "ra"));
     let dec_col = batch.column(column_index(batch, "dec"));
     let id_b_idx = column_index(batch, "id_b");
-    let mut out = Vec::with_capacity(n);
+    // Reserve based on expected matches: when few pixels wanted, avoid over-allocating.
+    let cap = if pixels_wanted.len() < 1000 {
+        (pixels_wanted.len() * 256).min(n)
+    } else {
+        n
+    };
+    let mut out = Vec::with_capacity(cap);
 
     if let (Some(pix_arr), Some(ra_arr), Some(dec_arr)) = (
         pix_col.as_any().downcast_ref::<UInt64Array>(),
@@ -622,6 +630,7 @@ fn load_b_from_shards(
 
 /// Compute pixels in chunk A plus all 8 neighbors (halo). Parallel over rows; merge with
 /// fold/reduce for better parallelism than single-threaded collect into HashSet.
+/// Uses thread-local cache for neighbor lists to avoid repeated append_bulk_neighbours.
 fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) -> FxHashSet<u64> {
     let layer = get(depth);
     (0..ra_deg.len())
@@ -630,10 +639,7 @@ fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) ->
             let lon = ra_deg[i] * DEG_TO_RAD;
             let lat = dec_deg[i] * DEG_TO_RAD;
             let center = layer.hash(lon, lat);
-            let mut neighbours = Vec::with_capacity(9);
-            neighbours.push(center);
-            nested::append_bulk_neighbours(depth, center, &mut neighbours);
-            neighbours
+            cached_neighbours(depth, center)
         })
         .fold_with(FxHashSet::default(), |mut s, neighbours| {
             s.extend(neighbours);
@@ -651,15 +657,47 @@ fn estimated_pixels(n_rows: usize) -> usize {
     (n_rows / 4).min(300_000).max(4096)
 }
 
+/// Max neighbors per pixel (center + 8).
+const MAX_NEIGHBOURS: usize = 9;
+
+/// Thread-local cache for HEALPix neighbor lists to avoid repeated append_bulk_neighbours calls.
+fn cached_neighbours(depth: u8, center: u64) -> ArrayVec<u64, MAX_NEIGHBOURS> {
+    thread_local! {
+        static CACHE: RefCell<FxHashMap<(u8, u64), ArrayVec<u64, MAX_NEIGHBOURS>>> =
+            RefCell::new(FxHashMap::default());
+        static SCRATCH: RefCell<Vec<u64>> = RefCell::new(Vec::with_capacity(MAX_NEIGHBOURS));
+    }
+    CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(n) = cache.get(&(depth, center)) {
+            return n.clone();
+        }
+        SCRATCH.with(|s| {
+            let mut scratch = s.borrow_mut();
+            scratch.clear();
+            scratch.push(center);
+            nested::append_bulk_neighbours(depth, center, &mut scratch);
+            let arr: ArrayVec<u64, MAX_NEIGHBOURS> =
+                scratch.drain(..).collect();
+            cache.insert((depth, center), arr.clone());
+            arr
+        })
+    })
+}
+
 /// Merge collected per-row results into (index, pixels). Used for profiling when PLEIADES_PROFILE=1.
 fn merge_pixels_and_index(
-    collected: Vec<(u64, usize, Vec<u64>)>,
+    collected: Vec<(u64, usize, ArrayVec<u64, MAX_NEIGHBOURS>)>,
 ) -> (FxHashMap<u64, Vec<usize>>, FxHashSet<u64>) {
     let cap = estimated_pixels(collected.len());
-    let mut idx: FxHashMap<u64, Vec<usize>> = FxHashMap::with_capacity_and_hasher(cap, Default::default());
+    let avg_rows_per_pixel = (collected.len() / cap).max(1);
+    let mut idx: FxHashMap<u64, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(cap, Default::default());
     let mut pixels = FxHashSet::with_capacity_and_hasher(cap, Default::default());
     for (center, row, neighbours) in collected {
-        idx.entry(center).or_default().push(row);
+        idx.entry(center)
+            .or_insert_with(|| Vec::with_capacity(avg_rows_per_pixel))
+            .push(row);
         for p in neighbours {
             pixels.insert(p);
         }
@@ -669,10 +707,14 @@ fn merge_pixels_and_index(
 
 /// Merge collected (pixel, row) pairs into index. Used for profiling when PLEIADES_PROFILE=1.
 fn merge_index_only(collected: Vec<(u64, usize)>) -> FxHashMap<u64, Vec<usize>> {
+    let cap = estimated_pixels(collected.len());
+    let avg_rows_per_pixel = (collected.len() / cap).max(1);
     let mut idx: FxHashMap<u64, Vec<usize>> =
-        FxHashMap::with_capacity_and_hasher(estimated_pixels(collected.len()), Default::default());
+        FxHashMap::with_capacity_and_hasher(cap, Default::default());
     for (pix, row) in collected {
-        idx.entry(pix).or_default().push(row);
+        idx.entry(pix)
+            .or_insert_with(|| Vec::with_capacity(avg_rows_per_pixel))
+            .push(row);
     }
     idx
 }
@@ -687,17 +729,15 @@ fn pixels_and_index(
     let layer = get(depth);
     let profile = env::var("PLEIADES_PROFILE").is_ok();
     let t_map = std::time::Instant::now();
-    let mut collected: Vec<(u64, usize, Vec<u64>)> = Vec::with_capacity(ra_deg.len());
+    let mut collected: Vec<(u64, usize, ArrayVec<u64, MAX_NEIGHBOURS>)> =
+        Vec::with_capacity(ra_deg.len());
     (0..ra_deg.len())
         .into_par_iter()
         .map(|row| {
             let lon = ra_deg[row] * DEG_TO_RAD;
             let lat = dec_deg[row] * DEG_TO_RAD;
             let center = layer.hash(lon, lat);
-            let mut neighbours = Vec::with_capacity(9);
-            neighbours.push(center);
-            nested::append_bulk_neighbours(depth, center, &mut neighbours);
-            (center, row, neighbours)
+            (center, row, cached_neighbours(depth, center))
         })
         .collect_into_vec(&mut collected);
     if profile {
@@ -1633,9 +1673,7 @@ fn run_cpu_join(
     let per_pixel: Vec<Vec<(usize, Vec<(usize, usize, f64)>)>> = by_pixel
         .par_iter()
         .map(|(pixel, b_indices)| {
-            let mut pixels_to_look = Vec::with_capacity(9);
-            pixels_to_look.push(*pixel);
-            nested::append_bulk_neighbours(depth_local, *pixel, &mut pixels_to_look);
+            let pixels_to_look = cached_neighbours(depth_local, *pixel);
 
             // Merge and dedup candidate indices.
             let mut candidates: Vec<usize> = Vec::new();
@@ -1644,7 +1682,11 @@ fn run_cpu_join(
                     candidates.extend(ixs.iter().copied());
                 }
             }
-            candidates.sort_unstable();
+            if candidates.len() > 10_000 {
+                candidates.par_sort_unstable();
+            } else {
+                candidates.sort_unstable();
+            }
             candidates.dedup();
 
             // Pre-filter: sort candidates by dec for binary-search dec window.
@@ -1652,7 +1694,13 @@ fn run_cpu_join(
                 .iter()
                 .map(|&ix| (dec_flat_ref[ix], ix))
                 .collect();
-            candidates_by_dec.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            if candidates_by_dec.len() > 10_000 {
+                candidates_by_dec
+                    .par_sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            } else {
+                candidates_by_dec
+                    .sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            }
 
             let mut out: Vec<(usize, Vec<(usize, usize, f64)>)> = Vec::with_capacity(b_indices.len());
             if candidates_by_dec.is_empty() {
@@ -2257,6 +2305,17 @@ pub fn cross_match_impl(
         };
         let b_cols = BColumns::from(b_rows_vec);
         let n_b_loaded = b_cols.len();
+        // Pre-allocate match vectors to reduce reallocs during join (heuristic: ~0.1% of cross product).
+        let est_matches = (n_a * n_b_loaded / 1000).min(10_000_000).max(256);
+        matches_id_a.reserve(est_matches);
+        matches_id_b.reserve(est_matches);
+        matches_sep.reserve(est_matches);
+        if include_coords {
+            matches_ra_a.reserve(est_matches);
+            matches_dec_a.reserve(est_matches);
+            matches_ra_b.reserve(est_matches);
+            matches_dec_b.reserve(est_matches);
+        }
         if verbose {
             verbose_log_timed("  load B", t_load.elapsed().as_secs_f64(), &format!("({} rows)", n_b_loaded));
         }
@@ -2277,9 +2336,7 @@ pub fn cross_match_impl(
                 let mut pairs: Vec<(usize, usize)> = Vec::new();
                 for (b_row_ix, (&ra_b_deg, &dec_b_deg)) in b_cols.ra_b.iter().zip(b_cols.dec_b.iter()).enumerate() {
                     let center_pix = layer.hash(ra_b_deg * DEG_TO_RAD, dec_b_deg * DEG_TO_RAD);
-                    let mut pixels_to_look = Vec::with_capacity(9);
-                    pixels_to_look.push(center_pix);
-                    nested::append_bulk_neighbours(depth_local, center_pix, &mut pixels_to_look);
+                    let pixels_to_look = cached_neighbours(depth_local, center_pix);
                     for pix in &pixels_to_look {
                         if let Some(candidate_ixs) = index_ref.get(pix) {
                             for &candidate_ix in candidate_ixs {
