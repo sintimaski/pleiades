@@ -143,7 +143,7 @@ Set `PLEIADES_VERBOSE=1` to log per-chunk timing (pixels+index, load B, join, wr
 
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — flow, Rust vs Python roles, bottlenecks and knobs
+- [ARCHITECTURE.md](ARCHITECTURE.md) — flow, Rust vs Python roles, bottlenecks and knobs, memory/allocation optimizations
 - [DATA_SOURCES.md](DATA_SOURCES.md) — Gaia, IRSA, SDSS, LSST: where to get Parquet catalogs
 - [docs/PRODUCTION.md](docs/PRODUCTION.md) — production checklist, env vars, path safety, logging
 

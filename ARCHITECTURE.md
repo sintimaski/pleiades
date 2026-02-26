@@ -58,10 +58,18 @@ When B is loaded from shards, cost is **Parquet decode** + **copy into Rust stru
 
 - **Large batch size** (`SHARD_READ_BATCH_ROWS` 128k): fewer decode cycles and larger reads.
 - **Fast path in `load_one_shard`**: Shard schema is fixed (UInt64 pixel_id, Float64 ra/dec from `partition_b_to_temp`). We downcast columns once per batch, use slice access for ra/dec (`ra_arr.values()[row]`), reserve capacity, and specialize Int64 `id_b` to avoid per-row `get_id_value` dispatch and extra branches.
+- **Pre-allocated shard collect**: `load_one_shard` and `load_b_from_shards` pre-allocate output Vecs to avoid Rayon `par_extend` reallocations; batches are mapped in parallel, total size summed, then a single allocation + extend.
 
 **macOS:** Optional build feature `macos_readahead` enables `fcntl(F_RDAHEAD)` on opened shard files so the kernel does read-ahead for sequential Parquet reads. Build with `maturin develop --features macos_readahead` on macOS.
 
 Columnar B is used in the join (`BColumns`: join hot path streams `ra_b`/`dec_b`; `id_b` fetched only when emitting a match). Possible later: predicate pushdown on shard Parquet by pixel_id if the format allows.
+
+### Memory and allocation optimizations
+
+- **Match vector reuse**: Match output vectors (`matches_id_a`, `matches_id_b`, `matches_sep`, coord columns) are reused across A chunks; cleared and reserved each iteration to avoid per-chunk allocation.
+- **HashMap/FxHashSet capacity**: `estimated_pixels()` adds ~25% headroom to reduce rehashing in `merge_pixels_and_index` and `merge_index_only`.
+- **Thread-local neighbour cache**: `cached_neighbours()` caches HEALPix neighbour lists per (depth, pixel) to avoid repeated `append_bulk_neighbours` calls.
+- **Pre-allocated match buffers**: Match vectors are pre-reserved with a heuristic (~0.1% of cross product × radius factor) before the join fills them.
 
 ---
 
@@ -91,6 +99,6 @@ So: **yes, multiple threads already read input** (A in a prefetch thread; B shar
 
 ## Further speedups (matching)
 
-Implemented: columnar B (`BColumns`), reuse of `pixels_to_look` per pixel, cheap reject before haversine (remainder path), haversine batches of 8 (then 4), n_nearest per chunk before write, parallel partition of B (batches processed in parallel), and **GPU join by default when available**. See “Join” and “Partitioning B” above.
+**Implemented:** columnar B (`BColumns`), reuse of `pixels_to_look` per pixel (thread-local neighbour cache), cheap reject before haversine (remainder path), haversine batches of 8 (then 4) with SIMD when GPU not used, n_nearest per chunk before write (BinaryHeap), parallel partition of B, pre-allocated shard collect and match vector reuse (see above), and **GPU join by default when available** (`wgpu` feature). Build features: `simd` (AVX2/NEON haversine), `parquet_mmap`, `macos_readahead`, `wgpu`, `rtree`.
 
 When the `wgpu` feature is built, the GPU is used by default when a GPU is available and pair count ≥ `PLEIADES_GPU_MIN_PAIRS` (default 80M). Set `PLEIADES_GPU=0`, `cpu`, or `off` to force CPU.

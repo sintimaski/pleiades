@@ -8,6 +8,7 @@
 
 ### Added
 
+- **Memory/allocation optimizations:** Pre-allocated shard collect in `load_one_shard` and `load_b_from_shards` to avoid Rayon `par_extend` reallocations; match vector reuse across A chunks (clear + reserve each iteration); HashMap/FxHashSet capacity headroom (~25%) in `merge_pixels_and_index` and `merge_index_only` to reduce rehashing.
 - **B prefetch overlap:** Send current and next chunk’s B load requests at chunk start; index runs in parallel with load B for the first chunk, join with load B for the next (two requests in flight).
 - **Verbose timing:** With `PLEIADES_VERBOSE=1`, the engine logs per-chunk phases: `pixels+index` (time and pixel count), `load B`, `join`, `write`, and `chunk total`.
 - **load_one_shard fast path:** Downcast columns once per batch, slice access for ra/dec, reserve capacity, Int64 id_b specialization; 128k-row batch size for shard Parquet reads.

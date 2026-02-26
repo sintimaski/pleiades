@@ -590,15 +590,22 @@ fn extract_shard_batch_rows(
 
 /// Load one shard file, return rows whose pixel_id is in pixels_wanted. Shard ra/dec are in degrees.
 /// Uses parallel row-group decode when the shard has multiple row groups.
+/// Pre-allocates output to avoid par_extend reallocs during collect.
 fn load_one_shard(
     path: &Path,
     pixels_wanted: &FxHashSet<u64>,
 ) -> Result<Vec<(IdVal, f64, f64)>, Box<dyn std::error::Error + Send + Sync>> {
     let batches = crate::parquet_parallel::read_parquet_parallel(path, SHARD_READ_BATCH_ROWS)?;
-    Ok(batches
+    let per_batch: Vec<Vec<(IdVal, f64, f64)>> = batches
         .par_iter()
-        .flat_map(|b| extract_shard_batch_rows(b, pixels_wanted))
-        .collect())
+        .map(|b| extract_shard_batch_rows(b, pixels_wanted))
+        .collect();
+    let total: usize = per_batch.iter().map(|v| v.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for v in per_batch {
+        out.extend(v);
+    }
+    Ok(out)
 }
 
 /// Load B rows from pre-partitioned shards for the given set of pixel IDs (shards loaded in parallel).
@@ -622,12 +629,12 @@ fn load_b_from_shards(
         .filter(|&&s| s < paths.len())
         .map(|&s| load_one_shard(&paths[s], pixels_wanted))
         .collect();
-    let out: Vec<(IdVal, f64, f64)> = vecs
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+    let vecs = vecs.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let total: usize = vecs.iter().map(|v| v.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for v in vecs {
+        out.extend(v);
+    }
     Ok(out)
 }
 
@@ -657,8 +664,10 @@ fn pixels_in_chunk_with_neighbors(ra_deg: &[f64], dec_deg: &[f64], depth: u8) ->
 }
 
 /// Estimated unique pixels for capacity hint (reduces rehashing).
+/// Add headroom to avoid resize during merge (HashMap rehash is expensive).
 fn estimated_pixels(n_rows: usize) -> usize {
-    (n_rows / 4).min(300_000).max(4096)
+    let base = (n_rows / 4).min(300_000).max(4096);
+    base + (base / 4) // 25% headroom
 }
 
 /// Max neighbors per pixel (center + 8).
@@ -694,7 +703,8 @@ fn merge_pixels_and_index(
     collected: Vec<(u64, usize, ArrayVec<u64, MAX_NEIGHBOURS>)>,
 ) -> (FxHashMap<u64, Vec<usize>>, FxHashSet<u64>) {
     let cap = estimated_pixels(collected.len());
-    let avg_rows_per_pixel = (collected.len() / cap).max(1);
+    let base = (cap * 4) / 5; // cap = base + base/4, so base ≈ cap * 4/5
+    let avg_rows_per_pixel = (collected.len() / base.max(1)).max(1);
     let mut idx: FxHashMap<u64, Vec<usize>> =
         FxHashMap::with_capacity_and_hasher(cap, Default::default());
     let mut pixels = FxHashSet::with_capacity_and_hasher(cap, Default::default());
@@ -712,7 +722,8 @@ fn merge_pixels_and_index(
 /// Merge collected (pixel, row) pairs into index. Used for profiling when PLEIADES_PROFILE=1.
 fn merge_index_only(collected: Vec<(u64, usize)>) -> FxHashMap<u64, Vec<usize>> {
     let cap = estimated_pixels(collected.len());
-    let avg_rows_per_pixel = (collected.len() / cap).max(1);
+    let base = (cap * 4) / 5;
+    let avg_rows_per_pixel = (collected.len() / base.max(1)).max(1);
     let mut idx: FxHashMap<u64, Vec<usize>> =
         FxHashMap::with_capacity_and_hasher(cap, Default::default());
     for (pix, row) in collected {
@@ -2207,6 +2218,15 @@ pub fn cross_match_impl(
         thread::JoinHandle<Result<(FxHashMap<u64, Vec<usize>>, FxHashSet<u64>), Box<dyn std::error::Error + Send + Sync>>>,
     > = None;
 
+    // Reuse match vectors across chunks to avoid per-chunk allocation churn.
+    let mut matches_id_a: Vec<IdVal> = Vec::new();
+    let mut matches_id_b: Vec<IdVal> = Vec::new();
+    let mut matches_sep: Vec<f64> = Vec::new();
+    let mut matches_ra_a: Vec<f64> = Vec::new();
+    let mut matches_dec_a: Vec<f64> = Vec::new();
+    let mut matches_ra_b: Vec<f64> = Vec::new();
+    let mut matches_dec_b: Vec<f64> = Vec::new();
+
     while let Some(batch_a) = current_batch.take() {
         chunks_processed += 1;
         let n_a = batch_a.num_rows();
@@ -2279,13 +2299,13 @@ pub fn cross_match_impl(
         let ra_flat_ref = ra_deg_a;
         let dec_flat_ref = dec_deg_a;
 
-        let mut matches_id_a: Vec<IdVal> = Vec::new();
-        let mut matches_id_b: Vec<IdVal> = Vec::new();
-        let mut matches_sep: Vec<f64> = Vec::new();
-        let mut matches_ra_a: Vec<f64> = Vec::new();
-        let mut matches_dec_a: Vec<f64> = Vec::new();
-        let mut matches_ra_b: Vec<f64> = Vec::new();
-        let mut matches_dec_b: Vec<f64> = Vec::new();
+        matches_id_a.clear();
+        matches_id_b.clear();
+        matches_sep.clear();
+        matches_ra_a.clear();
+        matches_dec_a.clear();
+        matches_ra_b.clear();
+        matches_dec_b.clear();
 
         if id_b_name.is_none() {
             id_b_name = Some(
@@ -2637,7 +2657,7 @@ pub fn cross_match_impl(
             let schema = out_schema.as_ref().unwrap();
             let col_a = coerce_id_column_to_type(col_a, schema.field(0).data_type())?;
             let col_b = coerce_id_column_to_type(col_b, schema.field(1).data_type())?;
-            let sep_arr = Arc::new(Float64Array::from(matches_sep));
+            let sep_arr = Arc::new(Float64Array::from(std::mem::take(&mut matches_sep)));
             let id_b_col = id_b_name.as_deref().unwrap_or("id_b");
             let mut batch_fields = vec![
                 Field::new(id_a_col.as_str(), schema.field(0).data_type().clone(), false),
