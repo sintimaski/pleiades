@@ -119,13 +119,18 @@ fn haversine_rad(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
 
 /// Haversine intermediate term `a` only (no sqrt/asin). Used for cheap-reject: if a > a_max, skip.
 /// a_max = sin²(radius_rad/2) for haversine threshold.
+/// Uses sin_cos for lat1/lat2 to avoid redundant trig calls.
 #[inline(always)]
 fn haversine_a_rad(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     let dlat = lat2 - lat1;
     let dlon = lon2 - lon1;
-    (dlat * 0.5).sin().mul_add(
-        (dlat * 0.5).sin(),
-        lat1.cos() * lat2.cos() * (dlon * 0.5).sin() * (dlon * 0.5).sin(),
+    let sin_hdlat = (dlat * 0.5).sin();
+    let sin_hdlon = (dlon * 0.5).sin();
+    let (_, cos_lat1) = lat1.sin_cos();
+    let (_, cos_lat2) = lat2.sin_cos();
+    sin_hdlat.mul_add(
+        sin_hdlat,
+        cos_lat1 * cos_lat2 * sin_hdlon * sin_hdlon,
     )
 }
 
@@ -146,12 +151,14 @@ fn haversine_arcsec(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) ->
 }
 
 /// Unit vector (x,y,z) from ra/dec in degrees.
+/// Uses sin_cos to compute both sin and cos in one call (cheaper than separate sin/cos).
 #[inline(always)]
 fn ra_dec_to_xyz_deg(ra_deg: f64, dec_deg: f64) -> (f64, f64, f64) {
     let lon = ra_deg * DEG_TO_RAD;
     let lat = dec_deg * DEG_TO_RAD;
-    let cos_lat = lat.cos();
-    (lon.cos() * cos_lat, lon.sin() * cos_lat, lat.sin())
+    let (lon_sin, lon_cos) = lon.sin_cos();
+    let (lat_sin, lat_cos) = lat.sin_cos();
+    (lon_cos * lat_cos, lon_sin * lat_cos, lat_sin)
 }
 
 /// Angular separation in arcsec via dot product of unit vectors. Fast for small angles.
@@ -1683,27 +1690,25 @@ fn run_cpu_join(
     let cos_radius_rad = radius_rad.cos();
 
     let t_per_pixel = std::time::Instant::now();
-    let per_pixel: Vec<Vec<(usize, Vec<(usize, usize, f64)>)>> = by_pixel
+    // Convert to Vec for IndexedParallelIterator (enables collect_into_vec with prealloc).
+    let by_pixel_vec: Vec<(u64, Vec<usize>)> = by_pixel.into_iter().collect();
+    let mut per_pixel: Vec<Vec<(usize, Vec<(usize, usize, f64)>)>> =
+        Vec::with_capacity(by_pixel_vec.len());
+    by_pixel_vec
         .par_iter()
         .map(|(pixel, b_indices)| {
             let pixels_to_look = cached_neighbours(depth_local, *pixel);
 
-            // Merge and dedup candidate indices.
-            let mut candidates: Vec<usize> = Vec::new();
+            // Merge and dedup candidate indices (HashSet avoids sort+dedup O(n log n) -> O(n)).
+            let mut candidates_set: FxHashSet<usize> = FxHashSet::default();
             for pix in &pixels_to_look {
                 if let Some(ixs) = index_ref.get(pix) {
-                    candidates.extend(ixs.iter().copied());
+                    candidates_set.extend(ixs.iter().copied());
                 }
             }
-            if candidates.len() > 10_000 {
-                candidates.par_sort_unstable();
-            } else {
-                candidates.sort_unstable();
-            }
-            candidates.dedup();
 
             // Pre-filter: sort candidates by dec for binary-search dec window.
-            let mut candidates_by_dec: Vec<(f64, usize)> = candidates
+            let mut candidates_by_dec: Vec<(f64, usize)> = candidates_set
                 .iter()
                 .map(|&ix| (dec_flat_ref[ix], ix))
                 .collect();
@@ -1994,12 +1999,13 @@ fn run_cpu_join(
             }
             out
         })
-        .collect();
+        .collect_into_vec(&mut per_pixel);
     if env::var("PLEIADES_PROFILE").is_ok() {
         profile_log("join_haversine_loop", t_per_pixel.elapsed().as_secs_f64(), "(per-pixel)");
     }
 
-    let mut row_matches: Vec<Vec<(usize, usize, f64)>> = (0..b_cols.len()).map(|_| Vec::new()).collect();
+    let mut row_matches: Vec<Vec<(usize, usize, f64)>> =
+        (0..b_cols.len()).map(|_| Vec::new()).collect();
     for chunk in per_pixel {
         for (b_row_ix, m) in chunk {
             row_matches[b_row_ix].extend(m);
@@ -2870,7 +2876,10 @@ fn merge_to_n_nearest(
             list.select_nth_unstable_by(n - 1, cmp);
             list.truncate(n);
         }
-        list.sort_by(cmp);
+        // Skip sort when n<=1 (already ordered) or empty
+        if list.len() > 1 {
+            list.sort_by(cmp);
+        }
         for (s, b) in list.into_iter().take(take) {
             out_a.push(a.clone());
             out_b.push(b);
@@ -2919,7 +2928,9 @@ fn merge_to_n_nearest_with_coords(
             list.select_nth_unstable_by(n - 1, cmp);
             list.truncate(n);
         }
-        list.sort_by(cmp);
+        if list.len() > 1 {
+            list.sort_by(cmp);
+        }
         for (s, b, ra, dec, rb, db) in list.into_iter().take(take) {
             out_a.push(a.clone());
             out_b.push(b);

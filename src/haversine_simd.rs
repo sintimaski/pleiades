@@ -7,6 +7,9 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
 const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 
 /// Haversine `a` for 4 lanes using AVX2. Output in out[0..4].
@@ -66,7 +69,63 @@ unsafe fn haversine_a_4_avx2(
     _mm256_storeu_pd(out.as_mut_ptr(), a);
 }
 
-/// Haversine `a` for 4 lanes — SIMD when available (AVX2 on x86_64), else scalar.
+/// Haversine `a` for 2 lanes using NEON (aarch64). Processes 2 f64 per call.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn haversine_a_2_neon(
+    ra1_deg: &[f64; 2],
+    dec1_deg: &[f64; 2],
+    lon2: f64,
+    lat2: f64,
+    cos_lat2: f64,
+    out: &mut [f64; 2],
+) {
+    let half = vdupq_n_f64(0.5);
+    let deg_to_rad = vdupq_n_f64(DEG_TO_RAD);
+
+    let ra1 = vld1q_f64(ra1_deg.as_ptr());
+    let dec1 = vld1q_f64(dec1_deg.as_ptr());
+
+    let lon1 = vmulq_f64(ra1, deg_to_rad);
+    let lat1 = vmulq_f64(dec1, deg_to_rad);
+
+    let lat2_v = vdupq_n_f64(lat2);
+    let lon2_v = vdupq_n_f64(lon2);
+
+    let dlat = vsubq_f64(lat2_v, lat1);
+    let dlon = vsubq_f64(lon2_v, lon1);
+
+    let half_dlat = vmulq_f64(dlat, half);
+    let half_dlon = vmulq_f64(dlon, half);
+
+    let mut sin_half_dlat = [0.0_f64; 2];
+    let mut sin_half_dlon = [0.0_f64; 2];
+    let mut cos_lat1 = [0.0_f64; 2];
+    vst1q_f64(sin_half_dlat.as_mut_ptr(), half_dlat);
+    vst1q_f64(sin_half_dlon.as_mut_ptr(), half_dlon);
+    vst1q_f64(cos_lat1.as_mut_ptr(), lat1);
+
+    for i in 0..2 {
+        sin_half_dlat[i] = sin_half_dlat[i].sin();
+        sin_half_dlon[i] = sin_half_dlon[i].sin();
+        cos_lat1[i] = cos_lat1[i].cos();
+    }
+
+    let sin_dlat = vld1q_f64(sin_half_dlat.as_ptr());
+    let sin_dlon = vld1q_f64(sin_half_dlon.as_ptr());
+    let cos_l1 = vld1q_f64(cos_lat1.as_ptr());
+
+    let cos_lat2_v = vdupq_n_f64(cos_lat2);
+
+    let sin_dlat_sq = vmulq_f64(sin_dlat, sin_dlat);
+    let sin_dlon_sq = vmulq_f64(sin_dlon, sin_dlon);
+    let term2 = vmulq_f64(vmulq_f64(cos_l1, cos_lat2_v), sin_dlon_sq);
+
+    let a = vaddq_f64(sin_dlat_sq, term2);
+    vst1q_f64(out.as_mut_ptr(), a);
+}
+
+/// Haversine `a` for 4 lanes — SIMD when available (AVX2 on x86_64, NEON on aarch64), else scalar.
 #[inline(always)]
 pub fn haversine_a_4_rad(
     ra1_deg: &[f64; 4],
@@ -86,7 +145,43 @@ pub fn haversine_a_4_rad(
         }
     }
 
-    // Scalar fallback (aarch64, or x86 without AVX2)
+    #[cfg(target_arch = "aarch64")]
+    {
+        #[target_feature(enable = "neon")]
+        unsafe fn inner(
+            ra1_deg: &[f64; 4],
+            dec1_deg: &[f64; 4],
+            lon2: f64,
+            lat2: f64,
+            cos_lat2: f64,
+            out: &mut [f64; 4],
+        ) {
+            let (ra1_2a, ra1_2b) = (
+                [ra1_deg[0], ra1_deg[1]],
+                [ra1_deg[2], ra1_deg[3]],
+            );
+            let (dec1_2a, dec1_2b) = (
+                [dec1_deg[0], dec1_deg[1]],
+                [dec1_deg[2], dec1_deg[3]],
+            );
+            let mut out_a = [0.0_f64; 2];
+            let mut out_b = [0.0_f64; 2];
+            haversine_a_2_neon(&ra1_2a, &dec1_2a, lon2, lat2, cos_lat2, &mut out_a);
+            haversine_a_2_neon(&ra1_2b, &dec1_2b, lon2, lat2, cos_lat2, &mut out_b);
+            out[0] = out_a[0];
+            out[1] = out_a[1];
+            out[2] = out_b[0];
+            out[3] = out_b[1];
+        }
+        // NEON is always available on aarch64
+        unsafe {
+            inner(ra1_deg, dec1_deg, lon2, lat2, cos_lat2, out);
+        }
+        return;
+    }
+
+    // Scalar fallback (other arches)
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     for i in 0..4 {
         let lon1 = ra1_deg[i] * DEG_TO_RAD;
         let lat1 = dec1_deg[i] * DEG_TO_RAD;
@@ -98,6 +193,23 @@ pub fn haversine_a_4_rad(
         let sin_hl = half_dlon.sin();
         let cos_l1 = lat1.cos();
         out[i] = sin_hd * sin_hd + cos_l1 * cos_lat2 * sin_hl * sin_hl;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        // x86_64 without AVX2
+        for i in 0..4 {
+            let lon1 = ra1_deg[i] * DEG_TO_RAD;
+            let lat1 = dec1_deg[i] * DEG_TO_RAD;
+            let dlat = lat2 - lat1;
+            let dlon = lon2 - lon1;
+            let half_dlat = dlat * 0.5;
+            let half_dlon = dlon * 0.5;
+            let sin_hd = half_dlat.sin();
+            let sin_hl = half_dlon.sin();
+            let cos_l1 = lat1.cos();
+            out[i] = sin_hd * sin_hd + cos_l1 * cos_lat2 * sin_hl * sin_hl;
+        }
     }
 }
 
